@@ -31,7 +31,7 @@ use x11rb::wrapper::ConnectionExt as _;
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
 use crate::engine::gpu_renderer::GpuSceneInstance;
 use crate::platform;
-use crate::render::{FrameSource, RenderSettings, WallpaperContent};
+use crate::render::{FrameSource, RenderSettings, ScreenContent, ScreenSettings, WallpaperContent};
 
 /// Frames per second for animated content. Matches `FrameSource`'s own target.
 const TARGET_FPS: f32 = 30.0;
@@ -41,25 +41,17 @@ const TARGET_FPS: f32 = 30.0;
 pub(super) struct X11Platform;
 
 impl DisplayPlatform for X11Platform {
-    fn spawn_wallpaper(
-        &self,
-        content: WallpaperContent,
-        settings: Arc<Mutex<RenderSettings>>,
-    ) -> Result<WallpaperHandle> {
+    fn spawn_wallpaper(&self, content: ScreenContent, settings: ScreenSettings) -> Result<WallpaperHandle> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
-        let settings_thread = Arc::clone(&settings);
 
         let thread = thread::spawn(move || {
-            if let Err(e) = wallpaper_loop(content, settings_thread, stop_thread) {
+            if let Err(e) = wallpaper_loop(content, settings, stop_thread) {
                 tracing::error!(target: "wallpaper", "X11 wallpaper thread error: {e}");
             }
         });
 
-        Ok(WallpaperHandle::new(
-            Box::new(X11Handle { stop, thread }),
-            settings,
-        ))
+        Ok(WallpaperHandle::new(Box::new(X11Handle { stop, thread })))
     }
 }
 
@@ -90,19 +82,29 @@ pub(crate) struct OutputRect {
     pub height: u16,
 }
 
-/// Enumerate active RandR CRTCs, falling back to the whole root window when
-/// RandR is missing or reports nothing usable (headless X, Xvfb, old servers).
-fn discover_outputs(
-    conn: &RustConnection,
-    root: Window,
-    root_w: u16,
-    root_h: u16,
-) -> Vec<OutputRect> {
-    let whole = vec![OutputRect {
-        x: 0,
-        y: 0,
-        width: root_w,
-        height: root_h,
+/// One monitor: its rectangle plus its RandR output name (e.g. `"HDMI-1"`)
+/// when available — the same string `wp-engine config set-screen` takes.
+/// `name` is `None` on the whole-root-window fallback (no RandR, or RandR
+/// present but nothing named/active decoded) — a per-screen assignment can
+/// never match it, so it always renders the default wallpaper.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NamedOutput {
+    pub name: Option<String>,
+    pub rect: OutputRect,
+}
+
+/// Enumerate connected+active RandR outputs (name + rectangle), falling back
+/// to the whole root window when RandR is missing or reports nothing usable
+/// (headless X, Xvfb, old servers).
+fn discover_outputs(conn: &RustConnection, root: Window, root_w: u16, root_h: u16) -> Vec<NamedOutput> {
+    let whole = vec![NamedOutput {
+        name: None,
+        rect: OutputRect {
+            x: 0,
+            y: 0,
+            width: root_w,
+            height: root_h,
+        },
     }];
 
     let Ok(cookie) = conn.randr_get_screen_resources_current(root) else {
@@ -112,7 +114,8 @@ fn discover_outputs(
         return whole;
     };
 
-    let mut rects: Vec<OutputRect> = resources
+    // CRTC id -> rectangle, for CRTCs that actually have a mode set.
+    let crtc_rects: std::collections::HashMap<u32, OutputRect> = resources
         .crtcs
         .iter()
         .filter_map(|&crtc| {
@@ -122,21 +125,55 @@ fn discover_outputs(
                 .reply()
                 .ok()?;
             // A CRTC with no mode is disconnected/disabled.
-            (info.width > 0 && info.height > 0).then_some(OutputRect {
-                x: info.x,
-                y: info.y,
-                width: info.width,
-                height: info.height,
+            (info.width > 0 && info.height > 0).then_some((
+                crtc,
+                OutputRect {
+                    x: info.x,
+                    y: info.y,
+                    width: info.width,
+                    height: info.height,
+                },
+            ))
+        })
+        .collect();
+
+    // Walk RandR *output* objects (not CRTCs) to recover names, then join
+    // each back to its driving CRTC's rectangle. An output with no CRTC (or
+    // one that turned out inactive above) is disconnected/off — skipped.
+    let mut outputs: Vec<NamedOutput> = resources
+        .outputs
+        .iter()
+        .filter_map(|&output| {
+            let info = conn
+                .randr_get_output_info(output, resources.config_timestamp)
+                .ok()?
+                .reply()
+                .ok()?;
+            let rect = crtc_rects.get(&info.crtc)?;
+            Some(NamedOutput {
+                name: Some(String::from_utf8_lossy(&info.name).into_owned()),
+                rect: *rect,
             })
         })
         .collect();
 
-    // Mirrored outputs report identical rectangles; drawing one twice is waste.
-    rects.dedup();
-    if rects.is_empty() {
+    // Mirrored outputs report identical rectangles under different names —
+    // legitimately different `NamedOutput`s (per-screen assignment keys on
+    // the name), so no dedup here unlike the geometry-only path below.
+    if !outputs.is_empty() {
+        return outputs;
+    }
+
+    // RandR present but no *named* output resolved (e.g. output objects
+    // unsupported by this server) — fall back to bare CRTC geometry, unnamed.
+    outputs = crtc_rects
+        .values()
+        .map(|&rect| NamedOutput { name: None, rect })
+        .collect();
+    if outputs.is_empty() {
         whole
     } else {
-        rects
+        outputs
     }
 }
 
@@ -229,11 +266,44 @@ fn put_image_chunked(
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
-fn wallpaper_loop(
-    content: WallpaperContent,
+/// Build the renderer for one output's resolved content — the X11 twin of
+/// the Wayland backend's `build_content_renderer`. Split out so each output
+/// gets its own independent `GpuSceneInstance`/`FrameSource` instead of one
+/// shared across the whole root pixmap.
+fn build_content_renderer(content: WallpaperContent, device: wgpu::Device, queue: wgpu::Queue) -> Result<ContentRenderer> {
+    Ok(match content {
+        WallpaperContent::Scene { dir } => {
+            match GpuSceneInstance::with_device(device, queue, &dir) {
+                Ok(instance) => ContentRenderer::Scene(Box::new(instance)),
+                Err(e) => {
+                    tracing::warn!(target: "wallpaper", "GPU scene init failed ({e}); using frame-loop fallback");
+                    ContentRenderer::Frames(FrameSource::from_content(WallpaperContent::Scene {
+                        dir,
+                    })?)
+                }
+            }
+        }
+        other => ContentRenderer::Frames(FrameSource::from_content(other)?),
+    })
+}
+
+/// One monitor's independent render state: its own content, own `ContentRenderer`,
+/// and its own click-edge tracking (X11 has no press/release *event* here — see
+/// `left_down`'s doc comment below — so each output needs its own last-known state,
+/// not one shared pair that would cross-talk between two different web wallpapers).
+struct OutputInstance {
+    named: NamedOutput,
+    renderer: ContentRenderer,
+    /// This output's own independent `RenderSettings` — resolved from
+    /// `ScreenSettings` the same way `renderer` is resolved from
+    /// `ScreenContent`, so a heavy scene on one monitor can't force every
+    /// other monitor's quality down with it.
     settings: Arc<Mutex<RenderSettings>>,
-    stop: Arc<AtomicBool>,
-) -> Result<()> {
+    left_down: bool,
+    right_down: bool,
+}
+
+fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, stop: Arc<AtomicBool>) -> Result<()> {
     let (conn, screen_num) =
         x11rb::connect(None).map_err(|e| anyhow!("cannot connect to X display: {e}"))?;
     let screen = &conn.setup().roots[screen_num];
@@ -251,27 +321,50 @@ fn wallpaper_loop(
     let gpu_scaler = platform::GpuScaler::from_device(gpu)
         .map_err(|e| anyhow!("GPU scaler init failed: {e}"))?;
 
-    let mut renderer = match content {
-        WallpaperContent::Scene { dir } => {
-            match GpuSceneInstance::with_device(device, queue, &dir) {
-                Ok(instance) => ContentRenderer::Scene(Box::new(instance)),
-                Err(e) => {
-                    tracing::warn!(target: "wallpaper", "GPU scene init failed ({e}); using frame-loop fallback");
-                    ContentRenderer::Frames(FrameSource::from_content(WallpaperContent::Scene {
-                        dir,
-                    })?)
-                }
-            }
-        }
-        other => ContentRenderer::Frames(FrameSource::from_content(other)?),
-    };
-
-    let outputs = discover_outputs(&conn, root, root_w, root_h);
+    let named_outputs = discover_outputs(&conn, root, root_w, root_h);
     tracing::info!(
         target: "wallpaper",
         "X11 root pixmap {root_w}x{root_h}, depth {depth}, {} output(s)",
-        outputs.len()
+        named_outputs.len()
     );
+
+    let mut outputs: Vec<OutputInstance> = Vec::with_capacity(named_outputs.len());
+    for named in named_outputs {
+        let per_screen = named
+            .name
+            .as_deref()
+            .is_some_and(|n| content.by_output.contains_key(n));
+        let resolved = content.resolve(named.name.as_deref());
+        match build_content_renderer(resolved, device.clone(), queue.clone()) {
+            Ok(renderer) => {
+                tracing::info!(
+                    target: "wallpaper",
+                    "output {:?}: {} wallpaper",
+                    named.name,
+                    if per_screen { "per-screen" } else { "default" }
+                );
+                let output_settings = settings.resolve(named.name.as_deref());
+                outputs.push(OutputInstance {
+                    named,
+                    renderer,
+                    settings: output_settings,
+                    left_down: false,
+                    right_down: false,
+                });
+            }
+            // Don't take down every other (working) output over one bad
+            // content path — log and leave this output out of the pixmap
+            // entirely (it keeps whatever the desktop already had there).
+            Err(e) => tracing::error!(
+                target: "wallpaper",
+                "failed to load wallpaper content for output {:?}: {e} — leaving it blank",
+                named.name
+            ),
+        }
+    }
+    if outputs.is_empty() {
+        return Err(anyhow!("no output's wallpaper content loaded successfully"));
+    }
 
     // The pixmap stays owned by this connection: when the process exits the
     // server frees it and the previous desktop background comes back.
@@ -284,15 +377,9 @@ fn wallpaper_loop(
     let prop_esetroot = conn.intern_atom(false, b"ESETROOT_PMAP_ID")?.reply()?.atom;
 
     let frame_budget = Duration::from_secs_f32(1.0 / TARGET_FPS);
-    let animated = renderer.is_animated();
-
-    // Edge-detected against each frame's polled button mask below — X11 has
-    // no press/release *event* path here (this backend polls, it doesn't
-    // subscribe), so a state change is the only way to tell "just clicked"
-    // from "held from last frame" apart, matching the C++ reference's own
-    // `CWeb::updateMouse` (`if leftClick != this->m_leftClick`).
-    let mut left_down = false;
-    let mut right_down = false;
+    // Any output still animating keeps the whole loop going; a genuinely
+    // static desktop (every output static) holds the pixmap and sleeps.
+    let animated = outputs.iter().any(|o| o.renderer.is_animated());
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -300,21 +387,20 @@ fn wallpaper_loop(
         }
         let started = Instant::now();
 
-        let frame = renderer.next_frame()?;
-        let quality = settings.lock().unwrap().quality;
-
-        for rect in &outputs {
+        for output in &mut outputs {
+            let quality = output.settings.lock().unwrap().quality;
+            let frame = output.renderer.next_frame()?;
             // `GpuScaler` emits ARGB8888-LE, i.e. bytes [B, G, R, A] — already
             // the byte order a Z_PIXMAP wants on a little-endian server, and
             // the same order the reference gets from its GL_BGRA readback. Do
             // not "fix" this into an RGBA swap.
             let pixels = gpu_scaler.scale(
                 frame.as_ref(),
-                rect.width as u32,
-                rect.height as u32,
+                output.named.rect.width as u32,
+                output.named.rect.height as u32,
                 quality,
             );
-            put_image_chunked(&conn, pixmap, gc, depth, *rect, &pixels)?;
+            put_image_chunked(&conn, pixmap, gc, depth, output.named.rect, &pixels)?;
         }
 
         // Publish the pixmap. Compositors (picom et al.) watch these atoms and
@@ -342,7 +428,7 @@ fn wallpaper_loop(
         conn.flush()?;
 
         if !animated {
-            // Static image: hold the pixmap until asked to stop.
+            // Every output is static: hold the pixmap until asked to stop.
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(100));
             }
@@ -351,28 +437,34 @@ fn wallpaper_loop(
 
         // Global cursor position drives parallax. X11 hands us this regardless
         // of which window has focus, so unlike the Wayland backend there is no
-        // "cursor left our surface" blind spot.
-        match &mut renderer {
-            ContentRenderer::Scene(scene) => {
-                if let Ok(pointer) = conn.query_pointer(root)?.reply() {
-                    let norm = [
-                        (pointer.root_x as f32 / root_w.max(1) as f32).clamp(0.0, 1.0),
-                        (pointer.root_y as f32 / root_h.max(1) as f32).clamp(0.0, 1.0),
-                    ];
-                    scene.set_mouse(norm);
+        // "cursor left our surface" blind spot. With multiple outputs, forward
+        // it only to whichever output's rect actually contains the cursor —
+        // each output's own last-known left/right state (`OutputInstance`)
+        // keeps two different web wallpapers on two different screens from
+        // cross-talking through a would-be shared click-edge flag.
+        if let Ok(pointer) = conn.query_pointer(root)?.reply() {
+            for output in &mut outputs {
+                let rect = output.named.rect;
+                let (px, py) = (pointer.root_x as i32, pointer.root_y as i32);
+                let inside = px >= rect.x as i32
+                    && py >= rect.y as i32
+                    && px < rect.x as i32 + rect.width as i32
+                    && py < rect.y as i32 + rect.height as i32;
+                if !inside {
+                    continue;
                 }
-            }
-            ContentRenderer::Frames(fs) => {
-                // Polled, not event-driven (see `left_down`/`right_down`'s
-                // own doc comment) — mirrors the C++ reference's own
-                // per-frame `CWeb::updateMouse` poll, not just Wayland's
-                // event model adapted here.
-                if let Some(tx) = fs.web_input() {
-                    if let Ok(pointer) = conn.query_pointer(root)?.reply() {
-                        let norm = [
-                            (pointer.root_x as f32 / root_w.max(1) as f32).clamp(0.0, 1.0),
-                            (pointer.root_y as f32 / root_h.max(1) as f32).clamp(0.0, 1.0),
-                        ];
+                let norm = [
+                    ((px - rect.x as i32) as f32 / rect.width.max(1) as f32).clamp(0.0, 1.0),
+                    ((py - rect.y as i32) as f32 / rect.height.max(1) as f32).clamp(0.0, 1.0),
+                ];
+                match &mut output.renderer {
+                    ContentRenderer::Scene(scene) => scene.set_mouse(norm),
+                    ContentRenderer::Frames(fs) => {
+                        // Polled, not event-driven (see `OutputInstance`'s own
+                        // doc comment) — mirrors the C++ reference's own
+                        // per-frame `CWeb::updateMouse` poll, not just
+                        // Wayland's event model adapted here.
+                        let Some(tx) = fs.web_input() else { continue };
                         let _ = tx.try_send(crate::render::web::WebInputEvent::MouseMove {
                             x_norm: norm[0],
                             y_norm: norm[1],
@@ -381,8 +473,8 @@ fn wallpaper_loop(
                         let mask: u16 = pointer.mask.into();
                         let left_now = mask & u16::from(KeyButMask::BUTTON1) != 0;
                         let right_now = mask & u16::from(KeyButMask::BUTTON3) != 0;
-                        if left_now != left_down {
-                            left_down = left_now;
+                        if left_now != output.left_down {
+                            output.left_down = left_now;
                             let _ = tx.try_send(crate::render::web::WebInputEvent::MouseButton {
                                 x_norm: norm[0],
                                 y_norm: norm[1],
@@ -390,8 +482,8 @@ fn wallpaper_loop(
                                 pressed: left_now,
                             });
                         }
-                        if right_now != right_down {
-                            right_down = right_now;
+                        if right_now != output.right_down {
+                            output.right_down = right_now;
                             let _ = tx.try_send(crate::render::web::WebInputEvent::MouseButton {
                                 x_norm: norm[0],
                                 y_norm: norm[1],

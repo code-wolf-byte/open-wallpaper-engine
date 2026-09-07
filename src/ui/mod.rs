@@ -247,7 +247,10 @@ impl WpApp {
                 old.stop();
             }
             let result = detect_platform()
-                .spawn_wallpaper(content, settings)
+                .spawn_wallpaper(
+                    crate::render::ScreenContent::single(content),
+                    crate::render::ScreenSettings::single(settings),
+                )
                 .map(|handle| (handle, display_title.clone()))
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);

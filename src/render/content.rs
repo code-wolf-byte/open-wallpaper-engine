@@ -10,6 +10,11 @@ use crate::workshop::{Wallpaper, WallpaperType};
 /// This is the primary extension point as new wallpaper types are supported:
 /// add a new variant here, implement it in `from_wallpaper`/`from_path`, and
 /// add a corresponding `FrameSource` variant in `frame.rs`.
+///
+/// `Clone` is cheap for every variant (an `Arc` clone or a `PathBuf` clone) —
+/// needed so the same content value can seed independent per-output renderer
+/// state (see [`ScreenContent`]) without re-resolving it from disk per output.
+#[derive(Clone)]
 pub enum WallpaperContent {
     /// A pre-loaded static RGBA image (PNG, JPEG, …).
     Static(Arc<RgbaImage>),
@@ -129,5 +134,99 @@ impl WallpaperContent {
                 Ok(WallpaperContent::Static(Arc::new(img)))
             }
         }
+    }
+}
+
+/// Per-output wallpaper content: what a [`crate::platform::DisplayPlatform`]
+/// resolves for each display it discovers, so different outputs can show
+/// different wallpapers (`wp-engine config set-screen`).
+///
+/// `by_output` is keyed by the platform's own output-name convention (a
+/// Wayland `wl_output`/xdg-output name like `"DP-1"`, or an X11 RandR output
+/// name like `"HDMI-1"`) — the same string `wp-engine config set-screen`
+/// takes. Outputs with no entry (including every output on platforms/paths
+/// that only ever discover one target, or when nothing was configured at
+/// all) fall back to `default`.
+#[derive(Clone)]
+pub struct ScreenContent {
+    pub by_output: std::collections::HashMap<String, WallpaperContent>,
+    pub default: WallpaperContent,
+}
+
+impl ScreenContent {
+    /// The common case: one wallpaper, shown on every output — what `set`/
+    /// `set-file` always use, and what `run` falls back to when no
+    /// screen-specific assignment was ever configured.
+    pub fn single(content: WallpaperContent) -> Self {
+        Self {
+            by_output: std::collections::HashMap::new(),
+            default: content,
+        }
+    }
+
+    /// The content to show on an output with this name (`None` when the
+    /// platform can't identify the output, e.g. no xdg-output support).
+    pub fn resolve(&self, output_name: Option<&str>) -> WallpaperContent {
+        output_name
+            .and_then(|name| self.by_output.get(name))
+            .cloned()
+            .unwrap_or_else(|| self.default.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scene(name: &str) -> WallpaperContent {
+        WallpaperContent::Scene {
+            dir: PathBuf::from(name),
+        }
+    }
+
+    fn scene_dir(content: &WallpaperContent) -> &str {
+        match content {
+            WallpaperContent::Scene { dir } => dir.to_str().unwrap(),
+            _ => panic!("expected a Scene variant, got a different one"),
+        }
+    }
+
+    #[test]
+    fn single_resolves_to_the_same_content_for_any_output() {
+        let content = ScreenContent::single(scene("default"));
+        assert_eq!(scene_dir(&content.resolve(None)), "default");
+        assert_eq!(scene_dir(&content.resolve(Some("DP-1"))), "default");
+        assert_eq!(scene_dir(&content.resolve(Some("HDMI-1"))), "default");
+    }
+
+    #[test]
+    fn resolve_prefers_the_named_output_entry_over_default() {
+        let mut by_output = std::collections::HashMap::new();
+        by_output.insert("DP-1".to_string(), scene("dp1-wallpaper"));
+        let content = ScreenContent {
+            by_output,
+            default: scene("default"),
+        };
+
+        assert_eq!(scene_dir(&content.resolve(Some("DP-1"))), "dp1-wallpaper");
+        // A different, unconfigured output name falls back to default.
+        assert_eq!(scene_dir(&content.resolve(Some("HDMI-1"))), "default");
+        // No output name at all (platform couldn't identify it) also falls
+        // back to default.
+        assert_eq!(scene_dir(&content.resolve(None)), "default");
+    }
+
+    #[test]
+    fn resolve_handles_multiple_distinct_screens_independently() {
+        let mut by_output = std::collections::HashMap::new();
+        by_output.insert("DP-1".to_string(), scene("wallpaper-a"));
+        by_output.insert("HDMI-1".to_string(), scene("wallpaper-b"));
+        let content = ScreenContent {
+            by_output,
+            default: scene("default"),
+        };
+
+        assert_eq!(scene_dir(&content.resolve(Some("DP-1"))), "wallpaper-a");
+        assert_eq!(scene_dir(&content.resolve(Some("HDMI-1"))), "wallpaper-b");
     }
 }

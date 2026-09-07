@@ -21,7 +21,7 @@
 // wgpu selects Metal automatically; WGSL is compiled to MSL by naga inside wgpu.
 
 use std::process::Child;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use objc2_app_kit::{NSView, NSWindowCollectionBehavior};
@@ -34,25 +34,27 @@ use winit::window::{Window, WindowId};
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
 use super::GpuDevice;
 use crate::engine::gpu_renderer::GpuSceneInstance;
-use crate::render::{RenderSettings, WallpaperContent};
+use crate::render::{ScreenContent, ScreenSettings, WallpaperContent};
 
 // ── Platform implementation ───────────────────────────────────────────────────
 
 pub struct MacOSPlatform;
 
 impl DisplayPlatform for MacOSPlatform {
-    fn spawn_wallpaper(
-        &self,
-        content: WallpaperContent,
-        settings: Arc<Mutex<RenderSettings>>,
-    ) -> Result<WallpaperHandle> {
+    fn spawn_wallpaper(&self, content: ScreenContent, _settings: ScreenSettings) -> Result<WallpaperHandle> {
         // AppKit/winit demand the event loop on the process main thread, and the
         // GUI (eframe) already owns this process's main thread — two winit event
         // loops can't share it. So we can't run the wallpaper in-process here.
         // Instead launch it as a child process (`wp-engine set-file <dir>`) that
         // owns its own main thread and runs `run_wallpaper_on_main`. The returned
         // handle stops the wallpaper by killing that child.
-        let dir = match &content {
+        //
+        // Per-screen assignment (`content.by_output`) isn't honored yet: this
+        // backend doesn't enumerate NSScreens or place a window per display at
+        // all yet (see the file doc comment above — "step 2 of the port"), so
+        // there's nowhere to route a second wallpaper to. Always runs
+        // `content.default`, same as before this was even a `ScreenContent`.
+        let dir = match &content.default {
             WallpaperContent::Scene { dir } => dir.clone(),
             _ => bail!("macOS backend currently renders only scene wallpapers"),
         };
@@ -63,10 +65,7 @@ impl DisplayPlatform for MacOSPlatform {
             .arg(&dir)
             .spawn()
             .map_err(|e| anyhow!("failed to launch wallpaper process: {e}"))?;
-        Ok(WallpaperHandle::new(
-            Box::new(ChildWallpaperHandle { child }),
-            settings,
-        ))
+        Ok(WallpaperHandle::new(Box::new(ChildWallpaperHandle { child })))
     }
 }
 

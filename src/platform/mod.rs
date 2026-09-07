@@ -47,6 +47,13 @@ impl RenderQuality {
         }
     }
 
+    /// Case-insensitive inverse of [`Self::label`] — for parsing
+    /// `--quality`/`wp-engine config set-quality` CLI input and the saved
+    /// per-wallpaper value in `settings::WpSettings`.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|q| q.label().eq_ignore_ascii_case(s))
+    }
+
     pub const ALL: [Self; 4] = [Self::Ultra, Self::High, Self::Medium, Self::Low];
 }
 

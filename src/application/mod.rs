@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::platform::{self, WallpaperHandle};
-use crate::render::WallpaperContent;
+use crate::render::{ScreenContent, ScreenSettings, WallpaperContent};
 
 pub mod application_context;
 pub use application_context::ApplicationContext;
@@ -48,7 +48,48 @@ impl WallpaperApplication {
         &self.context
     }
 
-    /// Load the configured background and start rendering on all outputs.
+    /// Resolves `context.background` (the default, shown on any output with
+    /// no more specific entry) and `context.screens` (per-output overrides,
+    /// only ever populated by `wp-engine run`) into a [`ScreenContent`] the
+    /// platform layer can hand out per discovered output. A screen whose
+    /// content fails to load is logged and skipped — falls back to the
+    /// default for that one output rather than failing the whole wallpaper
+    /// over one bad per-screen entry.
+    fn resolve_screen_content(&self) -> Result<ScreenContent> {
+        let default = WallpaperContent::from_any_path(&self.context.background).with_context(
+            || format!("loading wallpaper {}", self.context.background.display()),
+        )?;
+        let mut by_output = std::collections::HashMap::new();
+        for (screen, path) in &self.context.screens {
+            match WallpaperContent::from_any_path(path) {
+                Ok(content) => {
+                    by_output.insert(screen.clone(), content);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "app",
+                        "screen '{screen}': failed to load {}: {e} — falling back to the default wallpaper",
+                        path.display()
+                    );
+                }
+            }
+        }
+        Ok(ScreenContent { by_output, default })
+    }
+
+    /// The [`ScreenSettings`] twin of `resolve_screen_content` — `screen_
+    /// settings` was already built per-screen at the CLI layer (`main.rs`,
+    /// where each screen's saved quality override is looked up by its
+    /// original workshop-ID-or-path string), so this is just a wrap, not a
+    /// second resolution pass.
+    fn resolve_screen_settings(&self) -> ScreenSettings {
+        ScreenSettings {
+            by_output: self.context.screen_settings.clone(),
+            default: self.context.settings.clone(),
+        }
+    }
+
+    /// Load the configured background(s) and start rendering.
     #[tracing::instrument(target = "app", level = "info", skip(self), fields(background = %self.context.background.display()))]
     pub fn setup(&mut self) -> Result<()> {
         // macOS runs the wallpaper on the main thread in `show()` (winit/AppKit
@@ -61,13 +102,10 @@ impl WallpaperApplication {
         #[cfg(not(target_os = "macos"))]
         {
             tracing::info!(target: "app", "loading wallpaper content");
-            let content =
-                WallpaperContent::from_any_path(&self.context.background).with_context(|| {
-                    format!("loading wallpaper {}", self.context.background.display())
-                })?;
+            let content = self.resolve_screen_content()?;
+            let settings = self.resolve_screen_settings();
             tracing::debug!(target: "app", "content loaded; spawning platform renderer");
-            let handle = platform::detect_platform()
-                .spawn_wallpaper(content, self.context.settings.clone())?;
+            let handle = platform::detect_platform().spawn_wallpaper(content, settings)?;
             self.handle = Some(handle);
             tracing::info!(target: "app", "wallpaper renderer started");
             Ok(())

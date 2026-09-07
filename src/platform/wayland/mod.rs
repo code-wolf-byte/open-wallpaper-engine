@@ -35,7 +35,7 @@ use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
 use crate::{
     engine::gpu_renderer::GpuSceneInstance,
     platform,
-    render::{FrameSource, RenderSettings, WallpaperContent},
+    render::{FrameSource, RenderSettings, ScreenContent, ScreenSettings, WallpaperContent},
 };
 
 // ── Platform implementation ───────────────────────────────────────────────────
@@ -43,13 +43,9 @@ use crate::{
 pub(super) struct WaylandPlatform;
 
 impl DisplayPlatform for WaylandPlatform {
-    fn spawn_wallpaper(
-        &self,
-        content: WallpaperContent,
-        settings: Arc<Mutex<RenderSettings>>,
-    ) -> Result<WallpaperHandle> {
-        let wayland_handle = spawn_wayland_wallpaper(content, Arc::clone(&settings))?;
-        Ok(WallpaperHandle::new(Box::new(wayland_handle), settings))
+    fn spawn_wallpaper(&self, content: ScreenContent, settings: ScreenSettings) -> Result<WallpaperHandle> {
+        let wayland_handle = spawn_wayland_wallpaper(content, settings)?;
+        Ok(WallpaperHandle::new(Box::new(wayland_handle)))
     }
 }
 
@@ -71,15 +67,11 @@ impl WallpaperHandleInner for WaylandHandle {
     }
 }
 
-fn spawn_wayland_wallpaper(
-    content: WallpaperContent,
-    settings: Arc<Mutex<RenderSettings>>,
-) -> Result<WaylandHandle> {
+fn spawn_wayland_wallpaper(content: ScreenContent, settings: ScreenSettings) -> Result<WaylandHandle> {
     let (signal_tx, signal_rx) = std::sync::mpsc::sync_channel::<LoopSignal>(0);
 
-    let settings_thread = Arc::clone(&settings);
     let thread = thread::spawn(move || {
-        if let Err(e) = wallpaper_loop(content, settings_thread, signal_tx) {
+        if let Err(e) = wallpaper_loop(content, settings, signal_tx) {
             tracing::error!(target: "wallpaper", "wallpaper thread error: {e}");
         }
     });
@@ -116,6 +108,34 @@ impl ContentRenderer {
     }
 }
 
+/// Build the renderer for one output's resolved content. Scenes render on
+/// our own device so frames can be presented directly; everything else
+/// produces CPU frames. Split out of `wallpaper_loop` so `new_output` can
+/// call it per-output instead of once for the whole process — the core of
+/// per-screen wallpapers: each output gets its own independent
+/// `GpuSceneInstance`/`FrameSource`, not a shared one.
+fn build_content_renderer(
+    content: WallpaperContent,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    allow_gpu_surface: bool,
+) -> Result<ContentRenderer> {
+    Ok(match content {
+        WallpaperContent::Scene { dir } if allow_gpu_surface => {
+            match GpuSceneInstance::with_device(device, queue, &dir) {
+                Ok(instance) => ContentRenderer::Scene(Box::new(instance)),
+                Err(e) => {
+                    tracing::warn!(target: "wallpaper", "GPU scene init failed ({e}); using frame-loop fallback");
+                    ContentRenderer::Frames(FrameSource::from_content(WallpaperContent::Scene {
+                        dir,
+                    })?)
+                }
+            }
+        }
+        other => ContentRenderer::Frames(FrameSource::from_content(other)?),
+    })
+}
+
 // ── Internal renderer state ───────────────────────────────────────────────────
 
 /// GPU presentation state for one output surface.
@@ -136,6 +156,14 @@ struct WallpaperSurface {
     height: u32,
     /// Previous frame's SHM pool — kept alive until compositor releases the buffer.
     pool: Option<SlotPool>,
+    /// This output's own independent content — resolved from `ScreenContent`
+    /// by output name at `new_output` time, so different outputs can show
+    /// different wallpapers instead of one renderer shared by every surface.
+    renderer: ContentRenderer,
+    /// This output's own independent `RenderSettings` — resolved from
+    /// `ScreenSettings` the same way `renderer` is, so a heavy scene on one
+    /// monitor can't force every other monitor's quality down with it.
+    settings: Arc<Mutex<RenderSettings>>,
 }
 
 struct WallpaperState {
@@ -149,15 +177,22 @@ struct WallpaperState {
     /// and `g_PointerPosition`.
     pointer: Option<wl_pointer::WlPointer>,
     surfaces: Vec<WallpaperSurface>,
-    renderer: ContentRenderer,
+    /// Per-output content to resolve against each new output's name —
+    /// `new_output` builds that output's own `ContentRenderer` from this.
+    content: ScreenContent,
     gpu_scaler: platform::GpuScaler,
-    settings: Arc<Mutex<RenderSettings>>,
+    /// Per-output `RenderSettings` to resolve against each new output's
+    /// name, the same way `content` is.
+    settings: ScreenSettings,
     /// Queue handle stored so draw_at can request wl_surface_frame callbacks.
     qh: Option<QueueHandle<WallpaperState>>,
     // GPU presentation
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
+    /// Cloned alongside `device` — every output builds its own
+    /// `GpuSceneInstance`/`FrameSource` from the same shared wgpu queue.
+    queue: wgpu::Queue,
     display_ptr: *mut c_void,
     allow_gpu_surface: bool,
 }
@@ -168,7 +203,7 @@ impl WallpaperState {
     fn ensure_gpu_surface(&mut self, idx: usize) {
         if !self.allow_gpu_surface
             || self.surfaces[idx].gpu_failed
-            || !matches!(self.renderer, ContentRenderer::Scene(_))
+            || !matches!(self.surfaces[idx].renderer, ContentRenderer::Scene(_))
         {
             return;
         }
@@ -260,6 +295,10 @@ impl WallpaperState {
     }
 
     fn draw_at(&mut self, idx: usize) {
+        eprintln!(
+            "DIAG draw_at idx={idx} w={} h={}",
+            self.surfaces[idx].width, self.surfaces[idx].height
+        );
         if self.surfaces[idx].width == 0 || self.surfaces[idx].height == 0 {
             return;
         }
@@ -277,7 +316,7 @@ impl WallpaperState {
         let (width, height) = (self.surfaces[idx].width, self.surfaces[idx].height);
 
         // Request the next frame callback before present() commits the surface.
-        if self.renderer.is_animated() {
+        if self.surfaces[idx].renderer.is_animated() {
             if let Some(qh) = &self.qh {
                 let wl_surf = self.surfaces[idx].layer.wl_surface();
                 wl_surf.frame(qh, wl_surf.clone());
@@ -317,7 +356,7 @@ impl WallpaperState {
 
         let view = frame.texture.create_view(&Default::default());
         let format = self.surfaces[idx].gpu.as_ref().unwrap().format;
-        match &mut self.renderer {
+        match &mut self.surfaces[idx].renderer {
             ContentRenderer::Scene(instance) => {
                 instance.render_to_view(&view, width, height, format);
             }
@@ -333,7 +372,7 @@ impl WallpaperState {
         let width = self.surfaces[idx].width;
         let height = self.surfaces[idx].height;
 
-        let frame: Arc<image::RgbaImage> = match &mut self.renderer {
+        let frame: Arc<image::RgbaImage> = match &mut self.surfaces[idx].renderer {
             ContentRenderer::Frames(fs) => Arc::clone(fs.current_frame()),
             ContentRenderer::Scene(instance) => match instance.render_rgba() {
                 Ok(img) => Arc::new(img),
@@ -343,6 +382,24 @@ impl WallpaperState {
                 }
             },
         };
+        {
+            let raw = frame.as_raw();
+            let (fw, fh) = (frame.width() as usize, frame.height() as usize);
+            let sample = |xf: f64, yf: f64| -> Option<[u8; 4]> {
+                let x = ((fw as f64) * xf) as usize;
+                let y = ((fh as f64) * yf) as usize;
+                let off = (y * fw + x) * 4;
+                raw.get(off..off + 4).map(|s| [s[0], s[1], s[2], s[3]])
+            };
+            eprintln!(
+                "DIAG draw_shm idx={idx} frame={fw}x{fh} corners tl={:?} tr={:?} bl={:?} br={:?} mid={:?}",
+                sample(0.05, 0.05),
+                sample(0.95, 0.05),
+                sample(0.05, 0.95),
+                sample(0.95, 0.95),
+                sample(0.5, 0.5),
+            );
+        }
 
         let row_bytes = width as usize * 4;
         let stride = row_bytes;
@@ -368,7 +425,7 @@ impl WallpaperState {
             }
         };
 
-        let quality = self.settings.lock().unwrap().quality;
+        let quality = self.surfaces[idx].settings.lock().unwrap().quality;
         let pixels = self
             .gpu_scaler
             .scale(frame.as_ref(), width, height, quality);
@@ -392,7 +449,7 @@ impl WallpaperState {
         // animated sources. The callback fires after the compositor presents
         // this frame, at which point we advance to the next frame and draw again.
         // Static sources draw once on configure and never request more callbacks.
-        if self.renderer.is_animated() {
+        if self.surfaces[idx].renderer.is_animated() {
             if let Some(qh) = &self.qh {
                 wl_surf.frame(qh, wl_surf.clone());
             }
@@ -432,11 +489,7 @@ fn copy_frame_into_shm_canvas(
     }
 }
 
-fn wallpaper_loop(
-    content: WallpaperContent,
-    settings: Arc<Mutex<RenderSettings>>,
-    signal_tx: SyncSender<LoopSignal>,
-) -> Result<()> {
+fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, signal_tx: SyncSender<LoopSignal>) -> Result<()> {
     // Open GPU device (prefer iGPU for background tasks; fall back to best).
     let gpu = platform::GpuDevice::open_low_power()
         .or_else(|_| platform::GpuDevice::open_best())
@@ -449,23 +502,6 @@ fn wallpaper_loop(
         .map_err(|e| anyhow!("GPU scaler init failed: {e}"))?;
 
     let allow_gpu_surface = std::env::var("WP_ENGINE_FORCE_SHM").is_err();
-
-    // Build the content renderer. Scenes render on our own device so frames
-    // can be presented directly; everything else produces CPU frames.
-    let renderer = match content {
-        WallpaperContent::Scene { dir } if allow_gpu_surface => {
-            match GpuSceneInstance::with_device(device.clone(), queue.clone(), &dir) {
-                Ok(instance) => ContentRenderer::Scene(Box::new(instance)),
-                Err(e) => {
-                    tracing::warn!(target: "wallpaper", "GPU scene init failed ({e}); using frame-loop fallback");
-                    ContentRenderer::Frames(FrameSource::from_content(WallpaperContent::Scene {
-                        dir,
-                    })?)
-                }
-            }
-        }
-        other => ContentRenderer::Frames(FrameSource::from_content(other)?),
-    };
 
     let conn = Connection::connect_to_env()
         .map_err(|e| anyhow!("cannot connect to Wayland display: {e}"))?;
@@ -496,13 +532,14 @@ fn wallpaper_loop(
         layer_shell,
         pointer: None,
         surfaces: Vec::new(),
-        renderer,
+        content,
         gpu_scaler,
         settings,
         qh: Some(qh.clone()),
         instance,
         adapter,
         device,
+        queue,
         display_ptr,
         allow_gpu_surface,
     };
@@ -576,7 +613,7 @@ impl CompositorHandler for WallpaperState {
             .position(|s| s.layer.wl_surface() == surface);
         if let Some(idx) = idx {
             self.qh = Some(qh.clone());
-            if let ContentRenderer::Frames(fs) = &mut self.renderer {
+            if let ContentRenderer::Frames(fs) = &mut self.surfaces[idx].renderer {
                 fs.try_advance();
             }
             self.draw_at(idx);
@@ -595,6 +632,36 @@ impl OutputHandler for WallpaperState {
         qh: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
+        // The xdg-output/wl_output name (e.g. "DP-1") — the same string
+        // `wp-engine config set-screen` takes — resolved via SCTK's own
+        // output-info aggregation, `None` when the compositor never reports
+        // one (no per-screen assignment can ever match; falls back to the
+        // default wallpaper below, same as always).
+        let output_name = self.output_state.info(&output).and_then(|info| info.name);
+
+        let resolved = self.content.resolve(output_name.as_deref());
+        let per_screen = output_name
+            .as_deref()
+            .is_some_and(|name| self.content.by_output.contains_key(name));
+        let renderer =
+            match build_content_renderer(resolved, self.device.clone(), self.queue.clone(), self.allow_gpu_surface) {
+                Ok(r) => r,
+                Err(e) => {
+                    // Don't take down every other (working) output over one
+                    // bad content path — log and leave this output blank.
+                    tracing::error!(
+                        target: "wallpaper",
+                        "failed to load wallpaper content for output {output_name:?}: {e} — leaving it blank"
+                    );
+                    return;
+                }
+            };
+        tracing::info!(
+            target: "wallpaper",
+            "output {output_name:?}: {} wallpaper",
+            if per_screen { "per-screen" } else { "default" }
+        );
+
         let wl_surface = self.compositor_state.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(
             qh,
@@ -609,6 +676,8 @@ impl OutputHandler for WallpaperState {
         layer.set_size(0, 0);
         layer.commit();
 
+        let settings = self.settings.resolve(output_name.as_deref());
+
         self.surfaces.push(WallpaperSurface {
             gpu: None,
             gpu_failed: false,
@@ -616,6 +685,8 @@ impl OutputHandler for WallpaperState {
             width: 0,
             height: 0,
             pool: None,
+            renderer,
+            settings,
         });
     }
 
@@ -720,20 +791,21 @@ impl PointerHandler for WallpaperState {
                 PointerEventKind::Release { button, .. } => (Some(button), false),
                 _ => continue,
             };
-            let Some(surface) = self
+            let Some(idx) = self
                 .surfaces
                 .iter()
-                .find(|s| s.layer.wl_surface() == &event.surface)
+                .position(|s| s.layer.wl_surface() == &event.surface)
             else {
                 continue;
             };
+            let surface = &self.surfaces[idx];
             if surface.width == 0 || surface.height == 0 {
                 continue;
             }
 
             let norm = pointer_norm(event.position, surface.width, surface.height);
 
-            match &mut self.renderer {
+            match &mut self.surfaces[idx].renderer {
                 // ponytail: only tracks while the cursor is over our own
                 // layer surface. The reference additionally queries
                 // Hyprland's IPC socket for a global cursor when another

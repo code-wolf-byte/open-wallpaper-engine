@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use wp_engine::application::{ApplicationContext, WallpaperApplication};
 use wp_engine::workshop::{self, Wallpaper};
 use wp_engine::{engine, platform, ui};
@@ -40,6 +41,12 @@ enum Command {
         /// Override a user property: NAME=VALUE (repeatable; bare NAME = true)
         #[arg(long = "set-property", value_name = "NAME=VALUE")]
         properties: Vec<String>,
+        /// Render quality for this run: Ultra, High, Medium, or Low
+        #[arg(long)]
+        quality: Option<String>,
+        /// Persist these --set-property/--quality overrides for next time (see `config`)
+        #[arg(long)]
+        save: bool,
     },
     /// Apply a scene directory, video, image, or HTML file (CLI, blocks until Ctrl-C)
     SetFile {
@@ -47,6 +54,12 @@ enum Command {
         /// Override a user property: NAME=VALUE (repeatable; bare NAME = true)
         #[arg(long = "set-property", value_name = "NAME=VALUE")]
         properties: Vec<String>,
+        /// Render quality for this run: Ultra, High, Medium, or Low
+        #[arg(long)]
+        quality: Option<String>,
+        /// Persist these --set-property/--quality overrides for next time (see `config`)
+        #[arg(long)]
+        save: bool,
     },
     /// List the user-configurable properties of a Workshop item
     ListProperties { id: String },
@@ -98,6 +111,54 @@ enum Command {
         #[arg(long, default_value_t = 60)]
         frames: usize,
     },
+    /// Manage persisted settings: per-wallpaper property overrides, screen
+    /// assignments, and playlists (~/.config/wp-engine/settings.json)
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+    /// Run using persisted settings — see `config` to set them up first
+    Run,
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Print the full persisted settings file
+    Show,
+    /// Persist a property override for a wallpaper without launching it
+    SetProperty {
+        id: String,
+        /// NAME=VALUE (repeatable; bare NAME = true)
+        #[arg(required = true, value_name = "NAME=VALUE")]
+        properties: Vec<String>,
+    },
+    /// Remove a persisted property override
+    UnsetProperty { id: String, name: String },
+    /// Assign a wallpaper to a named screen/output
+    SetScreen { screen: String, id: String },
+    /// Remove a screen's saved wallpaper assignment
+    UnsetScreen { screen: String },
+    /// Set the fallback wallpaper `wp-engine run` uses with no screen assigned
+    SetDefault { id: String },
+    /// Persist a render-quality override for a wallpaper: Ultra, High, Medium, or Low
+    SetQuality { id: String, quality: String },
+    /// Remove a persisted render-quality override
+    UnsetQuality { id: String },
+    /// Define or replace a playlist
+    SetPlaylist {
+        name: String,
+        /// Workshop IDs or paths, in playback order
+        #[arg(required = true)]
+        items: Vec<String>,
+        #[arg(long, default_value_t = 60)]
+        delay: u32,
+        #[arg(long, default_value = "timer")]
+        mode: String,
+        #[arg(long, default_value = "sequential")]
+        order: String,
+    },
+    /// Remove a playlist
+    RemovePlaylist { name: String },
 }
 
 fn main() {
@@ -117,8 +178,10 @@ fn main() {
         // No subcommand → open GUI
         None => run_ui(),
         Some(Command::List { r#type }) => cmd_list(r#type),
-        Some(Command::Set { id, properties }) => cmd_set(&id, properties),
-        Some(Command::SetFile { path, properties }) => cmd_set_file(&path, properties),
+        Some(Command::Set { id, properties, quality, save }) => cmd_set(&id, properties, quality, save),
+        Some(Command::SetFile { path, properties, quality, save }) => {
+            cmd_set_file(&path, properties, quality, save)
+        }
         Some(Command::ListProperties { id }) => cmd_list_properties(&id),
         Some(Command::Info { id }) => cmd_info(&id),
         Some(Command::Probe) => cmd_probe(),
@@ -135,6 +198,8 @@ fn main() {
             height,
         }) => cmd_preview_scene(&id_or_path, width, height),
         Some(Command::TestScene { id_or_path, frames }) => cmd_test_scene(&id_or_path, frames),
+        Some(Command::Config { action }) => cmd_config(action),
+        Some(Command::Run) => cmd_run(),
     };
 
     if let Err(e) = result {
@@ -233,43 +298,315 @@ fn cmd_info(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_set(id: &str, properties: Vec<String>) -> Result<()> {
+fn cmd_set(id: &str, properties: Vec<String>, quality: Option<String>, save: bool) -> Result<()> {
     let w = workshop::find_by_id(id).ok_or_else(|| anyhow!("workshop item '{id}' not found"))?;
 
     println!("Loading: {}", w.path.display());
     println!("Applying \"{}\" to all outputs...", w.title());
 
     let mut context = ApplicationContext::new(w.path.clone());
-    context.add_property_args(&properties);
+    apply_saved_settings(&mut context, id, &properties, quality.as_deref(), save)?;
     let mut app = WallpaperApplication::new(context);
     app.setup()?;
     println!("Wallpaper active. Press Ctrl-C to exit.");
     app.show()
 }
 
+/// Installs property overrides and a quality level on `context` in priority
+/// order (saved < CLI flags — `--set-property`/`--quality` — later write
+/// wins), and — when `save` is set and there's anything new to save —
+/// persists the CLI-provided values under `id_or_path` (via `settings::
+/// normalize_key`) for next time.
+fn apply_saved_settings(
+    context: &mut ApplicationContext,
+    id_or_path: &str,
+    cli_properties: &[String],
+    cli_quality: Option<&str>,
+    save: bool,
+) -> Result<()> {
+    let mut settings = wp_engine::settings::WpSettings::load();
+    let saved = settings.property_overrides(id_or_path);
+    if !saved.is_empty() {
+        println!(
+            "Loaded {} saved property override(s) from {}",
+            saved.len(),
+            wp_engine::settings::settings_path().display()
+        );
+    }
+    context.properties.extend(saved);
+    context.add_property_args(cli_properties);
+
+    let saved_quality = settings.quality_override(id_or_path);
+    let cli_quality_parsed = cli_quality
+        .map(|s| {
+            wp_engine::platform::RenderQuality::parse(s)
+                .ok_or_else(|| anyhow!("invalid --quality '{s}' (expected Ultra, High, Medium, or Low)"))
+        })
+        .transpose()?;
+    if let Some(q) = cli_quality_parsed.or(saved_quality) {
+        if cli_quality_parsed.is_none() {
+            println!("Loaded saved quality: {}", q.label());
+        }
+        context.settings.lock().unwrap().quality = q;
+    }
+
+    if save {
+        let mut saved_anything = false;
+        for arg in cli_properties {
+            let (name, value) = engine::properties::parse_property_arg(arg);
+            settings.set_property(id_or_path, &name, &value);
+            saved_anything = true;
+        }
+        if !cli_properties.is_empty() {
+            println!("Saved {} property override(s) for next time", cli_properties.len());
+        }
+        if let Some(q) = cli_quality_parsed {
+            settings.set_quality(id_or_path, q);
+            println!("Saved quality override for next time: {}", q.label());
+            saved_anything = true;
+        }
+        if saved_anything {
+            settings.save()?;
+        }
+    }
+    Ok(())
+}
+
 fn cmd_list_properties(id: &str) -> Result<()> {
     let w = workshop::find_by_id(id).ok_or_else(|| anyhow!("workshop item '{id}' not found"))?;
-    let props = engine::properties::list_properties(&w.path)?;
-    if props.is_empty() {
+    let all_props = engine::properties::list_properties(&w.path)?;
+    if all_props.is_empty() {
         println!(
             "\"{}\" declares no user-configurable properties.",
             w.title()
         );
         return Ok(());
     }
+    // Decorative declarations (HTML separators/section headers — real
+    // content ships plenty of these) aren't things a user can actually
+    // set; listing them as if they were is misleading, not just noisy.
+    let (settable, decorative): (Vec<_>, Vec<_>) =
+        all_props.into_iter().partition(|p| p.is_settable());
+
+    if settable.is_empty() {
+        println!(
+            "\"{}\" declares no settable properties ({} decorative label(s) only).",
+            w.title(),
+            decorative.len()
+        );
+        return Ok(());
+    }
+
     println!("{:<28} {:<8} {:<24} {}", "Name", "Type", "Default", "Label");
     println!("{}", "─".repeat(80));
-    for p in props {
+    for p in &settable {
+        println!("{:<28} {:<8} {:<24} {}", p.name, p.kind, p.value, p.text);
+        if p.kind == "combo" && !p.options.is_empty() {
+            let choices = p
+                .options
+                .iter()
+                .map(|(value, label)| format!("{value}={label}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("{:<28} {:<8} choices: {choices}", "", "");
+        } else if p.kind == "slider" {
+            if let (Some(min), Some(max)) = (p.min, p.max) {
+                let step = p.step.map(|s| format!(", step {s}")).unwrap_or_default();
+                println!("{:<28} {:<8} range: {min}..={max}{step}", "", "");
+            }
+        }
+    }
+    if !decorative.is_empty() {
         println!(
-            "{:<28} {:<8} {:<24} {}",
-            p.name,
-            p.kind,
-            p.value.to_string(),
-            p.text
+            "\n({} decorative label(s) not shown — no real value to set)",
+            decorative.len()
         );
     }
     println!("\nOverride with: wp-engine set {id} --set-property NAME=VALUE");
     Ok(())
+}
+
+fn cmd_config(action: ConfigAction) -> Result<()> {
+    use wp_engine::settings::{Playlist, WpSettings};
+
+    let mut settings = WpSettings::load();
+
+    match action {
+        ConfigAction::Show => {
+            let path = wp_engine::settings::settings_path();
+            println!("Settings file: {}", path.display());
+            if !path.exists() {
+                println!("(nothing saved yet)");
+                return Ok(());
+            }
+            println!("{}", serde_json::to_string_pretty(&settings)?);
+            return Ok(());
+        }
+        ConfigAction::SetProperty { id, properties } => {
+            for arg in &properties {
+                let (name, value) = engine::properties::parse_property_arg(arg);
+                println!("{id}: {name} = {value}");
+                settings.set_property(&id, &name, &value);
+            }
+        }
+        ConfigAction::UnsetProperty { id, name } => {
+            if settings.unset_property(&id, &name) {
+                println!("Removed {id}: {name}");
+            } else {
+                println!("No saved override for {id}: {name}");
+                return Ok(());
+            }
+        }
+        ConfigAction::SetScreen { screen, id } => {
+            settings.set_screen(&screen, &id);
+            println!("{screen} -> {id}");
+        }
+        ConfigAction::UnsetScreen { screen } => {
+            if settings.unset_screen(&screen) {
+                println!("Removed screen assignment: {screen}");
+            } else {
+                println!("No saved assignment for screen: {screen}");
+                return Ok(());
+            }
+        }
+        ConfigAction::SetDefault { id } => {
+            settings.set_default_background(&id);
+            println!("Default background -> {id}");
+        }
+        ConfigAction::SetQuality { id, quality } => {
+            let q = platform::RenderQuality::parse(&quality).ok_or_else(|| {
+                anyhow!("invalid quality '{quality}' (expected Ultra, High, Medium, or Low)")
+            })?;
+            settings.set_quality(&id, q);
+            println!("{id}: quality = {}", q.label());
+        }
+        ConfigAction::UnsetQuality { id } => {
+            if settings.unset_quality(&id) {
+                println!("Removed quality override for {id}");
+            } else {
+                println!("No saved quality override for {id}");
+                return Ok(());
+            }
+        }
+        ConfigAction::SetPlaylist {
+            name,
+            items,
+            delay,
+            mode,
+            order,
+        } => {
+            println!("Playlist '{name}': {} item(s)", items.len());
+            settings.playlists.insert(
+                name,
+                Playlist {
+                    items,
+                    delay_minutes: delay,
+                    mode,
+                    order,
+                },
+            );
+        }
+        ConfigAction::RemovePlaylist { name } => {
+            if settings.playlists.remove(&name).is_some() {
+                println!("Removed playlist: {name}");
+            } else {
+                println!("No such playlist: {name}");
+                return Ok(());
+            }
+        }
+    }
+
+    settings.save()?;
+    Ok(())
+}
+
+/// A workshop ID or a filesystem path, resolved to a real path on disk —
+/// the same "ID first, then treat it as a path" rule `test-scene`/
+/// `render-scene` already use.
+fn resolve_id_or_path(id_or_path: &str) -> Result<PathBuf> {
+    if let Some(w) = workshop::find_by_id(id_or_path) {
+        return Ok(w.path);
+    }
+    let path = PathBuf::from(id_or_path);
+    if path.exists() {
+        Ok(path)
+    } else {
+        Err(anyhow!(
+            "not a directory and workshop item '{id_or_path}' not found"
+        ))
+    }
+}
+
+/// Runs using persisted settings (`wp-engine config` to set them up first):
+/// every `screens` entry gets its own independent wallpaper *and* its own
+/// independent render quality on its own output (real per-screen rendering
+/// — see `render::ScreenContent`/`render::ScreenSettings`); any output with
+/// no specific entry falls back to the first configured screen's wallpaper,
+/// else `default_background`, else the first playlist's first item.
+///
+/// Honest scope note: property overrides are still process-global (see
+/// `engine::properties`), so only the *default* background's saved
+/// overrides are applied — a per-screen wallpaper's own saved overrides
+/// aren't isolated from each other yet if two different screens' wallpapers
+/// happen to declare a property with the same name. Playlists are still
+/// data-only (no rotation timer exists) — only each playlist's first item
+/// is ever actually reachable through `run` today.
+fn cmd_run() -> Result<()> {
+    let settings = wp_engine::settings::WpSettings::load();
+
+    let default_id_or_path = settings
+        .screens
+        .values()
+        .next()
+        .or(settings.default_background.as_ref())
+        .or_else(|| settings.playlists.values().next().and_then(|p| p.items.first()))
+        .ok_or_else(|| {
+            anyhow!(
+                "no saved wallpaper — use `wp-engine config set-screen`/`set-default`/\
+                 `set-playlist` first, or `wp-engine set <id>` directly"
+            )
+        })?
+        .clone();
+    let default_path = resolve_id_or_path(&default_id_or_path)?;
+
+    println!("Default background: {default_id_or_path}");
+    let mut context = ApplicationContext::new(default_path);
+    for (screen, id_or_path) in &settings.screens {
+        match resolve_id_or_path(id_or_path) {
+            Ok(path) => {
+                print!("Screen '{screen}': {id_or_path}");
+                context.screens.insert(screen.clone(), path);
+                // Independent per-screen quality — looked up by the
+                // *original* id-or-path string (not the resolved path
+                // above): that's the same key `settings::normalize_key`
+                // would derive from it, and using the resolved path here
+                // instead would silently miss every workshop-ID-keyed
+                // saved override (a real bug this comment exists to head
+                // off — `normalize_key("2821407073")` and
+                // `normalize_key("/path/to/2821407073")` are NOT the same
+                // key).
+                if let Some(q) = settings.quality_override(id_or_path) {
+                    println!(" (quality: {})", q.label());
+                    context.screen_settings.insert(
+                        screen.clone(),
+                        Arc::new(Mutex::new(wp_engine::render::RenderSettings {
+                            quality: q,
+                            ..Default::default()
+                        })),
+                    );
+                } else {
+                    println!();
+                }
+            }
+            Err(e) => println!("Screen '{screen}': {id_or_path} — {e} (skipping)"),
+        }
+    }
+
+    apply_saved_settings(&mut context, &default_id_or_path, &[], None, false)?;
+    let mut app = WallpaperApplication::new(context);
+    app.setup()?;
+    println!("Wallpaper active. Press Ctrl-C to exit.");
+    app.show()
 }
 
 fn cmd_probe() -> Result<()> {
@@ -305,7 +642,7 @@ fn cmd_probe() -> Result<()> {
     Ok(())
 }
 
-fn cmd_set_file(path: &PathBuf, properties: Vec<String>) -> Result<()> {
+fn cmd_set_file(path: &PathBuf, properties: Vec<String>, quality: Option<String>, save: bool) -> Result<()> {
     if !path.exists() {
         return Err(anyhow!("file not found: {}", path.display()));
     }
@@ -313,7 +650,8 @@ fn cmd_set_file(path: &PathBuf, properties: Vec<String>) -> Result<()> {
     println!("Applying to all outputs…");
 
     let mut context = ApplicationContext::new(path.clone());
-    context.add_property_args(&properties);
+    let key = path.display().to_string();
+    apply_saved_settings(&mut context, &key, &properties, quality.as_deref(), save)?;
     let mut app = WallpaperApplication::new(context);
     app.setup()?;
     println!("Wallpaper active. Press Ctrl-C to exit.");
