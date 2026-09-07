@@ -25,6 +25,7 @@ pub mod noise;
 pub mod particle;
 pub mod pass;
 pub mod pkg;
+pub mod playback_gate;
 pub mod properties;
 pub mod puppet;
 pub mod render;

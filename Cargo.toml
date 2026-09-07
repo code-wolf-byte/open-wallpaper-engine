@@ -95,7 +95,13 @@ wayland-client          = "0.31"
 # client_system: use libwayland so wl_display/wl_surface C pointers exist —
 # required to create wgpu (Vulkan) surfaces on the layer-shell surface.
 wayland-backend         = { version = "0.3", features = ["client_system"] }
-wayland-protocols-wlr   = "0.2"
+# "client": off by default in this crate — needed to actually bind
+# zwlr_foreign_toplevel_manager_v1 for playback-pause's fullscreen/maximized
+# detection (engine::playback_gate, Ghidra report Follow-up (ff)); every
+# other Wayland global here comes through smithay-client-toolkit's own
+# wrapper types instead, which is why this crate had no direct use (and no
+# explicit feature) before now.
+wayland-protocols-wlr   = { version = "0.2", features = ["client"] }
 calloop                 = { version = "0.12", features = ["executor"] }
 calloop-wayland-source  = "0.2"
 # X11 display backend — root-window pixmap + RandR output discovery. Pure Rust

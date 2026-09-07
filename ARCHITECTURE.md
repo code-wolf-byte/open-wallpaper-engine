@@ -168,6 +168,24 @@ equivalent, so every frame is read back and pushed with `PutImage`. X11 gets
 better parallax for free: `QueryPointer` reports the global cursor regardless of
 which window has focus.
 
+Both the X11 and Wayland backends also implement the real Wallpaper Engine's
+own "pause wallpaper rendering when..." settings (`engine::playback_gate` —
+recovered from the Ghidra dump's import table, not the usual property scan;
+see the report's Follow-up (ff)): on battery power, when the session is
+locked, and when another application is fullscreen or maximized (X11 via
+EWMH's `_NET_ACTIVE_WINDOW`/`_NET_WM_STATE`; Wayland via
+`zwlr_foreign_toplevel_management`, so it only works on compositors that
+support that wlroots-ecosystem protocol — Sway/Hyprland/river, not
+GNOME/Mutter). Session-lock detection is Linux-only (logind over D-Bus, via
+`platform::power::LockWatcher`). Each condition defaults per
+`engine::playback_gate::PauseConditions::default`'s own doc comment (WE's
+real defaults for these aren't recoverable from the binary) and is
+overridable with `WP_ENGINE_PAUSE_ON_BATTERY`/`_LOCK`/`_FULLSCREEN`/
+`_MAXIMIZED=0`/`1`. macOS currently has none of this wired in (see
+`platform::macos`'s own "step 2 of the port" status note) — `platform::
+power::is_on_battery` already works there (via `pmset`) for whenever that
+backend's render loop is built out far enough to use it.
+
 Static images, videos, and web wallpapers flow through `src/render/frame.rs`
 frame sources.
 

@@ -21,14 +21,24 @@ use smithay_client_toolkit::{
     shell::WaylandSurface,
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::{mpsc::SyncSender, Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 use wayland_client::{
+    backend::ObjectId,
     globals::registry_queue_init,
     protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
-    Connection, Proxy, QueueHandle,
+    Connection, Dispatch, Proxy, QueueHandle,
+};
+// Manually dispatched (no smithay-client-toolkit delegate exists for this
+// protocol) — playback-pause's fullscreen/maximized-app detection, see
+// `engine::playback_gate` (Ghidra report Follow-up (ff)).
+use wayland_protocols_wlr::foreign_toplevel::v1::client::{
+    zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
+    zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
 };
 
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
@@ -37,6 +47,12 @@ use crate::{
     platform,
     render::{FrameSource, RenderSettings, ScreenContent, ScreenSettings, WallpaperContent},
 };
+
+/// How often to re-check playback-pause conditions (battery, session lock,
+/// fullscreen/maximized app) — see `engine::playback_gate`. Real I/O (sysfs
+/// reads, a D-Bus call), so this stays well below frame rate rather than
+/// adding that cost to every tick — matches `platform::x11`'s own interval.
+const PAUSE_CHECK_INTERVAL: Duration = Duration::from_millis(750);
 
 // ── Platform implementation ───────────────────────────────────────────────────
 
@@ -195,6 +211,44 @@ struct WallpaperState {
     queue: wgpu::Queue,
     display_ptr: *mut c_void,
     allow_gpu_surface: bool,
+    // ── Playback-pause (engine::playback_gate, Ghidra report Follow-up (ff)) ──
+    /// `None` when the compositor doesn't advertise `zwlr_layer_shell_v1`'s
+    /// sibling `zwlr_foreign_toplevel_manager_v1` at all — GNOME/Mutter
+    /// notably don't (it's a wlroots-ecosystem protocol: Sway/Hyprland/river
+    /// support it). Fullscreen/maximized-app pause just never triggers
+    /// there, same graceful-degradation precedent `platform::x11`'s EWMH
+    /// check uses for a window manager with no support.
+    ///
+    /// Never read after construction — its only job is to outlive the
+    /// connection so the subscription (and the `Toplevel` events it
+    /// delivers into `foreign_toplevels`) stays alive; dropping it would
+    /// tear the binding down.
+    #[allow(dead_code)]
+    foreign_toplevel_manager: Option<ZwlrForeignToplevelManagerV1>,
+    /// Per-toplevel state from `zwlr_foreign_toplevel_handle_v1` events,
+    /// keyed by the handle's own object id.
+    foreign_toplevels: HashMap<ObjectId, ForeignToplevelState>,
+    pause_conditions: crate::engine::playback_gate::PauseConditions,
+    lock_watcher: Option<platform::power::LockWatcher>,
+    playback_state: crate::engine::playback_gate::PlaybackState,
+    last_pause_check: Instant,
+    /// Last known pause state, so the watchdog timer (`tick_pause_watchdog`)
+    /// can tell "just resumed" apart from "still paused"/"still active" —
+    /// see that method's doc for why detecting the *edge* matters here.
+    paused: bool,
+}
+
+/// One tracked toplevel's committed state (`maximized`/`activated`/
+/// `fullscreen`) plus whatever a `state` event staged but hasn't been
+/// finalized by a `done` event yet — the protocol's own "atomic even
+/// across multiple events" contract (see the `state`/`done` event docs in
+/// `wlr-foreign-toplevel-management-unstable-v1.xml`).
+#[derive(Debug, Clone, Copy, Default)]
+struct ForeignToplevelState {
+    maximized: bool,
+    activated: bool,
+    fullscreen: bool,
+    pending: Option<(bool, bool, bool)>,
 }
 
 impl WallpaperState {
@@ -302,6 +356,18 @@ impl WallpaperState {
         if self.surfaces[idx].width == 0 || self.surfaces[idx].height == 0 {
             return;
         }
+        // Playback-pause (`engine::playback_gate`): skip rendering entirely
+        // and — just as importantly — don't request another `wl_surface`
+        // frame callback either, so the surface simply holds its last
+        // presented frame and the compositor stops nudging us every vblank.
+        // `tick_pause_watchdog` is what notices the pause has cleared and
+        // kicks this back into motion (nothing else will, once the
+        // callback chain has stalled like this).
+        if self.should_pause(Instant::now()) {
+            self.paused = true;
+            return;
+        }
+        self.paused = false;
         self.ensure_gpu_surface(idx);
         if self.surfaces[idx].gpu.is_some() {
             self.draw_gpu(idx);
@@ -522,6 +588,10 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, signal_tx: S
     })?;
     let registry_state = RegistryState::new(&globals);
     let seat_state = SeatState::new(&globals, &qh);
+    // Playback-pause's fullscreen/maximized detection — see the
+    // `foreign_toplevel_manager` field doc for the "not every compositor
+    // supports this" graceful-degradation note.
+    let foreign_toplevel_manager = globals.bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 1..=3, ()).ok();
 
     let mut state = WallpaperState {
         registry_state,
@@ -542,6 +612,13 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, signal_tx: S
         queue,
         display_ptr,
         allow_gpu_surface,
+        foreign_toplevel_manager,
+        foreign_toplevels: HashMap::new(),
+        pause_conditions: crate::engine::playback_gate::PauseConditions::from_env(),
+        lock_watcher: platform::power::LockWatcher::start(),
+        playback_state: crate::engine::playback_gate::PlaybackState::default(),
+        last_pause_check: Instant::now() - PAUSE_CHECK_INTERVAL,
+        paused: false,
     };
 
     // First roundtrip: discovers all current outputs → triggers new_output → creates surfaces.
@@ -561,6 +638,21 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, signal_tx: S
     WaylandSource::new(conn, event_queue)
         .insert(event_loop.handle())
         .map_err(|e| anyhow!("WaylandSource insert failed: {e}"))?;
+
+    // Playback-pause watchdog (`engine::playback_gate`, Ghidra report
+    // Follow-up (ff)): `draw_at` stops requesting new frame callbacks once
+    // paused (see its own doc comment), so nothing would ever notice the
+    // pause clearing without this independent timer.
+    event_loop
+        .handle()
+        .insert_source(
+            calloop::timer::Timer::from_duration(PAUSE_CHECK_INTERVAL),
+            |_deadline, (), state: &mut WallpaperState| {
+                state.tick_pause_watchdog();
+                calloop::timer::TimeoutAction::ToDuration(PAUSE_CHECK_INTERVAL)
+            },
+        )
+        .map_err(|e| anyhow!("pause-watchdog timer insert failed: {e}"))?;
 
     // Give the loop signal to the spawning thread before blocking.
     let _ = signal_tx.send(event_loop.get_signal());
@@ -880,6 +972,129 @@ delegate_layer!(WallpaperState);
 delegate_seat!(WallpaperState);
 delegate_pointer!(WallpaperState);
 delegate_registry!(WallpaperState);
+
+// ── Playback-pause: zwlr_foreign_toplevel_management (manual dispatch — no
+// smithay-client-toolkit delegate exists for this protocol) ───────────────────
+// See `engine::playback_gate`'s module doc (Ghidra report Follow-up (ff)).
+
+impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for WallpaperState {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZwlrForeignToplevelManagerV1,
+        event: zwlr_foreign_toplevel_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // `Finished` (the manager itself going away) needs no cleanup here —
+        // each handle's own `Closed` event already removes its own entry.
+        if let zwlr_foreign_toplevel_manager_v1::Event::Toplevel { toplevel } = event {
+            state
+                .foreign_toplevels
+                .insert(toplevel.id(), ForeignToplevelState::default());
+        }
+    }
+}
+
+impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for WallpaperState {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwlrForeignToplevelHandleV1,
+        event: zwlr_foreign_toplevel_handle_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let id = proxy.id();
+        match event {
+            // `state`'s `array` arg is a raw byte buffer of native-endian
+            // u32 enum values (maximized=0, minimized=1, activated=2,
+            // fullscreen=3 — `wlr-foreign-toplevel-management-unstable-v1
+            // .xml`'s own `state` enum) — staged, not applied yet, until
+            // `Done` commits it atomically (the protocol's own contract).
+            zwlr_foreign_toplevel_handle_v1::Event::State { state: bits } => {
+                let mut maximized = false;
+                let mut activated = false;
+                let mut fullscreen = false;
+                for chunk in bits.chunks_exact(4) {
+                    match u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) {
+                        0 => maximized = true,
+                        2 => activated = true,
+                        3 => fullscreen = true,
+                        _ => {}
+                    }
+                }
+                if let Some(t) = state.foreign_toplevels.get_mut(&id) {
+                    t.pending = Some((maximized, activated, fullscreen));
+                }
+            }
+            zwlr_foreign_toplevel_handle_v1::Event::Done => {
+                if let Some(t) = state.foreign_toplevels.get_mut(&id) {
+                    if let Some((maximized, activated, fullscreen)) = t.pending.take() {
+                        t.maximized = maximized;
+                        t.activated = activated;
+                        t.fullscreen = fullscreen;
+                    }
+                }
+            }
+            zwlr_foreign_toplevel_handle_v1::Event::Closed => {
+                state.foreign_toplevels.remove(&id);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl WallpaperState {
+    /// `(fullscreen, maximized)` — any currently-*activated* toplevel
+    /// reporting that state, mirroring `platform::x11`'s own "check the
+    /// active window" heuristic (not "some window somewhere is fullscreen,"
+    /// which could be a minimized/background one the user can't even see).
+    fn foreign_toplevel_pause_state(&self) -> (bool, bool) {
+        let fullscreen = self.foreign_toplevels.values().any(|t| t.activated && t.fullscreen);
+        let maximized = self.foreign_toplevels.values().any(|t| t.activated && t.maximized);
+        (fullscreen, maximized)
+    }
+
+    /// Re-checks all playback-pause conditions when `PAUSE_CHECK_INTERVAL`
+    /// has elapsed, then returns whether rendering should pause right now.
+    fn should_pause(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.last_pause_check) >= PAUSE_CHECK_INTERVAL {
+            self.last_pause_check = now;
+            let (fullscreen_app, maximized_app) = self.foreign_toplevel_pause_state();
+            self.playback_state = crate::engine::playback_gate::PlaybackState {
+                on_battery: platform::power::is_on_battery(),
+                locked_or_sleeping: self
+                    .lock_watcher
+                    .as_mut()
+                    .map(|w| w.is_locked())
+                    .unwrap_or(false),
+                fullscreen_app,
+                maximized_app,
+            };
+        }
+        crate::engine::playback_gate::should_pause(&self.pause_conditions, &self.playback_state)
+    }
+
+    /// Runs on its own `PAUSE_CHECK_INTERVAL` timer (inserted once at
+    /// startup, independent of any surface's frame callbacks) — the only
+    /// thing that can notice a pause has cleared once `draw_at` has
+    /// stopped requesting new callbacks (see its own doc comment), since
+    /// nothing else would call back into this state to check again.
+    fn tick_pause_watchdog(&mut self) {
+        let was_paused = self.paused;
+        let now_paused = self.should_pause(Instant::now());
+        if was_paused && !now_paused {
+            for idx in 0..self.surfaces.len() {
+                if self.surfaces[idx].renderer.is_animated() {
+                    self.draw_at(idx);
+                }
+            }
+        } else {
+            self.paused = now_paused;
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

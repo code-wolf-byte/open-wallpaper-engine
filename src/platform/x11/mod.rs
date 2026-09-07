@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xproto::{
-    AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateGCAux, Gcontext, ImageFormat,
-    KeyButMask, Pixmap, PropMode, Window,
+    Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateGCAux, Gcontext,
+    ImageFormat, KeyButMask, Pixmap, PropMode, Window,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
@@ -35,6 +35,12 @@ use crate::render::{FrameSource, RenderSettings, ScreenContent, ScreenSettings, 
 
 /// Frames per second for animated content. Matches `FrameSource`'s own target.
 const TARGET_FPS: f32 = 30.0;
+
+/// How often to re-check playback-pause conditions (battery, session lock,
+/// fullscreen/maximized app) — see `engine::playback_gate`. Real I/O (sysfs
+/// reads, an EWMH round trip, a D-Bus call), so this stays well below frame
+/// rate rather than adding that cost to every tick.
+const PAUSE_CHECK_INTERVAL: Duration = Duration::from_millis(750);
 
 // ── Platform implementation ───────────────────────────────────────────────────
 
@@ -264,6 +270,75 @@ fn put_image_chunked(
     Ok(())
 }
 
+// ── Fullscreen/maximized-app detection (playback-pause) ────────────────────────
+// EWMH's `_NET_ACTIVE_WINDOW` + `_NET_WM_STATE` — see `engine::playback_gate`'s
+// module doc (Ghidra report Follow-up (ff)) for where `playbackfullscreen`/
+// `playbackmaximized` come from.
+
+struct EwmhAtoms {
+    active_window: Atom,
+    wm_state: Atom,
+    fullscreen: Atom,
+    maximized_vert: Atom,
+    maximized_horz: Atom,
+}
+
+impl EwmhAtoms {
+    fn intern(conn: &impl Connection) -> Result<Self> {
+        let atom = |name: &[u8]| -> Result<Atom> { Ok(conn.intern_atom(false, name)?.reply()?.atom) };
+        Ok(Self {
+            active_window: atom(b"_NET_ACTIVE_WINDOW")?,
+            wm_state: atom(b"_NET_WM_STATE")?,
+            fullscreen: atom(b"_NET_WM_STATE_FULLSCREEN")?,
+            maximized_vert: atom(b"_NET_WM_STATE_MAXIMIZED_VERT")?,
+            maximized_horz: atom(b"_NET_WM_STATE_MAXIMIZED_HORZ")?,
+        })
+    }
+
+    /// `(fullscreen, maximized)` for whichever window `_NET_ACTIVE_WINDOW`
+    /// currently names, or `(false, false)` when there's no active window,
+    /// the window manager doesn't publish one, or any request fails — a WM
+    /// with no EWMH support at all must degrade to "never pauses," not
+    /// error the whole render loop.
+    fn check(&self, conn: &impl Connection, root: Window) -> (bool, bool) {
+        let Some(active) = read_window32(conn, root, self.active_window) else {
+            return (false, false);
+        };
+        if active == 0 || active == root {
+            return (false, false);
+        }
+        let Some(states) = read_atoms32(conn, active, self.wm_state) else {
+            return (false, false);
+        };
+        let fullscreen = states.contains(&self.fullscreen);
+        let maximized = states.contains(&self.maximized_vert) && states.contains(&self.maximized_horz);
+        (fullscreen, maximized)
+    }
+}
+
+fn read_window32(conn: &impl Connection, window: Window, property: Atom) -> Option<Window> {
+    let reply = conn
+        .get_property(false, window, property, AtomEnum::WINDOW, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?;
+    let mut values = reply.value32()?;
+    values.next()
+}
+
+/// Capped at 1024 atoms — `_NET_WM_STATE` never remotely approaches that in
+/// practice (real window managers set a handful), and an unbounded
+/// `long_length` would let a misbehaving property balloon this request.
+fn read_atoms32(conn: &impl Connection, window: Window, property: Atom) -> Option<Vec<Atom>> {
+    let reply = conn
+        .get_property(false, window, property, AtomEnum::ATOM, 0, 1024)
+        .ok()?
+        .reply()
+        .ok()?;
+    let values = reply.value32()?;
+    Some(values.collect())
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 /// Build the renderer for one output's resolved content — the X11 twin of
@@ -376,6 +451,19 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, stop: Arc<At
     let prop_root = conn.intern_atom(false, b"_XROOTPMAP_ID")?.reply()?.atom;
     let prop_esetroot = conn.intern_atom(false, b"ESETROOT_PMAP_ID")?.reply()?.atom;
 
+    // Playback-pause conditions (`engine::playback_gate` — Ghidra report
+    // Follow-up (ff)). `ewmh` degrades to "never fullscreen/maximized" on
+    // any WM without `_NET_ACTIVE_WINDOW`/`_NET_WM_STATE` support (its own
+    // `check`'s doc comment); battery/lock are checked on the same
+    // `PAUSE_CHECK_INTERVAL` throttle rather than every frame, since both
+    // involve real I/O (sysfs reads, a D-Bus round trip) a 30fps loop
+    // shouldn't pay for every tick.
+    let pause_conditions = crate::engine::playback_gate::PauseConditions::from_env();
+    let ewmh = EwmhAtoms::intern(&conn)?;
+    let mut lock_watcher = platform::power::LockWatcher::start();
+    let mut playback_state = crate::engine::playback_gate::PlaybackState::default();
+    let mut last_pause_check = Instant::now() - PAUSE_CHECK_INTERVAL;
+
     let frame_budget = Duration::from_secs_f32(1.0 / TARGET_FPS);
     // Any output still animating keeps the whole loop going; a genuinely
     // static desktop (every output static) holds the pixmap and sleeps.
@@ -387,45 +475,62 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, stop: Arc<At
         }
         let started = Instant::now();
 
-        for output in &mut outputs {
-            let quality = output.settings.lock().unwrap().quality;
-            let frame = output.renderer.next_frame()?;
-            // `GpuScaler` emits ARGB8888-LE, i.e. bytes [B, G, R, A] — already
-            // the byte order a Z_PIXMAP wants on a little-endian server, and
-            // the same order the reference gets from its GL_BGRA readback. Do
-            // not "fix" this into an RGBA swap.
-            let pixels = gpu_scaler.scale(
-                frame.as_ref(),
-                output.named.rect.width as u32,
-                output.named.rect.height as u32,
-                quality,
-            );
-            put_image_chunked(&conn, pixmap, gc, depth, output.named.rect, &pixels)?;
+        if started.duration_since(last_pause_check) >= PAUSE_CHECK_INTERVAL {
+            last_pause_check = started;
+            let (fullscreen_app, maximized_app) = ewmh.check(&conn, root);
+            playback_state = crate::engine::playback_gate::PlaybackState {
+                on_battery: platform::power::is_on_battery(),
+                locked_or_sleeping: lock_watcher
+                    .as_mut()
+                    .map(|w| w.is_locked())
+                    .unwrap_or(false),
+                fullscreen_app,
+                maximized_app,
+            };
         }
+        let paused = crate::engine::playback_gate::should_pause(&pause_conditions, &playback_state);
 
-        // Publish the pixmap. Compositors (picom et al.) watch these atoms and
-        // will otherwise paint over the background themselves.
-        conn.change_property32(
-            PropMode::REPLACE,
-            root,
-            prop_root,
-            AtomEnum::PIXMAP,
-            &[pixmap],
-        )?;
-        conn.change_property32(
-            PropMode::REPLACE,
-            root,
-            prop_esetroot,
-            AtomEnum::PIXMAP,
-            &[pixmap],
-        )?;
-        conn.change_window_attributes(
-            root,
-            &ChangeWindowAttributesAux::new().background_pixmap(pixmap),
-        )?;
-        // Repaint the root from its new background.
-        conn.clear_area(false, root, 0, 0, 0, 0)?;
-        conn.flush()?;
+        if !paused {
+            for output in &mut outputs {
+                let quality = output.settings.lock().unwrap().quality;
+                let frame = output.renderer.next_frame()?;
+                // `GpuScaler` emits ARGB8888-LE, i.e. bytes [B, G, R, A] — already
+                // the byte order a Z_PIXMAP wants on a little-endian server, and
+                // the same order the reference gets from its GL_BGRA readback. Do
+                // not "fix" this into an RGBA swap.
+                let pixels = gpu_scaler.scale(
+                    frame.as_ref(),
+                    output.named.rect.width as u32,
+                    output.named.rect.height as u32,
+                    quality,
+                );
+                put_image_chunked(&conn, pixmap, gc, depth, output.named.rect, &pixels)?;
+            }
+
+            // Publish the pixmap. Compositors (picom et al.) watch these atoms and
+            // will otherwise paint over the background themselves.
+            conn.change_property32(
+                PropMode::REPLACE,
+                root,
+                prop_root,
+                AtomEnum::PIXMAP,
+                &[pixmap],
+            )?;
+            conn.change_property32(
+                PropMode::REPLACE,
+                root,
+                prop_esetroot,
+                AtomEnum::PIXMAP,
+                &[pixmap],
+            )?;
+            conn.change_window_attributes(
+                root,
+                &ChangeWindowAttributesAux::new().background_pixmap(pixmap),
+            )?;
+            // Repaint the root from its new background.
+            conn.clear_area(false, root, 0, 0, 0, 0)?;
+            conn.flush()?;
+        }
 
         if !animated {
             // Every output is static: hold the pixmap until asked to stop.
@@ -496,7 +601,10 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, stop: Arc<At
             }
         }
 
-        if let Some(rest) = frame_budget.checked_sub(started.elapsed()) {
+        // Paused: no point looping at frame rate just to re-check the same
+        // throttled conditions — sleep for that same interval instead.
+        let budget = if paused { PAUSE_CHECK_INTERVAL } else { frame_budget };
+        if let Some(rest) = budget.checked_sub(started.elapsed()) {
             thread::sleep(rest);
         }
     }
