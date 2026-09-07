@@ -527,6 +527,25 @@ impl GpuSceneRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
+                // Spot-light cookie texture (`usecookie`/`cookie`) — a
+                // harmless 1x1 white dummy when no light has one, same
+                // "always-valid dummy binding" precedent as `shadow_atlas`.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let mesh3d_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1961,9 +1980,9 @@ const MESH3D_MAX_SHADOW_LIGHTS: usize = crate::engine::shadow::MAX_SHADOW_LIGHTS
 /// `MESH3D_MAX_LIGHTS`-length `vec4` arrays (positions, colors, spot
 /// direction+exponent), then `MESH3D_MAX_SHADOW_LIGHTS` `mat4x4`s (shadow
 /// view-projections) and `MESH3D_MAX_SHADOW_LIGHTS` `vec4`s (their atlas UV
-/// sub-rects).
+/// sub-rects), then one trailing `mat4x4` (`cookie_view_proj`).
 const MESH3D_LIGHTING_BYTES_LEN: usize =
-    16 * 5 + 16 * MESH3D_MAX_LIGHTS * 3 + (64 + 16) * MESH3D_MAX_SHADOW_LIGHTS;
+    16 * 5 + 16 * MESH3D_MAX_LIGHTS * 3 + (64 + 16) * MESH3D_MAX_SHADOW_LIGHTS + 64;
 
 /// Pack one mesh's `Mesh3dTransform` uniform (mvp, model_view, normal_view,
 /// model) — layout must match `Mesh3dTransform` in `gpu_shaders.wgsl`
@@ -2009,11 +2028,18 @@ fn mesh3d_transform_bytes(
 /// tell "no shadow" (0.0) from "shadow slot 0" without a separate flags
 /// field — `light_color.a <= 0.0` (unused light slot) already uses the same
 /// "skip" convention.
+///
+/// `cookie` is `Some((light_index, view_proj))` when one of `scene.lights()`
+/// is a Spot light with a resolvable cookie texture (see
+/// `GpuSceneInstance::build`'s cookie-resolution step) — packed into
+/// `flags.y` (as `light_index + 1`, `0.0` = none) and the trailing
+/// `cookie_view_proj` field.
 fn mesh3d_lighting_bytes(
     scene: &crate::engine::scene::Scene,
     cam: &crate::engine::camera3d::PerspectiveCamera,
     shadow_slots: &[Option<usize>],
     shadow_slot_data: &[(crate::engine::camera3d::Mat4, [f32; 4])],
+    cookie: Option<(usize, crate::engine::camera3d::Mat4)>,
 ) -> Vec<u8> {
     let lights = scene.lights();
     let general = scene.general.as_ref();
@@ -2043,7 +2069,13 @@ fn mesh3d_lighting_bytes(
                 | crate::engine::lighting::Light::Tube { .. }
         )
     });
-    push4([if has_renderable_light { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]);
+    let cookie_light_flag = cookie.map(|(idx, _)| (idx + 1) as f32).unwrap_or(0.0);
+    push4([
+        if has_renderable_light { 1.0 } else { 0.0 },
+        cookie_light_flag,
+        0.0,
+        0.0,
+    ]);
     push4([ambient[0], ambient[1], ambient[2], 0.0]);
     match &fog {
         Some(f) => {
@@ -2176,6 +2208,12 @@ fn mesh3d_lighting_bytes(
     for slot in 0..MESH3D_MAX_SHADOW_LIGHTS {
         let uv_rect = shadow_slot_data.get(slot).map(|(_, r)| *r).unwrap_or([0.0; 4]);
         push4(uv_rect);
+    }
+    let cookie_view_proj = cookie
+        .map(|(_, vp)| vp)
+        .unwrap_or_else(crate::engine::camera3d::identity);
+    for col in cookie_view_proj.iter() {
+        push4(*col);
     }
     bytes
 }
@@ -2459,7 +2497,7 @@ impl GpuSceneInstance {
         // `_rt_VolumetricsBuffer`'s allocation on whether any light actually
         // needs it — see `engine::scene::SceneObject::volumetrics_params`.
         let lights = resolved.scene.lights();
-        let has_volumetrics = lights.iter().any(|(_, _, v)| v.is_some());
+        let has_volumetrics = lights.iter().any(|(_, _, v, _)| v.is_some());
 
         // Allocate all persistent render targets up front so the render loop
         // can look them up immutably. Per-layer effect-chain FBOs (ping-pong
@@ -2680,6 +2718,44 @@ impl GpuSceneInstance {
             )
         };
         let shadow_atlas_view = shadow_atlas_tex.create_view(&Default::default());
+        // Spot-light cookie texture (`usecookie`/`cookie` — see
+        // `SceneObject::cookie_texture_path`). Scoped to the *first* Spot
+        // light with a real, loadable cookie image — real content sets
+        // `usecookie` on zero lights, ever (see the Ghidra report's
+        // property-schema survey), so there's no real-content case to
+        // generalize "one" into "N" against, same precedent
+        // `build_volumetrics` already uses for its own "first light with
+        // the flag" scoping. Only resolves against loose files under `dir`
+        // (no `scene.pkg` fallback) — the pkg handle isn't otherwise
+        // plumbed into `build`, and every real `usecookie` occurrence in
+        // this sandbox's cache is zero either way.
+        let cookie_data = {
+            use crate::engine::lighting::Light;
+            let (center, radius) = crate::engine::shadow::scene_bounds(&resolved.mesh3d_layers);
+            lights.iter().enumerate().find_map(|(i, (light, _, _, cookie_path))| {
+                let path = cookie_path.as_ref()?;
+                let Light::Spot { origin, direction, outer_cone_degrees, .. } = light else {
+                    return None;
+                };
+                let image = super::render::resolve_static_texture(Some(dir), None, path)?;
+                let vp = crate::engine::shadow::spot_light_view_proj(
+                    *origin,
+                    *direction,
+                    *outer_cone_degrees,
+                    center,
+                    radius,
+                );
+                Some((i, vp, image))
+            })
+        };
+        let cookie_view = renderer
+            .upload_texture(
+                &cookie_data
+                    .as_ref()
+                    .map(|(_, _, img)| img.clone())
+                    .unwrap_or_else(|| RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]))),
+            )
+            .create_view(&Default::default());
         // Volumetric-light-shaft ray march's static per-scene bind group —
         // `None` unless `has_volumetrics` (checked again inside, cheaply,
         // since it also needs to find *which* light). See `build_volumetrics`.
@@ -2699,7 +2775,15 @@ impl GpuSceneInstance {
         // place lights through, matching `mesh3d` staying empty in that case.
         let mesh3d_lighting_bytes = camera3d
             .as_ref()
-            .map(|cam| mesh3d_lighting_bytes(&resolved.scene, cam, &shadow_slots, &shadow_slot_data))
+            .map(|cam| {
+                mesh3d_lighting_bytes(
+                    &resolved.scene,
+                    cam,
+                    &shadow_slots,
+                    &shadow_slot_data,
+                    cookie_data.as_ref().map(|(i, vp, _)| (*i, *vp)),
+                )
+            })
             .unwrap_or_else(|| vec![0u8; MESH3D_LIGHTING_BYTES_LEN]);
         let mesh3d_lighting_ubo = renderer.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mesh3d_lighting"),
@@ -2719,7 +2803,16 @@ impl GpuSceneInstance {
                         .as_ref()
                         .is_none_or(|f| m.name.contains(f.as_str()))
                 })
-                .map(|m| Self::build_mesh3d(&renderer, cam, m, &mesh3d_lighting_ubo, &shadow_atlas_view))
+                .map(|m| {
+                    Self::build_mesh3d(
+                        &renderer,
+                        cam,
+                        m,
+                        &mesh3d_lighting_ubo,
+                        &shadow_atlas_view,
+                        &cookie_view,
+                    )
+                })
                 .collect(),
             None => Vec::new(),
         };
@@ -2802,7 +2895,12 @@ impl GpuSceneInstance {
     fn build_volumetrics(
         renderer: &GpuSceneRenderer,
         cam: &crate::engine::camera3d::PerspectiveCamera,
-        lights: &[(crate::engine::lighting::Light, bool, Option<(f32, f32)>)],
+        lights: &[(
+            crate::engine::lighting::Light,
+            bool,
+            Option<(f32, f32)>,
+            Option<String>,
+        )],
         shadow_slots: &[Option<usize>],
         shadow_slot_data: &[(crate::engine::camera3d::Mat4, [f32; 4])],
         shadow_atlas_view: &wgpu::TextureView,
@@ -2810,7 +2908,7 @@ impl GpuSceneInstance {
         use crate::engine::lighting::Light;
 
         let (idx, origin, color_intensity, density, exponent) =
-            lights.iter().enumerate().find_map(|(i, (light, _, volumetrics))| {
+            lights.iter().enumerate().find_map(|(i, (light, _, volumetrics, _))| {
                 let (density, exponent) = (*volumetrics)?;
                 let (origin, color, intensity) = match light {
                     // Directional has no position to march a shaft from;
@@ -2905,7 +3003,12 @@ impl GpuSceneInstance {
     fn build_shadow_atlas(
         renderer: &GpuSceneRenderer,
         mesh3d_layers: &[crate::engine::render::Mesh3dLayer],
-        lights: &[(crate::engine::lighting::Light, bool, Option<(f32, f32)>)],
+        lights: &[(
+            crate::engine::lighting::Light,
+            bool,
+            Option<(f32, f32)>,
+            Option<String>,
+        )],
     ) -> (
         wgpu::Texture,
         Vec<Option<usize>>,
@@ -2925,7 +3028,7 @@ impl GpuSceneInstance {
         let shadow_casters: Vec<(usize, crate::engine::camera3d::Mat4)> = lights
             .iter()
             .enumerate()
-            .filter_map(|(i, (light, casts_shadow, _volumetrics))| {
+            .filter_map(|(i, (light, casts_shadow, _volumetrics, _))| {
                 if !*casts_shadow {
                     return None;
                 }
@@ -3119,6 +3222,7 @@ impl GpuSceneInstance {
         layer: &crate::engine::render::Mesh3dLayer,
         lighting_ubo: &wgpu::Buffer,
         shadow_atlas_view: &wgpu::TextureView,
+        cookie_view: &wgpu::TextureView,
     ) -> Mesh3dGpu {
         let (vbuf, ibuf, index_count) = Self::upload_mesh3d_geometry(renderer, &layer.mesh);
 
@@ -3165,6 +3269,14 @@ impl GpuSceneInstance {
                         resource: wgpu::BindingResource::Sampler(
                             &renderer.shadow_comparison_sampler,
                         ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(cookie_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::Sampler(&renderer.samplers[0]),
                     },
                 ],
             });
@@ -5787,7 +5899,7 @@ mod tests {
         let cam = crate::engine::camera3d::PerspectiveCamera::from_scene(&scene, 1.0).unwrap();
 
         // The common case: no shadow-casting lights at all.
-        let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[]);
+        let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[], None);
         assert_eq!(bytes.len(), MESH3D_LIGHTING_BYTES_LEN);
 
         // One shadow-casting light occupying slot 0 — same length either way,
@@ -5798,8 +5910,40 @@ mod tests {
             crate::engine::camera3d::identity(),
             [0.0, 0.0, 1.0, 1.0],
         )];
-        let bytes = mesh3d_lighting_bytes(&scene, &cam, &shadow_slots, &shadow_slot_data);
+        let bytes = mesh3d_lighting_bytes(&scene, &cam, &shadow_slots, &shadow_slot_data, None);
         assert_eq!(bytes.len(), MESH3D_LIGHTING_BYTES_LEN);
+    }
+
+    /// `cookie: Some((light_index, view_proj))` must write `flags.y ==
+    /// light_index + 1` and pack `view_proj` into the trailing
+    /// `cookie_view_proj` field (the last `MESH3D_MAX_SHADOW_LIGHTS` shadow
+    /// mat4s + the `MESH3D_MAX_SHADOW_LIGHTS` uv-rect vec4s precede it —
+    /// see `MESH3D_LIGHTING_BYTES_LEN`'s own layout doc).
+    #[test]
+    fn mesh3d_lighting_bytes_encodes_cookie_flag_and_matrix() {
+        let scene: crate::engine::scene::Scene = serde_json::from_str(
+            r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
+        )
+        .unwrap();
+        let cam = crate::engine::camera3d::PerspectiveCamera::from_scene(&scene, 1.0).unwrap();
+
+        let mut vp = crate::engine::camera3d::identity();
+        vp[3][0] = 42.0; // an arbitrary, recognizable value to round-trip
+        let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[], Some((2, vp)));
+
+        let flags_y = f32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(flags_y, 3.0, "flags.y must be light_index + 1");
+
+        let cookie_mat_offset = MESH3D_LIGHTING_BYTES_LEN - 64;
+        let read_f32 = |i: usize| {
+            f32::from_le_bytes(
+                bytes[cookie_mat_offset + i * 4..cookie_mat_offset + i * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        // Column 3, row 0 (the value we perturbed) is float index 12.
+        assert_eq!(read_f32(12), 42.0, "cookie_view_proj must round-trip the matrix");
     }
 
     /// A spot light must (a) count as renderable (`flags.x == 1.0` — the
@@ -5825,7 +5969,7 @@ mod tests {
                 ]}"#,
         )
         .unwrap();
-        let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[]);
+        let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[], None);
 
         // flags.x is the buffer's first f32.
         let flags_x = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
@@ -5867,7 +6011,7 @@ mod tests {
                 ]}"#,
         )
         .unwrap();
-        let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[]);
+        let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[], None);
 
         let flags_x = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
         assert_eq!(flags_x, 1.0, "a directional-only scene must still engage the lit branch");
@@ -5909,7 +6053,7 @@ mod tests {
                 ]}"#,
         )
         .unwrap();
-        let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[]);
+        let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[], None);
 
         let flags_x = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
         assert_eq!(flags_x, 1.0, "a tube-only scene must still engage the lit branch");

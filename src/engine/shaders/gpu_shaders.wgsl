@@ -835,6 +835,9 @@ struct Mesh3dLighting {
     // 0.0 for virtually every scene, and the fragment shader falls back to
     // the plain textured look every mesh3d scene already had — this pass is
     // additive, never a regression for existing unlit content.
+    // y = the cookie-texture light's index + 1 (0.0 = no light has a
+    // cookie — real content never sets `usecookie`, so this is 0.0 for
+    // ~100% of the corpus; see `mesh3d_cookie_factor`).
     flags: vec4<f32>,
     ambient: vec4<f32>,       // rgb; a unused
     fog_distance: vec4<f32>,  // rgb = color, a = density (0 = off)
@@ -861,6 +864,13 @@ struct Mesh3dLighting {
     // a second matrix — see the Ghidra report's shadow-mapping follow-up).
     shadow_view_proj: array<mat4x4<f32>, MESH3D_MAX_SHADOW_LIGHTS>,
     shadow_uv_rect: array<vec4<f32>, MESH3D_MAX_SHADOW_LIGHTS>,
+    // World-space view-projection for the cookie-texture light named by
+    // `flags.y` — meaningless (never read) when `flags.y == 0.0`. A single
+    // slot, not one per light: real content never uses more than zero
+    // cookie textures at once (see `mesh3d_cookie_factor`'s doc comment),
+    // matching the same "one active thing, not a per-light array" scoping
+    // `build_volumetrics` already uses for volumetric lights.
+    cookie_view_proj: mat4x4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> mesh3d_xform: Mesh3dTransform;
@@ -869,6 +879,12 @@ struct Mesh3dLighting {
 @group(0) @binding(3) var<uniform> mesh3d_lighting: Mesh3dLighting;
 @group(0) @binding(4) var shadow_atlas: texture_depth_2d;
 @group(0) @binding(5) var shadow_sampler: sampler_comparison;
+// Spot-light cookie texture (`usecookie`/`cookie` — see
+// `SceneObject::cookie_texture_path`) — a harmless 1x1 white dummy, bound
+// the same way `shadow_atlas` is when there's nothing real to show, for the
+// ~100% of real content that never sets `usecookie`.
+@group(0) @binding(6) var cookie_tex: texture_2d<f32>;
+@group(0) @binding(7) var cookie_sampler: sampler;
 
 struct Mesh3dVsOut {
     @builtin(position) position: vec4<f32>,
@@ -1043,6 +1059,33 @@ fn mesh3d_spot_factor(light_spot: vec4<f32>, l: vec3<f32>) -> f32 {
     return pow(cos_angle, max(light_spot.w, 1.0));
 }
 
+// Spot-light cookie texture — the one piece of `PerformLighting_V1`'s real
+// per-pixel formula this report recovered verbatim as plaintext GLSL (see
+// the report's spot-light section): `colorCookie = texSample2D(COOKIE,
+// projectedCoords.xy).rgb`, multiplied into the light's color. `i` is this
+// light's slot in `mesh3d_lighting.light_pos`/`light_color`; only the one
+// light named by `flags.y` (real content: at most one, ever — see
+// `Scene::lights`' cookie_path scoping) samples the real texture. Outside
+// the light's own projected frustum (or behind it) contributes vec3(0) —
+// darkness, matching a cookie texture's implicit "nothing outside the
+// beam" clamp-to-border behavior — everything else passes through
+// unmodified (vec3(1)).
+fn mesh3d_cookie_factor(i: u32, world_pos: vec3<f32>) -> vec3<f32> {
+    if (i32(mesh3d_lighting.flags.y) - 1 != i32(i)) {
+        return vec3<f32>(1.0);
+    }
+    let clip = mesh3d_lighting.cookie_view_proj * vec4(world_pos, 1.0);
+    if (clip.w <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let ndc = clip.xy / clip.w;
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        return vec3<f32>(0.0);
+    }
+    return textureSampleLevel(cookie_tex, cookie_sampler, uv, 0.0).rgb;
+}
+
 @fragment
 fn fs_mesh3d(in: Mesh3dVsOut) -> @location(0) vec4<f32> {
     let albedo = textureSample(mesh3d_tex, mesh3d_sampler, in.uv);
@@ -1103,11 +1146,13 @@ fn fs_mesh3d(in: Mesh3dVsOut) -> @location(0) vec4<f32> {
         // explicitly rather than relying on that function's own
         // "zero-length = not a spot" check the way Point/Directional do.
         var spot_factor = 1.0;
+        var cookie = vec3<f32>(1.0);
         if (shadow_w >= -1.5) {
             spot_factor = mesh3d_spot_factor(mesh3d_lighting.light_spot[i], l);
+            cookie = mesh3d_cookie_factor(i, in.world_pos);
         }
         let shadow_factor = mesh3d_shadow_factor(shadow_w, in.world_pos);
-        lit = lit + mesh3d_brdf(n, l, v, albedo.rgb, lc.rgb * atten * spot_factor) * shadow_factor;
+        lit = lit + mesh3d_brdf(n, l, v, albedo.rgb, lc.rgb * atten * spot_factor * cookie) * shadow_factor;
     }
 
     var color = lit;

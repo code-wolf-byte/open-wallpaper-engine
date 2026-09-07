@@ -1758,6 +1758,22 @@ fn load_texture_from_pkg(pkg: &Package, image_path: &str) -> Result<LoadedImage>
     anyhow::bail!("texture not found in package: {image_path}")
 }
 
+/// Resolve a bare texture-reference path (same rules as any other material
+/// texture reference — loose file under `dir`, `.tex` fallback, then `pkg`)
+/// to a decoded image, or `None` if it doesn't resolve. Used by
+/// `GpuSceneInstance::build` (gpu_renderer.rs) to load a spot light's
+/// `cookie` texture without duplicating `load_texture_from_dir`/
+/// `load_texture_from_pkg`'s resolution logic.
+pub(crate) fn resolve_static_texture(
+    dir: Option<&Path>,
+    pkg: Option<&Package>,
+    path: &str,
+) -> Option<RgbaImage> {
+    dir.and_then(|d| load_texture_from_dir(d, path).ok())
+        .or_else(|| pkg.and_then(|p| load_texture_from_pkg(p, path).ok()))
+        .map(|l| l.image)
+}
+
 /// Follow the model -> material -> texture reference chain in a PKG archive.
 /// Shared global WE assets install, used as a fallback when a model/material/
 /// texture isn't bundled with this specific wallpaper. Built-in particle

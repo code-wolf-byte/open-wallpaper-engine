@@ -23,14 +23,17 @@
 //!
 //! # What is NOT yet implemented (GAP)
 //!
-//! - Shadow cascade mixing (`PerformShadowMapping` / `PerformPointShadowMapping`)
-//!   — requires a GPU depth-map pass. The `shadow_factor` parameter is
-//!   exposed so a future GPU pass can plug in directly.
-//! - Spot / tube cookie texture lookup (`texture2D(cookie, uv)`)
-//!   — requires a GPU texture sampler. `cookie_factor` parameter is
-//!   exposed the same way.
 //! - HLSL→GLSL shim (CAST3, etc.) — the transpiler in `shaders.rs` handles
 //!   the GLSL→WGSL path; the shim is a separate concern.
+//!
+//! Both shadow-cascade mixing and the spot-light cookie texture lookup this
+//! comment used to list here have since been wired in on the GPU side —
+//! `engine::shadow`/`mesh3d_shadow_factor` in `gpu_shaders.wgsl` for
+//! shadows, `mesh3d_cookie_factor` for the cookie — because both need a
+//! real depth/color texture sampler this pure-CPU-math module intentionally
+//! doesn't have. `shadow_factor` stays a plain parameter here for the same
+//! reason it always was: this module supplies the BRDF math, the GPU pass
+//! supplies the texture read.
 //!
 //! # Coordinate convention
 //!

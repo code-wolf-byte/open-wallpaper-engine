@@ -49,13 +49,23 @@ impl Scene {
     /// treats it as `Point`) can still resolve to `Spot` when the author's
     /// intent is otherwise clear from `innercone`/`outercone` being set.
     ///
-    /// Every `light` scene object as `(light, casts_shadow, volumetrics)`.
-    /// Paired rather than parallel vecs so a caller can never let a flag
-    /// drift out of sync with the light it belongs to after filtering.
-    /// `volumetrics` is `Some((density, exponent))` when `castvolumetrics`
-    /// is set — see `SceneObject::volumetrics_params` and the Ghidra
-    /// report's `_rt_volumetrics*` follow-up.
-    pub fn lights(&self) -> Vec<(crate::engine::lighting::Light, bool, Option<(f32, f32)>)> {
+    /// Every `light` scene object as `(light, casts_shadow, volumetrics,
+    /// cookie_path)`. Paired rather than parallel vecs so a caller can
+    /// never let a flag drift out of sync with the light it belongs to
+    /// after filtering. `volumetrics` is `Some((density, exponent))` when
+    /// `castvolumetrics` is set — see `SceneObject::volumetrics_params` and
+    /// the Ghidra report's `_rt_volumetrics*` follow-up. `cookie_path` is
+    /// `Some(path)` only for a Spot light with a resolvable
+    /// `SceneObject::cookie_texture_path` — always `None` for every other
+    /// light type.
+    pub fn lights(
+        &self,
+    ) -> Vec<(
+        crate::engine::lighting::Light,
+        bool,
+        Option<(f32, f32)>,
+        Option<String>,
+    )> {
         self.objects
             .iter()
             .filter(|o| o.image.is_none())
@@ -133,7 +143,10 @@ impl Scene {
                         radius,
                     }
                 };
-                Some((light, casts_shadow, volumetrics))
+                let cookie_path = is_spot
+                    .then(|| o.cookie_texture_path().map(str::to_string))
+                    .flatten();
+                Some((light, casts_shadow, volumetrics, cookie_path))
             })
             .collect()
     }
@@ -559,6 +572,14 @@ pub struct SceneObject {
     pub innercone: Option<serde_json::Value>,
     #[serde(default)]
     pub outercone: Option<serde_json::Value>,
+    /// A spot light's cookie-texture toggle and path — real field names
+    /// from the Ghidra property dump (`usecookie`, `cookie`, adjacent to a
+    /// literal built-in preset path `cookie/flashlight1` in `strings.txt`).
+    /// See `SceneObject::cookie_texture_path`.
+    #[serde(default)]
+    pub usecookie: Option<serde_json::Value>,
+    #[serde(default)]
+    pub cookie: Option<serde_json::Value>,
     /// A tube light's second endpoint, relative to `origin` — see
     /// `SceneObject::tube_endpoints`. Confirmed a vec3 field from the Ghidra
     /// property dump (same type code and setter function as `color`, a
@@ -627,6 +648,28 @@ impl SceneObject {
         let inner = self.innercone.as_ref().and_then(parse_value_f32)?;
         let outer = self.outercone.as_ref().and_then(parse_value_f32)?;
         Some((inner, outer))
+    }
+
+    /// A spot light's cookie-texture path, when `usecookie` is truthy and
+    /// `cookie` names a non-empty path — `None` otherwise (the overwhelming
+    /// common case: real content never sets `usecookie`, per the Ghidra
+    /// report's property-schema survey). WE's own built-in cookie presets
+    /// (e.g. `cookie/flashlight1`, seen as a literal string in the binary)
+    /// live inside the original .exe, not in any wallpaper's own asset
+    /// folder, so they're unreachable here — this only resolves to
+    /// something real for a wallpaper that ships its own cookie image
+    /// relative to its own directory (same resolution rules as any other
+    /// texture reference — see `GpuSceneInstance::build` in gpu_renderer.rs).
+    pub fn cookie_texture_path(&self) -> Option<&str> {
+        let on = self
+            .usecookie
+            .as_ref()
+            .and_then(parse_value_bool)
+            .unwrap_or(false);
+        if !on {
+            return None;
+        }
+        self.cookie.as_ref()?.as_str().filter(|s| !s.is_empty())
     }
 
     /// The `light` field's own value as a type discriminant — see the
@@ -1236,6 +1279,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(scene.lights()[0].2, None);
+    }
+
+    // `usecookie: true` + a non-empty `cookie` path on a spot light must
+    // surface in `Scene::lights()`'s 4th tuple slot; every other case
+    // (no `usecookie`, or a non-spot light) must stay `None`.
+    #[test]
+    fn cookie_texture_path_only_set_for_spot_with_usecookie() {
+        let scene = Scene::from_json(
+            r#"{"objects": [
+                {"id": 1, "light": "lspot", "origin": "0 0 0",
+                 "usecookie": true, "cookie": "cookie/flashlight1"},
+                {"id": 2, "light": true, "origin": "0 0 0",
+                 "usecookie": true, "cookie": "cookie/flashlight1"},
+                {"id": 3, "light": "lspot", "origin": "0 0 0"}
+            ]}"#,
+        )
+        .unwrap();
+        let lights = scene.lights();
+        assert_eq!(lights.len(), 3);
+        assert_eq!(lights[0].3.as_deref(), Some("cookie/flashlight1"));
+        assert_eq!(lights[1].3, None, "a Point light must never carry a cookie path");
+        assert_eq!(lights[2].3, None, "usecookie absent must leave the cookie path None");
+    }
+
+    #[test]
+    fn cookie_texture_path_requires_usecookie_true() {
+        let scene = Scene::from_json(
+            r#"{"objects": [{"id": 1, "light": "lspot", "origin": "0 0 0", "cookie": "x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(scene.objects[0].cookie_texture_path(), None);
     }
 
     // `light: "ltube"` must resolve to Tube, with origin_b = origin +

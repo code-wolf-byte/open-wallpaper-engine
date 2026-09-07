@@ -360,6 +360,47 @@ pub struct Operator {
     pub transformfunction: Option<String>,
     #[serde(default)]
     pub transforminputscale: Option<f64>,
+    /// `collisionsphere`/`collisionbox`/`collisionbounds`/`collisionquad`/
+    /// `collisionplane` (real operator names, Ghidra `strings.txt` around
+    /// `140490008`, alongside `boids`/`collisionbehavior`/`bouncefactor` —
+    /// no C++ reference implements any of these, so field semantics below
+    /// are a reasoned reconstruction, not byte-verified). A sphere/box/
+    /// bounds/quad collider's half-size or radius; box/bounds/quad read
+    /// `size`'s x/y, sphere reads `radius`.
+    #[serde(default)]
+    pub radius: Option<f64>,
+    #[serde(default)]
+    pub size: Option<serde_json::Value>,
+    /// `slide` (zero the into-surface velocity component), `bounce`
+    /// (reflect it, scaled by `bouncefactor`), or `delete` (kill the
+    /// particle on contact). Defaults to `bounce`, the most common
+    /// particle-collision behavior in comparable engines.
+    #[serde(default)]
+    pub collisionbehavior: Option<String>,
+    #[serde(default)]
+    pub bouncefactor: Option<f64>,
+    /// `boids` flocking rules (separation/alignment/cohesion) — real field
+    /// names from the same table (`variablestrength`, `separationthreshold`,
+    /// `neighborthreshold`, `maxspeed`, `separationfactor`,
+    /// `alignmentfactor`, `cohesionfactor`).
+    #[serde(default)]
+    pub separationthreshold: Option<f64>,
+    #[serde(default)]
+    pub neighborthreshold: Option<f64>,
+    #[serde(default)]
+    pub maxspeed: Option<f64>,
+    #[serde(default)]
+    pub separationfactor: Option<f64>,
+    #[serde(default)]
+    pub alignmentfactor: Option<f64>,
+    #[serde(default)]
+    pub cohesionfactor: Option<f64>,
+    #[serde(default)]
+    pub variablestrength: Option<f64>,
+    /// Plane-collider orientation (reuses the same "z-axis rotates a default
+    /// normal" convention `controlpoint`/vortex offsets already use).
+    #[serde(default)]
+    pub angles: Option<serde_json::Value>,
 }
 
 /// Scene.json's per-instance `instanceoverride` on a particle object —
@@ -594,6 +635,12 @@ pub struct ParticleSystem {
     vortex: Option<VortexParams>,
     /// `remapvalue` operator parameters.
     remap: Option<RemapParams>,
+    /// `collisionsphere`/`collisionbox`/`collisionbounds`/`collisionquad`/
+    /// `collisionplane` operators — every one attached, since a system can
+    /// have more than one collider (e.g. a floor plane plus a wall box).
+    collisions: Vec<CollisionParams>,
+    /// `boids` operator parameters.
+    boids: Option<BoidsParams>,
     /// Simulation clock (sum of `step` dts) — drives the time-scrolled
     /// noise fields, the reference's `m_time`/`currentTime`.
     time: f32,
@@ -728,6 +775,69 @@ struct VortexParams {
     ring_width: f32,
     ring_pull_distance: f32,
     ring_pull_force: f32,
+}
+
+/// Collider shape for a `collisionsphere`/`collisionbox`/`collisionbounds`/
+/// `collisionquad`/`collisionplane` operator (see the `Operator` field docs
+/// for the "no C++ reference, reasoned reconstruction" caveat). `Box` also
+/// covers `collisionbounds`/`collisionquad` — this 2D engine has no distinct
+/// notion of "world bounds" vs. "an oriented flat quad" vs. "a box", so all
+/// three collapse to the same axis-aligned-rectangle test.
+#[derive(Clone, Copy)]
+enum CollisionShape {
+    Sphere { radius: f32 },
+    Box { half_extent: [f32; 2] },
+    /// `normal` points away from the solid side (into free space).
+    Plane { normal: [f32; 2] },
+}
+
+/// `collisionbehavior`: what happens to a particle that penetrates a
+/// collider this frame.
+#[derive(Clone, Copy, PartialEq)]
+enum CollisionBehavior {
+    Bounce,
+    Slide,
+    Delete,
+}
+
+impl CollisionBehavior {
+    fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("slide") => Self::Slide,
+            Some("delete") => Self::Delete,
+            _ => Self::Bounce,
+        }
+    }
+}
+
+/// One resolved collider: anchored at a `controlpoint` (+ `offset`), same
+/// static-at-construction simplification `vortex`/`controlpointattract`
+/// already accept for control points.
+#[derive(Clone, Copy)]
+struct CollisionParams {
+    shape: CollisionShape,
+    center: [f32; 2],
+    behavior: CollisionBehavior,
+    bounce_factor: f32,
+}
+
+/// `boids` operator: standard separation/alignment/cohesion flocking rules.
+/// Real field names recovered from the binary (see the `Operator` field
+/// docs); the flocking algorithm itself is the industry-standard
+/// three-rule formulation, not independently verified against WE's own
+/// (unrecoverable) per-pixel/per-particle GPU dispatch.
+#[derive(Clone, Copy)]
+struct BoidsParams {
+    separation_threshold: f32,
+    neighbor_threshold: f32,
+    max_speed: f32,
+    separation_factor: f32,
+    alignment_factor: f32,
+    cohesion_factor: f32,
+    /// `variablestrength != 0`: jitter each particle's flocking-force
+    /// magnitude by a deterministic per-particle hash of its id, so a flock
+    /// doesn't move as one mechanically uniform block.
+    variable_strength: bool,
 }
 
 /// `remapvalue`: a noise value at `pos*input_scale` (+time) remapped into
@@ -1251,6 +1361,87 @@ impl ParticleSystem {
                 }
             });
 
+        // `collisionsphere`/`collisionbox`/`collisionbounds`/`collisionquad`/
+        // `collisionplane` — see the `Operator`/`CollisionParams` field docs
+        // for the "no C++ reference" caveat. Anchored at `controlpoint` (+
+        // `offset`), same static-resolve-once convention as
+        // `controlpointattract`/`vortex`.
+        const COLLISION_NAMES: [&str; 5] = [
+            "collisionsphere",
+            "collisionbox",
+            "collisionbounds",
+            "collisionquad",
+            "collisionplane",
+        ];
+        let collisions: Vec<CollisionParams> = config
+            .operator
+            .iter()
+            .filter(|op| COLLISION_NAMES.contains(&op.name.as_str()))
+            .map(|op| {
+                let cp_idx = op.controlpoint.unwrap_or(0).max(0) as usize;
+                let cp = control_points.get(cp_idx).copied().unwrap_or([0.0; 3]);
+                let offset = op
+                    .offset
+                    .as_ref()
+                    .and_then(value_as_vec3)
+                    .unwrap_or([0.0; 3]);
+                let center = [cp[0] + offset[0], cp[1] + offset[1]];
+                let shape = match op.name.as_str() {
+                    "collisionsphere" => CollisionShape::Sphere {
+                        radius: op.radius.unwrap_or(100.0) as f32,
+                    },
+                    "collisionplane" => {
+                        // Default normal (0,1) is "up" in our y-down space
+                        // (screen-up); `angles.z` rotates it, same convention
+                        // `mapsequencearoundcontrolpoint`-adjacent offset
+                        // rotation already uses elsewhere in this module.
+                        let az = op
+                            .angles
+                            .as_ref()
+                            .and_then(value_as_vec3)
+                            .map(|a| a[2])
+                            .unwrap_or(0.0);
+                        let (s, c) = az.sin_cos();
+                        CollisionShape::Plane {
+                            normal: [-s, c],
+                        }
+                    }
+                    // collisionbox/collisionbounds/collisionquad
+                    _ => {
+                        let size = op
+                            .size
+                            .as_ref()
+                            .and_then(value_as_vec3)
+                            .unwrap_or([200.0, 200.0, 0.0]);
+                        CollisionShape::Box {
+                            half_extent: [size[0] * 0.5, size[1] * 0.5],
+                        }
+                    }
+                };
+                CollisionParams {
+                    shape,
+                    center,
+                    behavior: CollisionBehavior::parse(op.collisionbehavior.as_deref()),
+                    bounce_factor: op.bouncefactor.unwrap_or(1.0) as f32,
+                }
+            })
+            .collect();
+
+        // `boids`: standard separation/alignment/cohesion flocking.
+        let boids = config
+            .operator
+            .iter()
+            .find(|op| op.name == "boids")
+            .map(|op| BoidsParams {
+                separation_threshold: op.separationthreshold.unwrap_or(50.0) as f32,
+                neighbor_threshold: op.neighborthreshold.unwrap_or(150.0) as f32,
+                max_speed: op.maxspeed.unwrap_or(500.0) as f32,
+                separation_factor: op.separationfactor.unwrap_or(1.0) as f32,
+                alignment_factor: op.alignmentfactor.unwrap_or(1.0) as f32,
+                cohesion_factor: op.cohesionfactor.unwrap_or(1.0) as f32,
+                variable_strength: op.variablestrength.unwrap_or(0.0) != 0.0,
+            });
+
         Self {
             particles: Vec::with_capacity(max_count),
             emitters,
@@ -1318,6 +1509,8 @@ impl ParticleSystem {
             turbulence,
             vortex,
             remap,
+            collisions,
+            boids,
             time: 0.0,
             start_time: config.starttime.unwrap_or(0.0).max(0.0) as f32,
             scene_force: [0.0, 0.0],
@@ -1348,7 +1541,15 @@ impl ParticleSystem {
 
     pub fn step(&mut self, dt: f32) {
         self.time += dt;
-        for p in &mut self.particles {
+        // `boids`: needs every particle's position/velocity as of the START
+        // of this frame (not yet mutated by this frame's own movement), so
+        // it's computed as a separate read-only pass before the main
+        // per-particle loop mutates anything.
+        let boids_accel = self
+            .boids
+            .as_ref()
+            .map(|b| compute_boids_accel(&self.particles, b));
+        for (particle_index, p) in self.particles.iter_mut().enumerate() {
             // `movement` operator (CParticle.cpp createMovementOperator):
             // position integrates the CURRENT velocity first, and only then
             // do this frame's forces modify velocity (for the next frame) —
@@ -1469,6 +1670,34 @@ impl ParticleSystem {
                 }
             }
 
+            // `boids` operator: apply this particle's precomputed
+            // separation/alignment/cohesion acceleration, then cap speed.
+            if let (Some(accel), Some(b)) = (&boids_accel, &self.boids) {
+                let [ax, ay] = accel[particle_index];
+                let strength = if b.variable_strength {
+                    // Deterministic per-particle jitter in [0.5, 1.5] from a
+                    // cheap integer hash of the particle's stable id — avoids
+                    // adding a new per-particle RNG-state field for a value
+                    // that only needs to be stable, not independently random
+                    // each frame.
+                    let h = p.id.wrapping_mul(2654435761);
+                    0.5 + ((h >> 8) & 0xFFFF) as f32 / 65535.0
+                } else {
+                    1.0
+                };
+                let k = dt * self.speed_mult * strength;
+                p.vx += ax * k;
+                p.vy += ay * k;
+                if b.max_speed > 0.0 {
+                    let speed2 = p.vx * p.vx + p.vy * p.vy;
+                    if speed2 > b.max_speed * b.max_speed {
+                        let s = b.max_speed / speed2.sqrt();
+                        p.vx *= s;
+                        p.vy *= s;
+                    }
+                }
+            }
+
             // `remapvalue`: sample a noise field at the particle position and
             // remap it into the output range, setting velocity (or rescaling
             // speed). fbmnoise sums 4 octaves via `noise::fbm_noise`
@@ -1529,6 +1758,16 @@ impl ParticleSystem {
                         p.vy += (to_center[1] / distance) * force;
                     }
                 }
+            }
+
+            // `collisionsphere`/`collisionbox`/`collisionbounds`/
+            // `collisionquad`/`collisionplane`: checked last among the
+            // motion-affecting operators, against this frame's final
+            // position, so a collider reacts to where the particle actually
+            // ended up (matching how a physics response is conventionally
+            // the last word on a frame's motion).
+            for collider in &self.collisions {
+                resolve_collision(p, collider);
             }
 
             p.life -= dt;
@@ -2851,6 +3090,125 @@ fn point_in_convex_quad(point: [f32; 2], corners: &[[f32; 2]; 4]) -> bool {
     true
 }
 
+/// `boids` operator: O(n^2) separation/alignment/cohesion, using each
+/// particle's position/velocity as of the start of the frame (the caller
+/// snapshots `self.particles` before any per-particle mutation happens this
+/// step). Fine for the particle counts real presets use (`maxcount` is
+/// typically in the hundreds, not thousands).
+fn compute_boids_accel(particles: &[Particle], b: &BoidsParams) -> Vec<[f32; 2]> {
+    let n = particles.len();
+    let mut accel = vec![[0.0f32; 2]; n];
+    for i in 0..n {
+        let pi = &particles[i];
+        let mut separation = [0.0f32; 2];
+        let mut sep_count: u32 = 0;
+        let mut avg_vel = [0.0f32; 2];
+        let mut avg_pos = [0.0f32; 2];
+        let mut neighbor_count: u32 = 0;
+        for (j, pj) in particles.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let d = [pi.x - pj.x, pi.y - pj.y];
+            let dist = (d[0] * d[0] + d[1] * d[1]).sqrt();
+            if dist > 0.0001 && dist < b.separation_threshold {
+                let f = 1.0 / dist;
+                separation[0] += d[0] * f;
+                separation[1] += d[1] * f;
+                sep_count += 1;
+            }
+            if dist < b.neighbor_threshold {
+                avg_vel[0] += pj.vx;
+                avg_vel[1] += pj.vy;
+                avg_pos[0] += pj.x;
+                avg_pos[1] += pj.y;
+                neighbor_count += 1;
+            }
+        }
+        let mut a = [0.0f32; 2];
+        if sep_count > 0 {
+            let n = sep_count as f32;
+            a[0] += separation[0] / n * b.separation_factor;
+            a[1] += separation[1] / n * b.separation_factor;
+        }
+        if neighbor_count > 0 {
+            let n = neighbor_count as f32;
+            a[0] += (avg_vel[0] / n - pi.vx) * b.alignment_factor;
+            a[1] += (avg_vel[1] / n - pi.vy) * b.alignment_factor;
+            a[0] += (avg_pos[0] / n - pi.x) * b.cohesion_factor;
+            a[1] += (avg_pos[1] / n - pi.y) * b.cohesion_factor;
+        }
+        accel[i] = a;
+    }
+    accel
+}
+
+/// Apply one collider's contact response to a particle already moved this
+/// frame — see `CollisionShape`/`CollisionBehavior` docs for the "no C++
+/// reference" caveat on exact semantics.
+fn resolve_collision(p: &mut Particle, c: &CollisionParams) {
+    // `normal` points from the collider's solid surface toward free space;
+    // `penetration` is how far past the surface the particle currently is
+    // (<= 0.0 means "not colliding", skipped by the caller's-eye-view check
+    // below in each shape branch).
+    let (normal, penetration): ([f32; 2], f32) = match c.shape {
+        CollisionShape::Sphere { radius } => {
+            let d = [p.x - c.center[0], p.y - c.center[1]];
+            let dist = (d[0] * d[0] + d[1] * d[1]).sqrt();
+            if dist >= radius || dist < 1e-5 {
+                return;
+            }
+            ([d[0] / dist, d[1] / dist], radius - dist)
+        }
+        CollisionShape::Box { half_extent } => {
+            let d = [p.x - c.center[0], p.y - c.center[1]];
+            if d[0].abs() >= half_extent[0] || d[1].abs() >= half_extent[1] {
+                return;
+            }
+            let px = half_extent[0] - d[0].abs();
+            let py = half_extent[1] - d[1].abs();
+            if px < py {
+                ([d[0].signum(), 0.0], px)
+            } else {
+                ([0.0, d[1].signum()], py)
+            }
+        }
+        CollisionShape::Plane { normal } => {
+            let d = [p.x - c.center[0], p.y - c.center[1]];
+            let signed = d[0] * normal[0] + d[1] * normal[1];
+            if signed >= 0.0 {
+                return;
+            }
+            (normal, -signed)
+        }
+    };
+
+    match c.behavior {
+        CollisionBehavior::Delete => {
+            p.life = -1.0;
+        }
+        CollisionBehavior::Slide => {
+            p.x += normal[0] * penetration;
+            p.y += normal[1] * penetration;
+            let vn = p.vx * normal[0] + p.vy * normal[1];
+            if vn < 0.0 {
+                p.vx -= normal[0] * vn;
+                p.vy -= normal[1] * vn;
+            }
+        }
+        CollisionBehavior::Bounce => {
+            p.x += normal[0] * penetration;
+            p.y += normal[1] * penetration;
+            let vn = p.vx * normal[0] + p.vy * normal[1];
+            if vn < 0.0 {
+                let restitution = 1.0 + c.bounce_factor;
+                p.vx -= normal[0] * vn * restitution;
+                p.vy -= normal[1] * vn * restitution;
+            }
+        }
+    }
+}
+
 /// Wraps an angle to `[-pi, pi]`, matching `createAngularMovementOperator`'s
 /// per-axis wrap (CParticle.cpp).
 fn wrap_angle(a: f32) -> f32 {
@@ -3866,6 +4224,104 @@ mod tests {
             "no radial force expected, got vx={}",
             p.vx
         );
+    }
+
+    /// `collisionsphere` with the default `bounce` behavior: a particle that
+    /// has penetrated the sphere gets pushed back to the surface and its
+    /// into-surface velocity component reflected (scaled by `1+bouncefactor`).
+    #[test]
+    fn collisionsphere_bounces_particle_off_surface() {
+        let json = r#"{
+            "maxcount": 1,
+            "emitter": [{"name":"box","rate":0}],
+            "controlpoint": [{"id":0,"offset":"0 0 0"}],
+            "operator": [{"id":1,"name":"collisionsphere","controlpoint":0,"radius":50}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        let mut p = make_particle(10.0, 0.0, 5.0, 0.0);
+        p.vx = -50.0;
+        sys.particles.push(p);
+        sys.step(0.1);
+        let p = &sys.particles[0];
+        assert!((p.x - 50.0).abs() < 1e-3, "expected pushed to surface, x={}", p.x);
+        assert!(p.vx > 0.0, "expected reflected outward velocity, vx={}", p.vx);
+    }
+
+    /// `collisionbox` with `slide`: the into-wall velocity component is
+    /// zeroed (not reflected), and the particle is pushed back to the wall.
+    #[test]
+    fn collisionbox_slide_zeroes_into_wall_velocity() {
+        let json = r#"{
+            "maxcount": 1,
+            "emitter": [{"name":"box","rate":0}],
+            "controlpoint": [{"id":0,"offset":"0 0 0"}],
+            "operator": [{"id":1,"name":"collisionbox","controlpoint":0,
+                          "size":"100 100 0","collisionbehavior":"slide"}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        let mut p = make_particle(60.0, 0.0, 5.0, 0.0);
+        p.vx = -100.0;
+        sys.particles.push(p);
+        sys.step(0.15);
+        let p = &sys.particles[0];
+        assert!((p.x - 50.0).abs() < 1e-3, "expected pushed to wall, x={}", p.x);
+        assert!(p.vx.abs() < 1e-3, "expected into-wall velocity zeroed, vx={}", p.vx);
+    }
+
+    /// `collisionplane` with `delete`: a particle on the solid side of the
+    /// plane is killed outright (removed by `step`'s own retain).
+    #[test]
+    fn collisionplane_delete_removes_particle() {
+        let json = r#"{
+            "maxcount": 1,
+            "emitter": [{"name":"box","rate":0}],
+            "controlpoint": [{"id":0,"offset":"0 0 0"}],
+            "operator": [{"id":1,"name":"collisionplane","controlpoint":0,
+                          "collisionbehavior":"delete"}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.particles.push(make_particle(0.0, -10.0, 5.0, 0.0));
+        sys.step(0.1);
+        assert!(sys.particles.is_empty(), "particle should be deleted on contact");
+    }
+
+    /// `boids` cohesion pulls two distant particles toward each other.
+    #[test]
+    fn boids_cohesion_pulls_particles_together() {
+        let json = r#"{
+            "maxcount": 2,
+            "emitter": [{"name":"box","rate":0}],
+            "operator": [{"id":1,"name":"boids","neighborthreshold":500,
+                          "separationthreshold":1,"cohesionfactor":1.0,"alignmentfactor":0}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.particles.push(make_particle(-100.0, 0.0, 5.0, 0.0));
+        sys.particles.push(make_particle(100.0, 0.0, 5.0, 0.0));
+        sys.step(0.1);
+        assert!(sys.particles[0].vx > 1.0, "left particle should move right, vx={}", sys.particles[0].vx);
+        assert!(sys.particles[1].vx < -1.0, "right particle should move left, vx={}", sys.particles[1].vx);
+    }
+
+    /// `boids` separation pushes two nearby particles apart.
+    #[test]
+    fn boids_separation_pushes_particles_apart() {
+        let json = r#"{
+            "maxcount": 2,
+            "emitter": [{"name":"box","rate":0}],
+            "operator": [{"id":1,"name":"boids","separationthreshold":50,
+                          "neighborthreshold":1,"separationfactor":1.0}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.particles.push(make_particle(-2.0, 0.0, 5.0, 0.0));
+        sys.particles.push(make_particle(2.0, 0.0, 5.0, 0.0));
+        sys.step(0.1);
+        assert!(sys.particles[0].vx < 0.0, "left particle should move further left, vx={}", sys.particles[0].vx);
+        assert!(sys.particles[1].vx > 0.0, "right particle should move further right, vx={}", sys.particles[1].vx);
     }
 
     /// `movement.drag` decays velocity by `1 - drag*dt` per step, clamped
