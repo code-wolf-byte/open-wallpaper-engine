@@ -346,12 +346,28 @@ pub struct Operator {
     pub ringpulldistance: Option<f64>,
     #[serde(default)]
     pub ringpullforce: Option<f64>,
-    /// `remapvalue` (CParticle createValueRemapOperator): samples a noise
-    /// function at the particle position and remaps it into `outputrange*`,
-    /// writing the `output` channel (`velocity`/`speed`). `outputrangemin`/
-    /// `max` are `"x y z"` vec3 for velocity, scalar for speed.
+    /// `remapvalue` (CParticle createValueRemapOperator, real retail-binary
+    /// dispatch tables recovered in the Ghidra report's Follow-up (x)):
+    /// reads `input` (a named particle field, or noise sampled at the
+    /// particle position/time when unset), shapes it through
+    /// `transformfunction`, remaps `[inputrangemin, inputrangemax]` into
+    /// `[outputrangemin, outputrangemax]`, and combines it into `output` via
+    /// `operation`. `outputrangemin`/`max` are `"x y z"` vec3 for
+    /// vector-valued outputs (velocity/position/color), scalar otherwise.
+    #[serde(default)]
+    pub input: Option<String>,
+    #[serde(default)]
+    pub inputcomponent: Option<String>,
     #[serde(default)]
     pub output: Option<String>,
+    #[serde(default)]
+    pub outputcomponent: Option<String>,
+    #[serde(default)]
+    pub operation: Option<String>,
+    #[serde(default)]
+    pub inputrangemin: Option<serde_json::Value>,
+    #[serde(default)]
+    pub inputrangemax: Option<serde_json::Value>,
     #[serde(default)]
     pub outputrangemin: Option<serde_json::Value>,
     #[serde(default)]
@@ -633,8 +649,12 @@ pub struct ParticleSystem {
     turbulence: Option<TurbulenceParams>,
     /// `vortex` operator parameters.
     vortex: Option<VortexParams>,
-    /// `remapvalue` operator parameters.
-    remap: Option<RemapParams>,
+    /// `remapvalue` operator parameters — a `Vec` since real content
+    /// (`particles/presets/rain_screen.json`) attaches more than one (one
+    /// targeting `velocity`, one targeting `speed`) and both must run; a
+    /// single `Option` here used to silently drop every instance after the
+    /// first.
+    remap: Vec<RemapParams>,
     /// `collisionsphere`/`collisionbox`/`collisionbounds`/`collisionquad`/
     /// `collisionplane` operators — every one attached, since a system can
     /// have more than one collider (e.g. a floor plane plus a wall box).
@@ -840,20 +860,327 @@ struct BoidsParams {
     variable_strength: bool,
 }
 
-/// `remapvalue`: a noise value at `pos*input_scale` (+time) remapped into
-/// `[out_min, out_max]` per axis, written to the `velocity` or `speed` channel.
+/// `remapvalue`'s `input`/`output` field selector. Real, named fields
+/// recovered directly from the retail binary's own dispatch table (Ghidra
+/// report Follow-up (x)); only the subset this engine already tracks
+/// per-particle state for is implemented. The rest
+/// (`distancetocontrolpoint`/`positionbetweentwocontrolpoints`/`runtime`/
+/// `timeofday`/`particlesystemtime`/`layertime`/`controlpoint`/
+/// `deltatocontrolpoint`/`directiontocontrolpoint`/`layerorigin`) are real
+/// names too, but need control-point/scene-clock plumbing this operator
+/// doesn't have access to and no cached real content (271 Workshop items
+/// checked) exercises any of them — falling through to `None` (noise mode)
+/// rather than silently misreading a wrong field.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RemapField {
+    /// No `input` configured: sample noise at the particle position/time —
+    /// the original, real-content-validated behavior, unchanged.
+    None,
+    LifetimeFraction,
+    MaxLifetime,
+    Size,
+    Opacity,
+    Speed,
+    Rotation,
+    AngularSpeed,
+    Color,
+    Position,
+    Velocity,
+}
+
+impl RemapField {
+    fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("lifetimefraction") => Self::LifetimeFraction,
+            Some("maxlifetime") => Self::MaxLifetime,
+            Some("size") => Self::Size,
+            Some("opacity") => Self::Opacity,
+            Some("speed") => Self::Speed,
+            Some("rotation") => Self::Rotation,
+            Some("angularspeed") => Self::AngularSpeed,
+            Some("color") => Self::Color,
+            Some("position") => Self::Position,
+            Some("velocity") => Self::Velocity,
+            _ => Self::None,
+        }
+    }
+}
+
+/// `remapvalue`'s `output` field — same real dispatch table as
+/// [`RemapField`], restricted to fields this operator can write back to.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RemapOutput {
+    Velocity,
+    Speed,
+    Size,
+    Opacity,
+    Rotation,
+    AngularSpeed,
+    Color,
+    Position,
+}
+
+impl RemapOutput {
+    fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("speed") => Self::Speed,
+            Some("size") => Self::Size,
+            Some("opacity") => Self::Opacity,
+            Some("rotation") => Self::Rotation,
+            Some("angularspeed") => Self::AngularSpeed,
+            Some("color") => Self::Color,
+            Some("position") => Self::Position,
+            // "velocity" and anything unrecognized: existing default.
+            _ => Self::Velocity,
+        }
+    }
+}
+
+/// `remapvalue`'s `operation` — how the remapped value combines with the
+/// output field's current value. `Multiply` is corroborated directly: the
+/// retail binary's own `alphafade`-family default-preset builders
+/// (`FUN_1401bfbb0`/`FUN_1401bc4b0`, Follow-up (x)) construct exactly
+/// `operation=multiply, input=lifetimefraction` to fade a field by a
+/// lifetime-driven factor — the same shape as this engine's own
+/// (independently, already-validated) `alphafade` — so "multiply the
+/// current value" is a corroborated reading, not a guess. `Add`/`Subtract`
+/// follow the same current-value-combine pattern; no real cached content
+/// exercises them to cross-check against.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RemapOp {
+    /// Default: replace the output field outright (the original,
+    /// real-content-validated `remapvalue` behavior).
+    Remap,
+    Multiply,
+    Add,
+    Subtract,
+}
+
+impl RemapOp {
+    fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("multiply") => Self::Multiply,
+            Some("add") => Self::Add,
+            Some("subtract") => Self::Subtract,
+            _ => Self::Remap,
+        }
+    }
+
+    fn combine(self, current: f32, remapped: f32) -> f32 {
+        match self {
+            Self::Remap => remapped,
+            Self::Multiply => current * remapped,
+            Self::Add => current + remapped,
+            Self::Subtract => current - remapped,
+        }
+    }
+}
+
+/// `remapvalue`'s `transformfunction` — shapes the normalized `[0,1]` input
+/// before it's remapped into the output range. The retail binary gave up
+/// only the *names* (Follow-up (x)), not formulas: `Sine`/`Square`/
+/// `Triangle` are the standard one-period constructions for each name, an
+/// honest best-effort reading rather than a verified port. `Saw` is a
+/// linear ramp over a single non-wrapping `[0,1]` pass, which makes it
+/// indistinguishable here from `None` — documented, not hidden.
+/// `Simplex`/`Fbm` are unchanged from before: real, position/time-driven
+/// noise sampling, validated against real content
+/// (`particles/presets/rain_screen.json`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RemapTransform {
+    None,
+    Sine,
+    Square,
+    Saw,
+    Triangle,
+    Simplex,
+    Fbm,
+}
+
+impl RemapTransform {
+    /// Parses an explicit, non-empty `transformfunction` value. Whether an
+    /// *absent* key defaults to `Simplex` (noise generator) or `None`
+    /// (passthrough) depends on whether `input` was also given — see the
+    /// call site in `ParticleSystem::new` — so that's handled there, not
+    /// here.
+    fn parse(s: &str) -> Self {
+        match s {
+            "none" => Self::None,
+            "sine" => Self::Sine,
+            "square" => Self::Square,
+            "saw" => Self::Saw,
+            "triangle" => Self::Triangle,
+            "fbmnoise" => Self::Fbm,
+            // "simplexnoise" and anything unrecognized.
+            _ => Self::Simplex,
+        }
+    }
+
+    fn is_noise(self) -> bool {
+        matches!(self, Self::Simplex | Self::Fbm)
+    }
+
+    /// Shape an already-clamped `[0,1]` value. Noise variants are handled
+    /// separately (via position/time sampling, not this function).
+    fn shape(self, t: f32) -> f32 {
+        match self {
+            Self::None | Self::Saw | Self::Simplex | Self::Fbm => t,
+            Self::Sine => 0.5 + 0.5 * (t * std::f32::consts::TAU).sin(),
+            Self::Square => {
+                if t < 0.5 {
+                    0.0
+                } else {
+                    1.0
+                }
+            }
+            Self::Triangle => 1.0 - (2.0 * t - 1.0).abs(),
+        }
+    }
+}
+
+/// `remapvalue`'s `inputcomponent`/`outputcomponent` — real, named
+/// selectors recovered from the retail binary (Follow-up (x)).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RemapComponent {
+    All,
+    X,
+    Y,
+    Z,
+    Sum,
+    Average,
+    Max,
+    Min,
+}
+
+impl RemapComponent {
+    fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("x") => Self::X,
+            Some("y") => Self::Y,
+            Some("z") => Self::Z,
+            Some("sum") => Self::Sum,
+            Some("average") => Self::Average,
+            Some("max") => Self::Max,
+            Some("min") => Self::Min,
+            _ => Self::All,
+        }
+    }
+
+    /// Collapse a (2- or 3-axis) vector to one scalar, for reading a
+    /// vector-valued input field. `All`/`Average` both average — a vector
+    /// input must collapse to one scalar for the remap math regardless, and
+    /// averaging is the least-arbitrary choice among these (stays in the
+    /// field's native range, unlike `Sum`, which scales with axis count).
+    fn reduce(self, v: [f32; 3], axes: usize) -> f32 {
+        let axes = axes.min(3);
+        match self {
+            Self::X => v[0],
+            Self::Y => v[1],
+            Self::Z => v[2],
+            Self::Sum => v[..axes].iter().sum(),
+            Self::Max => v[..axes].iter().cloned().fold(f32::MIN, f32::max),
+            Self::Min => v[..axes].iter().cloned().fold(f32::MAX, f32::min),
+            Self::All | Self::Average => v[..axes].iter().sum::<f32>() / axes as f32,
+        }
+    }
+}
+
+/// `remapvalue`: reads `input` (a named particle field, or noise sampled at
+/// the particle position when unset), shapes it, remaps it into
+/// `[out_min, out_max]`, and combines it into `output` via `operation`. See
+/// [`RemapField`]/[`RemapOutput`]/[`RemapOp`]/[`RemapTransform`] for what's
+/// grounded in the retail binary vs. an honest best-effort reading.
 #[derive(Clone, Copy)]
 struct RemapParams {
-    /// 0 = write velocity vector, 1 = scale speed along current heading.
-    to_speed: bool,
+    input: RemapField,
+    input_component: RemapComponent,
+    output: RemapOutput,
+    output_component: RemapComponent,
+    operation: RemapOp,
+    transform: RemapTransform,
+    in_min: f32,
+    in_max: f32,
     out_min: [f32; 3],
     out_max: [f32; 3],
     input_scale: f32,
-    /// `fbmnoise` sums 4 octaves via `noise::fbm_noise` instead of a single
-    /// `perlin_noise` sample — see that function's doc comment for why the
-    /// octave count/weighting is a reasonable approximation, not a verified
-    /// port (WE's real formula isn't recoverable for this operator).
-    fbm: bool,
+}
+
+impl RemapParams {
+    /// Read the configured input field as a single scalar (vector fields
+    /// collapse via `input_component`). Only meaningful when `input !=
+    /// RemapField::None` — noise mode is handled entirely in `sample01`.
+    fn read_input(&self, p: &Particle, lifetime_pos: f32, max_life: f32) -> f32 {
+        match self.input {
+            RemapField::None => 0.0,
+            RemapField::LifetimeFraction => lifetime_pos,
+            RemapField::MaxLifetime => max_life,
+            RemapField::Size => p.size,
+            RemapField::Opacity => p.alpha,
+            RemapField::Speed => (p.vx * p.vx + p.vy * p.vy).sqrt(),
+            RemapField::Rotation => p.rotation,
+            RemapField::AngularSpeed => p.angular_velocity,
+            RemapField::Color => self.input_component.reduce(
+                [
+                    p.color[0] as f32 / 255.0,
+                    p.color[1] as f32 / 255.0,
+                    p.color[2] as f32 / 255.0,
+                ],
+                3,
+            ),
+            RemapField::Position => self.input_component.reduce([p.x, p.y, 0.0], 2),
+            RemapField::Velocity => self.input_component.reduce([p.vx, p.vy, 0.0], 2),
+        }
+    }
+
+    /// The shaped `[0,1]` value to lerp into `[out_min, out_max]`.
+    /// `axis_seed` only matters in noise mode (a different seed per output
+    /// axis, exactly the original x/y-decorrelation this operator always
+    /// used); field mode ignores it, which is what gives a scalar field's
+    /// single value its "broadcast to every output axis" behavior.
+    fn sample01(&self, axis_seed: f64, p: &Particle, time: f32, lifetime_pos: f32, max_life: f32) -> f32 {
+        if self.input == RemapField::None || self.transform.is_noise() {
+            use crate::engine::noise::fbm_noise;
+            let s = self.input_scale;
+            let (x, y, t) = ((p.x * s) as f64, (p.y * s) as f64, time as f64);
+            let octaves = if self.transform == RemapTransform::Fbm { 4 } else { 1 };
+            let n = fbm_noise(x + axis_seed, y, t, octaves);
+            ((n * 0.5 + 0.5) as f32).clamp(0.0, 1.0) // [-1,1] → [0,1]
+        } else {
+            let raw = self.read_input(p, lifetime_pos, max_life);
+            let range = (self.in_max - self.in_min).abs().max(1e-6);
+            let normalized = ((raw - self.in_min) / range).clamp(0.0, 1.0);
+            self.transform.shape(normalized)
+        }
+    }
+
+    /// Apply this operator to a 2- or 3-axis vector field (`velocity`/
+    /// `position`/`color`), honoring `output_component` (writes only that
+    /// one axis, leaving the rest of `current` untouched) or every in-range
+    /// axis when it's `All`. Distinct per-axis noise seeds match the
+    /// original x/y-decorrelated noise sampling exactly; field-mode inputs
+    /// naturally broadcast the same value to every written axis instead
+    /// (`sample01` ignores the seed outside noise mode).
+    fn apply_vector(&self, p: &Particle, time: f32, lifetime_pos: f32, current: [f32; 3], axes: usize) -> [f32; 3] {
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let seeds = [0.0f64, 13.7, 27.4];
+        let mut out = current;
+        let apply_axis = |axis: usize, out: &mut [f32; 3]| {
+            let t = self.sample01(seeds[axis], p, time, lifetime_pos, p.max_life);
+            let remapped = lerp(self.out_min[axis], self.out_max[axis], t);
+            out[axis] = self.operation.combine(current[axis], remapped);
+        };
+        match self.output_component {
+            RemapComponent::X => apply_axis(0, &mut out),
+            RemapComponent::Y if axes >= 2 => apply_axis(1, &mut out),
+            RemapComponent::Z if axes >= 3 => apply_axis(2, &mut out),
+            _ => {
+                for axis in 0..axes {
+                    apply_axis(axis, &mut out);
+                }
+            }
+        }
+        out
+    }
 }
 
 struct EmitterState {
@@ -1341,10 +1668,10 @@ impl ParticleSystem {
                 }
             });
 
-        let remap = config
+        let remap: Vec<RemapParams> = config
             .operator
             .iter()
-            .find(|op| op.name == "remapvalue")
+            .filter(|op| op.name == "remapvalue")
             .map(|op| {
                 let range = |v: &Option<serde_json::Value>, d: f32| {
                     v.as_ref()
@@ -1352,14 +1679,41 @@ impl ParticleSystem {
                         .or_else(|| v.as_ref().and_then(value_as_f32).map(|s| [s, s, s]))
                         .unwrap_or([d, d, d])
                 };
+                let scalar = |v: &Option<serde_json::Value>, d: f32| {
+                    v.as_ref().and_then(value_as_f32).unwrap_or(d)
+                };
+                let input = RemapField::parse(op.input.as_deref());
+                // No `transformfunction` key at all: noise-generator default
+                // when there's no `input` field either (the classic,
+                // real-content-validated case, `rain_screen.json`);
+                // passthrough when an `input` field IS given, so setting
+                // `input` alone uses the field's value directly instead of
+                // silently overriding it with noise. Confirmed against the
+                // retail binary's own `alphafade`-preset builder
+                // (Follow-up (x)), which pairs `input=lifetimefraction` with
+                // an *explicit* `transformfunction=none` — this default
+                // reproduces that pairing even when a wallpaper's own config
+                // omits the (redundant) explicit "none".
+                let transform = match op.transformfunction.as_deref() {
+                    Some(s) => RemapTransform::parse(s),
+                    None if input == RemapField::None => RemapTransform::Simplex,
+                    None => RemapTransform::None,
+                };
                 RemapParams {
-                    to_speed: op.output.as_deref() == Some("speed"),
+                    input,
+                    input_component: RemapComponent::parse(op.inputcomponent.as_deref()),
+                    output: RemapOutput::parse(op.output.as_deref()),
+                    output_component: RemapComponent::parse(op.outputcomponent.as_deref()),
+                    operation: RemapOp::parse(op.operation.as_deref()),
+                    transform,
+                    in_min: scalar(&op.inputrangemin, 0.0),
+                    in_max: scalar(&op.inputrangemax, 1.0),
                     out_min: range(&op.outputrangemin, 0.0),
                     out_max: range(&op.outputrangemax, 0.0),
                     input_scale: op.transforminputscale.unwrap_or(1.0) as f32,
-                    fbm: op.transformfunction.as_deref() == Some("fbmnoise"),
                 }
-            });
+            })
+            .collect();
 
         // `collisionsphere`/`collisionbox`/`collisionbounds`/`collisionquad`/
         // `collisionplane` — see the `Operator`/`CollisionParams` field docs
@@ -1698,34 +2052,37 @@ impl ParticleSystem {
                 }
             }
 
-            // `remapvalue`: sample a noise field at the particle position and
-            // remap it into the output range, setting velocity (or rescaling
-            // speed). fbmnoise sums 4 octaves via `noise::fbm_noise`
-            // (industry-standard construction, not a verified port — WE's
-            // real formula isn't recoverable; see the Ghidra report's
-            // fbmnoise follow-up). `octaves = 1` makes the non-fbm case
-            // reduce to exactly `perlin_noise`, unchanged from before.
-            if let Some(r) = self.remap {
-                let s = r.input_scale;
-                let noise = |seed: f64| -> f32 {
-                    use crate::engine::noise::fbm_noise;
-                    let (x, y, t) = ((p.x * s) as f64, (p.y * s) as f64, self.time as f64);
-                    let octaves = if r.fbm { 4 } else { 1 };
-                    let n = fbm_noise(x + seed, y, t, octaves);
-                    ((n * 0.5 + 0.5) as f32).clamp(0.0, 1.0) // [-1,1] → [0,1]
-                };
-                let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
-                if r.to_speed {
-                    let sp = lerp(r.out_min[0], r.out_max[0], noise(0.0));
-                    let mag = (p.vx * p.vx + p.vy * p.vy).sqrt();
-                    if mag > 1e-4 {
-                        let k = sp / mag;
-                        p.vx *= k;
-                        p.vy *= k;
+            // `remapvalue` targeting `velocity`/`speed`: runs here (before
+            // this frame's velocity is used for next frame's position
+            // integration), matching the original, real-content-validated
+            // timing exactly. Fields targeting other outputs run later,
+            // after alpha/size/color are computed (see below) so
+            // `remapvalue` can override them.
+            let lifetime_pos_pre = if p.max_life > 0.0 {
+                ((p.max_life - p.life) / p.max_life).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            for r in &self.remap {
+                match r.output {
+                    RemapOutput::Velocity => {
+                        let [vx, vy, _] =
+                            r.apply_vector(p, self.time, lifetime_pos_pre, [p.vx, p.vy, 0.0], 2);
+                        p.vx = vx;
+                        p.vy = vy;
                     }
-                } else {
-                    p.vx = lerp(r.out_min[0], r.out_max[0], noise(0.0));
-                    p.vy = lerp(r.out_min[1], r.out_max[1], noise(13.7));
+                    RemapOutput::Speed => {
+                        let t = r.sample01(0.0, p, self.time, lifetime_pos_pre, p.max_life);
+                        let target = r.out_min[0] + (r.out_max[0] - r.out_min[0]) * t;
+                        let mag = (p.vx * p.vx + p.vy * p.vy).sqrt();
+                        let sp = r.operation.combine(mag, target);
+                        if mag > 1e-4 {
+                            let k = sp / mag;
+                            p.vx *= k;
+                            p.vy *= k;
+                        }
+                    }
+                    _ => {}
                 }
             }
 
@@ -1871,6 +2228,55 @@ impl ParticleSystem {
                     (p.initial_color[1] * mult[1] * 255.0).clamp(0.0, 255.0) as u8,
                     (p.initial_color[2] * mult[2] * 255.0).clamp(0.0, 255.0) as u8,
                 ];
+            }
+
+            // `remapvalue` targeting anything other than velocity/speed
+            // (handled above, before position integration needs it): runs
+            // last, after alphafade/sizechange/colorchange/oscillate, so an
+            // author who explicitly attaches remapvalue to one of these
+            // fields gets it as the final, overriding value.
+            for r in &self.remap {
+                match r.output {
+                    RemapOutput::Velocity | RemapOutput::Speed => {}
+                    RemapOutput::Opacity => {
+                        let t = r.sample01(0.0, p, self.time, lifetime_pos, p.max_life);
+                        let remapped = r.out_min[0] + (r.out_max[0] - r.out_min[0]) * t;
+                        alpha = r.operation.combine(alpha, remapped);
+                    }
+                    RemapOutput::Size => {
+                        let t = r.sample01(0.0, p, self.time, lifetime_pos, p.max_life);
+                        let remapped = r.out_min[0] + (r.out_max[0] - r.out_min[0]) * t;
+                        size = r.operation.combine(size, remapped);
+                    }
+                    RemapOutput::Rotation => {
+                        let t = r.sample01(0.0, p, self.time, lifetime_pos, p.max_life);
+                        let remapped = r.out_min[0] + (r.out_max[0] - r.out_min[0]) * t;
+                        p.rotation = r.operation.combine(p.rotation, remapped);
+                    }
+                    RemapOutput::AngularSpeed => {
+                        let t = r.sample01(0.0, p, self.time, lifetime_pos, p.max_life);
+                        let remapped = r.out_min[0] + (r.out_max[0] - r.out_min[0]) * t;
+                        p.angular_velocity = r.operation.combine(p.angular_velocity, remapped);
+                    }
+                    RemapOutput::Color => {
+                        let current = [
+                            p.color[0] as f32 / 255.0,
+                            p.color[1] as f32 / 255.0,
+                            p.color[2] as f32 / 255.0,
+                        ];
+                        let out = r.apply_vector(p, self.time, lifetime_pos, current, 3);
+                        p.color = [
+                            (out[0] * 255.0).clamp(0.0, 255.0) as u8,
+                            (out[1] * 255.0).clamp(0.0, 255.0) as u8,
+                            (out[2] * 255.0).clamp(0.0, 255.0) as u8,
+                        ];
+                    }
+                    RemapOutput::Position => {
+                        let [x, y, _] = r.apply_vector(p, self.time, lifetime_pos, [p.x, p.y, 0.0], 2);
+                        p.x = x;
+                        p.y = y;
+                    }
+                }
             }
 
             // `self.alpha_mult` (the instance-override multiplier) is already
@@ -4805,6 +5211,125 @@ mod tests {
                 (-1201.0..=-199.0).contains(&p.vy),
                 "vy {} out of remapped y-range",
                 p.vy
+            );
+        }
+    }
+
+    /// Real content (`particles/presets/rain_screen.json`, workshop item
+    /// `3564529588`) attaches *two* `remapvalue` operators — one targeting
+    /// `velocity`, one `speed` — and both must take effect. The old
+    /// `Option<RemapParams>` silently dropped every instance after the
+    /// first; this is the regression test for the `Vec` fix.
+    #[test]
+    fn multiple_remapvalue_operators_all_apply() {
+        let json = r#"{
+            "maxcount": 20,
+            "emitter": [{"name":"boxrandom","rate":1000,"distancemin":"0 0 0","distancemax":"0 0 0"}],
+            "initializer": [
+                {"id":1,"name":"lifetimerandom","min":100,"max":100}
+            ],
+            "operator": [
+                {"id":1,"name":"remapvalue","output":"velocity",
+                 "outputrangemin":"5 5 0","outputrangemax":"5 5 0",
+                 "transformfunction":"simplexnoise","transforminputscale":10},
+                {"id":2,"name":"remapvalue","output":"speed",
+                 "outputrangemin":"50","outputrangemax":"50",
+                 "transformfunction":"fbmnoise","transforminputscale":8}
+            ]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).unwrap();
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        // Particles spawn at the *end* of `step()`, after the per-particle
+        // update loop that applies `remapvalue` — a freshly-spawned particle
+        // hasn't had it applied yet on the frame it's born (same reasoning
+        // `remapvalue_sets_velocity_within_output_range` above steps
+        // multiple times for), so step twice before checking.
+        sys.step(1.0 / 30.0);
+        sys.step(1.0 / 30.0);
+        assert!(!sys.particles.is_empty(), "should have spawned particles");
+        for p in &sys.particles {
+            // A degenerate [5,5]x[5,5] range collapses velocity's own remap
+            // to a fixed heading; the speed operator then rescales its
+            // magnitude to 50 — only observable if *both* operators ran.
+            let mag = (p.vx * p.vx + p.vy * p.vy).sqrt();
+            assert!((mag - 50.0).abs() < 0.5, "speed {mag} not rescaled to ~50");
+        }
+    }
+
+    /// The general field-to-field form: `input=lifetimefraction,
+    /// operation=multiply, output=opacity` is exactly the shape the retail
+    /// binary's own `alphafade`-preset builders construct internally
+    /// (Ghidra report Follow-up (x), `FUN_1401bfbb0`/`FUN_1401bc4b0`) — a
+    /// lifetime-driven fade-out multiplier. Checks opacity decreases
+    /// monotonically as the particle ages toward its declared output range.
+    #[test]
+    fn remapvalue_multiply_by_lifetimefraction_fades_opacity() {
+        let json = r#"{
+            "maxcount": 5,
+            "emitter": [{"name":"boxrandom","rate":1000,"distancemin":"0 0 0","distancemax":"0 0 0"}],
+            "initializer": [
+                {"id":1,"name":"lifetimerandom","min":30,"max":30},
+                {"id":2,"name":"alpharandom","min":1,"max":1}
+            ],
+            "operator": [
+                {"id":1,"name":"remapvalue","input":"lifetimefraction",
+                 "operation":"multiply","output":"opacity",
+                 "inputrangemin":0,"inputrangemax":1,
+                 "outputrangemin":1,"outputrangemax":0,
+                 "transformfunction":"none"}
+            ]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).unwrap();
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.step(1.0 / 30.0);
+        assert!(!sys.particles.is_empty(), "should have spawned particles");
+        let alpha_early = sys.particles[0].alpha;
+        for _ in 0..20 {
+            sys.step(1.0 / 30.0);
+        }
+        assert!(!sys.particles.is_empty(), "particle should still be alive");
+        let alpha_late = sys.particles[0].alpha;
+        assert!(
+            alpha_late < alpha_early,
+            "opacity should fade as lifetimefraction rises toward 1 (early={alpha_early}, late={alpha_late})"
+        );
+    }
+
+    /// `transformfunction:"none"` with a real `input` field is a straight
+    /// remap (default `operation`), no shaping — the simplest, most literal
+    /// case of the general form, targeting `size` this time.
+    #[test]
+    fn remapvalue_remaps_size_from_maxlifetime() {
+        let json = r#"{
+            "maxcount": 5,
+            "emitter": [{"name":"boxrandom","rate":1000,"distancemin":"0 0 0","distancemax":"0 0 0"}],
+            "initializer": [
+                {"id":1,"name":"lifetimerandom","min":40,"max":40},
+                {"id":2,"name":"sizerandom","min":1,"max":1}
+            ],
+            "operator": [
+                {"id":1,"name":"remapvalue","input":"maxlifetime",
+                 "output":"size","transformfunction":"none",
+                 "inputrangemin":0,"inputrangemax":40,
+                 "outputrangemin":0,"outputrangemax":200}
+            ]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).unwrap();
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        // See the comment in `multiple_remapvalue_operators_all_apply`: a
+        // freshly-spawned particle hasn't had `remapvalue` applied yet on
+        // its spawn frame.
+        sys.step(1.0 / 30.0);
+        sys.step(1.0 / 30.0);
+        assert!(!sys.particles.is_empty(), "should have spawned particles");
+        for p in &sys.particles {
+            // maxlifetime=40 sits at the top of [0,40] -> size should land
+            // at (or very near) the top of [0,200], overriding sizerandom's
+            // spawn value of 1.
+            assert!(
+                (p.size - 200.0).abs() < 1.0,
+                "size {} not remapped from maxlifetime",
+                p.size
             );
         }
     }
