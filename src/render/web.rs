@@ -167,9 +167,21 @@ mod imp {
 
   window.wallpaperRegisterAudioListener = function (cb) { audioCb = cb; };
 
-  // No file-picker UI exists here, so the callback simply never fires — the
-  // page keeps whatever default it started with.
-  window.wallpaperRequestRandomFileForProperty = function (name, cb) {};
+  // Rust bundles a `__files` array (file:// URLs) onto any `directory`-type
+  // property whose current value resolves to a real, readable directory
+  // (see `user_properties_json`) — pick one at random here rather than a
+  // real native round-trip per call; same user-visible behavior (a
+  // randomized slideshow) for confirmed real usage (workshop item
+  // 893418273), far less machinery than the genuine async CEF IPC a
+  // literal port of the real per-call API would need.
+  window.wallpaperRequestRandomFileForProperty = function (name, cb) {
+    if (!pendingProps) return;
+    var prop = pendingProps[name];
+    var files = prop && prop.__files;
+    if (!files || !files.length) return;
+    var file = files[Math.floor(Math.random() * files.length)];
+    try { cb(name, file); } catch (e) { console.error(e); }
+  };
 
   // Real shape confirmed from the vendored C++ reference's ScriptEngine.cpp
   // (`notifyMediaUpdate`) — WE calls all four callbacks a listener defines,
@@ -261,6 +273,48 @@ mod imp {
         impl App {
             fn render_process_handler(&self) -> Option<RenderProcessHandler> {
                 Some(self.render_process_handler.clone())
+            }
+
+            /// Some sandboxes (containers with restricted process-spawn/
+            /// namespace permissions) fail to launch Chromium's separate GPU
+            /// process at all — not a missing-driver problem
+            /// (`/dev/dri/renderD128` present and accessible is not enough;
+            /// the crash is a zygote/process-launch failure:
+            /// `GPU process launch failed`, then a hard `GPU process isn't
+            /// usable. Goodbye.` before any page even loads). `--in-process-
+            /// gpu` is the standard fix for exactly this failure mode: it
+            /// runs GPU code inside the browser process instead of spawning
+            /// a separate one, sidestepping the broken spawn path entirely.
+            /// `--disable-gpu-sandbox` additionally skips the per-process GPU
+            /// sandbox (redundant with `Settings.no_sandbox` already being
+            /// set, but that field doesn't necessarily suppress every
+            /// internal Chromium sandbox attempt on its own — the zygote
+            /// failure above is exactly that kind of leftover). Applied
+            /// unconditionally (every process type, including the initial
+            /// browser-process call where `process_type` is `None`) —
+            /// standard practice for flags like this that child processes
+            /// need to inherit consistently.
+            fn on_before_command_line_processing(
+                &self,
+                _process_type: Option<&CefString>,
+                command_line: Option<&mut CommandLine>,
+            ) {
+                let Some(command_line) = command_line else {
+                    return;
+                };
+                command_line.append_switch(Some(&"disable-gpu-sandbox".into()));
+                // Chromium restricts a `file://` page to reading `file://`
+                // resources from its OWN directory tree by default — real
+                // impact here, not theoretical: a `file`/`directory`-type
+                // property's user-chosen path (`user_properties_json` in
+                // this module) is almost never inside the wallpaper's own
+                // bundle directory (a user picks their own ~/Pictures
+                // folder for a slideshow, workshop item 893418273's real
+                // use case), so without this flag every such override —
+                // and the `__files` directory-listing feature built on top
+                // of it — would silently fail to load, indistinguishable
+                // from a wallpaper that simply renders solid black.
+                command_line.append_switch(Some(&"allow-file-access-from-files".into()));
             }
         }
     }
@@ -548,6 +602,15 @@ mod imp {
         .set_as_windowless(0);
         let browser_settings = BrowserSettings {
             windowless_frame_rate: 60,
+            // CEF's OSR default is fully transparent (`0x00000000`) — meant
+            // for embedding a browser view over other content, not for a
+            // desktop background. A wallpaper whose page hasn't painted an
+            // opaque background yet (or, on this run, is genuinely stuck on
+            // an early transparent paint — see `on_before_command_line_
+            // processing`'s doc comment on `--in-process-gpu`) should still
+            // show *something* solid, not whatever the desktop had behind
+            // it. `0xFF000000` = opaque black, ARGB.
+            background_color: 0xFF000000,
             ..Default::default()
         };
 
@@ -561,22 +624,95 @@ mod imp {
         )
     }
 
-    /// project.json's `general.properties` as a JSON object literal.
+    /// Builds the JSON `applyUserProperties` receives, starting from the raw
+    /// `project.json` declarations (preserving every field real wallpaper JS
+    /// might read beyond `.value` — `condition`, `index`, `order`, etc. —
+    /// verbatim) and then:
     ///
-    /// Its shape is already what `applyUserProperties` expects — each entry is
-    /// `{ "value": …, "type": …, … }` and pages read `properties.<name>.value`
-    /// — so it passes through untouched. Empty string when there are none.
+    /// 1. **Applying `--set-property`/saved overrides** — this used to send
+    ///    the project.json defaults straight through, meaning web wallpapers
+    ///    silently ignored every override scene wallpapers already got via
+    ///    `engine::properties::SceneProperties`. Same override source
+    ///    (`global_overrides`), so `wp-engine set <web-wallpaper>
+    ///    --set-property name=value` (and a saved `settings::WpSettings`
+    ///    override) now actually reaches the page.
+    /// 2. **`file`-type values are passed through as bare filesystem paths,
+    ///    unmodified** — real-content ground truth, confirmed against TWO
+    ///    independent wallpapers' actual code, not assumed: 893418273's
+    ///    `backgroundimage` handler does `imagePath = "file:///" +
+    ///    properties.backgroundimage.value`, and 1396475780's `audiOrbits.js`
+    ///    `setImgSrc` does the identical `"file:///" + srcVal` — both
+    ///    wallpapers do their *own* `file://` prefixing and expect a bare
+    ///    path in `.value`. An earlier version of this function pre-
+    ///    converted `.value` to a full `file://` URL, which looked
+    ///    plausible (a bare path isn't normally a valid `<img src>`) but
+    ///    was never actually verified against a real wallpaper's *full*
+    ///    property-consumption code, only assumed from seeing `.value` read
+    ///    directly — that produced a broken double-prefixed
+    ///    `file:///file:///...` URL for exactly the wallpaper it was meant
+    ///    to fix, caught by an end-to-end visual smoke test (a magenta test
+    ///    image that rendered as flat black — every sampled pixel exactly
+    ///    matched the browser's own background-fill color, meaning the
+    ///    image never loaded at all). A bare absolute path used directly in
+    ///    a CSS `url(...)`/`<img src>` still resolves correctly on a page
+    ///    loaded from a `file://` origin (standard URL-resolution rules
+    ///    treat a leading `/` as absolute-path-from-the-current-origin's
+    ///    root, and a `file://` origin's root *is* the filesystem root) —
+    ///    so passing the raw path through is correct for both conventions,
+    ///    not just the one this was tested against.
+    /// 3. **Bundling a file listing for `directory`-type properties** under
+    ///    `__files` (bare paths, same reasoning as above) — real usage
+    ///    (workshop item 893418273) calls
+    ///    `wallpaperRequestRandomFileForProperty(name, cb)` expecting a
+    ///    *different* random file back on each call (a slideshow). Rather
+    ///    than build genuine async native↔JS IPC (the CEF `CefProcessMessage`
+    ///    round-trip a literal port would need) for one confirmed real
+    ///    caller, the directory is listed once, here, and
+    ///    `wallpaperRequestRandomFileForProperty`'s JS-side implementation
+    ///    (`BOOTSTRAP_JS`) picks randomly from the bundled list — same
+    ///    user-visible behavior (a randomized slideshow), far less
+    ///    machinery. `__` prefix so it can't collide with any real WE
+    ///    property field.
     fn user_properties_json(dir: &Path) -> String {
         let Ok(text) = std::fs::read_to_string(dir.join("project.json")) else {
             return String::new();
         };
-        let Ok(project) = serde_json::from_str::<serde_json::Value>(&text) else {
+        let Ok(mut project) = serde_json::from_str::<serde_json::Value>(&text) else {
             return String::new();
         };
-        match project.get("general").and_then(|g| g.get("properties")) {
-            Some(props) if props.is_object() => props.to_string(),
-            _ => String::new(),
+        let Some(props) = project
+            .get_mut("general")
+            .and_then(|g| g.get_mut("properties"))
+            .and_then(|p| p.as_object_mut())
+        else {
+            return String::new();
+        };
+
+        let resolved = crate::engine::properties::SceneProperties::from_project_dir(dir);
+        for (name, decl) in props.iter_mut() {
+            if let Some(value) = resolved.get(name) {
+                decl["value"] = value.clone();
+            }
+
+            if decl.get("type").and_then(|t| t.as_str()) == Some("directory") {
+                let dir_path = decl.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                if !dir_path.is_empty() {
+                    if let Ok(entries) = std::fs::read_dir(dir_path) {
+                        let files: Vec<serde_json::Value> = entries
+                            .flatten()
+                            .filter(|e| e.path().is_file())
+                            .filter_map(|e| e.path().canonicalize().ok())
+                            .map(|p| serde_json::Value::String(p.display().to_string()))
+                            .collect();
+                        if !files.is_empty() {
+                            decl["__files"] = serde_json::Value::Array(files);
+                        }
+                    }
+                }
+            }
         }
+
+        serde_json::to_string(props).unwrap_or_default()
     }
 
     /// Does this wallpaper's bundle reference `needle` anywhere in its
@@ -770,5 +906,129 @@ mod imp {
             rx,
             input_tx,
         ))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A fresh temp directory nobody else can collide with, for a
+        /// project.json + (for the `directory` case) some real files.
+        fn tempdir(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "wp-engine-web-props-test-{name}-{}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// `file`-type property values pass through as bare filesystem
+        /// paths, unmodified — confirmed against TWO real wallpapers' full
+        /// consumption code (893418273's `backgroundimage` handler and
+        /// 1396475780's `audiOrbits.js` `setImgSrc`), both of which do
+        /// their *own* `"file:///" + value` prefixing and would break on
+        /// an already-prefixed value (a real regression an earlier version
+        /// of this had — a visual smoke test caught it rendering flat
+        /// black, the double-`file:///file:///`-prefixed URL never
+        /// loading).
+        #[test]
+        fn file_property_value_passes_through_as_a_bare_path() {
+            let dir = tempdir("file-prop");
+            std::fs::write(
+                dir.join("project.json"),
+                r#"{"general":{"properties":{
+                    "img_background": {"type":"file","text":"BG","value":"/home/user/bg.png"}
+                }}}"#,
+            )
+            .unwrap();
+
+            let json = user_properties_json(&dir);
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed["img_background"]["value"], "/home/user/bg.png");
+        }
+
+        /// `directory`-type properties get a `__files` listing bundled in
+        /// (bare paths, same reasoning as the `file`-type case above) when
+        /// the declared value resolves to a real, readable directory —
+        /// what `wallpaperRequestRandomFileForProperty` picks randomly from
+        /// (confirmed real usage, workshop item 893418273's image-slideshow
+        /// `customrandomdirectory`).
+        #[test]
+        fn directory_property_gets_a_bundled_file_listing() {
+            let dir = tempdir("directory-prop");
+            let images = dir.join("images");
+            std::fs::create_dir_all(&images).unwrap();
+            std::fs::write(images.join("a.jpg"), b"fake").unwrap();
+            std::fs::write(images.join("b.jpg"), b"fake").unwrap();
+            std::fs::create_dir_all(images.join("subdir")).unwrap(); // not a file, must be excluded
+
+            let project = serde_json::json!({"general": {"properties": {
+                "customrandomdirectory": {
+                    "type": "directory",
+                    "text": "Image Folder",
+                    "value": images.to_str().unwrap(),
+                }
+            }}});
+            std::fs::write(dir.join("project.json"), project.to_string()).unwrap();
+
+            let json = user_properties_json(&dir);
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let files = parsed["customrandomdirectory"]["__files"]
+                .as_array()
+                .expect("__files should be a bundled array");
+            assert_eq!(files.len(), 2, "should list exactly the 2 real files, not the subdirectory");
+            for f in files {
+                let s = f.as_str().unwrap();
+                assert!(s.starts_with('/'), "{s} should be a bare absolute path");
+                assert!(!s.starts_with("file://"), "{s} should not be pre-prefixed with file://");
+                assert!(s.ends_with(".jpg"));
+            }
+        }
+
+        /// An empty/unset directory value (the common case — no default
+        /// makes sense for "pick your own folder") bundles no listing
+        /// rather than erroring.
+        #[test]
+        fn directory_property_with_no_value_gets_no_file_listing() {
+            let dir = tempdir("directory-prop-empty");
+            std::fs::write(
+                dir.join("project.json"),
+                r#"{"general":{"properties":{
+                    "customrandomdirectory": {"type":"directory","text":"Image Folder","value":""}
+                }}}"#,
+            )
+            .unwrap();
+
+            let json = user_properties_json(&dir);
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert!(parsed["customrandomdirectory"].get("__files").is_none());
+        }
+
+        /// Every other declared field on a property (real content puts real
+        /// weight on `condition`/`index`/`order`) must survive untouched —
+        /// this rebuilds from the raw declaration and only overlays
+        /// `value`/`__files`, it doesn't reconstruct from a narrower typed
+        /// view that would silently drop them.
+        #[test]
+        fn unrelated_declaration_fields_pass_through_untouched() {
+            let dir = tempdir("passthrough-fields");
+            std::fs::write(
+                dir.join("project.json"),
+                r#"{"general":{"properties":{
+                    "effect": {"type":"combo","text":"Effect","value":"1","index":7,"order":107,
+                               "condition":"somecond","options":[{"label":"A","value":"0"}]}
+                }}}"#,
+            )
+            .unwrap();
+
+            let json = user_properties_json(&dir);
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed["effect"]["index"], 7);
+            assert_eq!(parsed["effect"]["order"], 107);
+            assert_eq!(parsed["effect"]["condition"], "somecond");
+            assert_eq!(parsed["effect"]["options"][0]["label"], "A");
+        }
     }
 }

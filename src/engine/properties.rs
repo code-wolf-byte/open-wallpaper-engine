@@ -13,7 +13,14 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-/// One declared property from project.json `general.properties`.
+/// One declared property from project.json `general.properties`. Real-world
+/// type distribution surveyed across 271 cached Workshop items: `slider`
+/// (640), `color` (447), `bool` (429), `combo` (111), `text` (91, a static
+/// HTML label/separator — no real value), `group` (39, a UI section
+/// header — also no real value), `textinput` (19, free text), `file` (16),
+/// `directory` (2), `scenetexture` (1). `is_settable()` distinguishes the
+/// two decorative types (plus a missing/empty `type`, which real content
+/// also uses for the same static-label purpose) from everything else.
 #[derive(Debug, Clone)]
 pub struct SceneProperty {
     pub name: String,
@@ -23,6 +30,34 @@ pub struct SceneProperty {
     pub text: String,
     /// The effective raw value (project default, then CLI override).
     pub value: Value,
+    /// `combo`'s declared choices, `(value, label)` in declared order —
+    /// `value` is stringified regardless of the declaration's own JSON type
+    /// (a *scene* combo's `options[].value` is always a JSON string, 52/52
+    /// surveyed; a *web* combo's is genuinely mixed, 43 numeric / 16 string
+    /// of 59 surveyed) since this is for display/matching, not for
+    /// reproducing the original type — see `convert_override`'s `"combo"`
+    /// arm for where the type that actually matters (what gets stored back
+    /// into `value` on an override) is handled correctly per-property.
+    /// `label` is what a picker should display.
+    pub options: Vec<(String, String)>,
+    /// `slider`'s declared range/step, for clamping a `--set-property`
+    /// override into range the way a real slider widget would (a raw CLI
+    /// float has no widget to keep it in bounds otherwise).
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub step: Option<f64>,
+}
+
+impl SceneProperty {
+    /// `false` for the decorative, no-real-value declarations real content
+    /// actually ships (`text` labels/HTML separators, `group` section
+    /// headers, and a `type`-less declaration — real content uses all
+    /// three for the same "this is UI chrome, not a setting" purpose).
+    /// `list-properties`/a settings-picker UI should filter these out
+    /// rather than present them as things a user can meaningfully set.
+    pub fn is_settable(&self) -> bool {
+        !matches!(self.kind.as_str(), "text" | "group" | "")
+    }
 }
 
 /// The resolved property set for one wallpaper project.
@@ -69,6 +104,42 @@ impl SceneProperties {
                 .unwrap_or("")
                 .to_string();
             let value = decl.get("value").cloned().unwrap_or(Value::Null);
+            let options = decl
+                .get("options")
+                .and_then(|o| o.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|opt| {
+                            // `value` is a JSON string on every real *scene*
+                            // combo but a bare number on many real *web*
+                            // ones (`backgroundsource`'s `{"value": 1}`,
+                            // workshop item 893418273) — `.as_str()` alone
+                            // silently dropped every numeric-valued option.
+                            // Stringify either shape; this list is for
+                            // display/matching (`list-properties`'
+                            // "choices:" line, and `apply_overrides`'
+                            // does-this-override-match-a-declared-choice
+                            // check), where the string form is exactly what
+                            // both need regardless of the JSON type
+                            // underneath.
+                            let value = match opt.get("value") {
+                                Some(Value::String(s)) => s.clone(),
+                                Some(v @ Value::Number(_)) => json_value_as_string(v),
+                                _ => return None,
+                            };
+                            let label = opt
+                                .get("label")
+                                .and_then(|l| l.as_str())
+                                .unwrap_or(&value)
+                                .to_string();
+                            Some((value, label))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let min = decl.get("min").and_then(|v| v.as_f64());
+            let max = decl.get("max").and_then(|v| v.as_f64());
+            let step = decl.get("step").and_then(|v| v.as_f64());
             self.properties.insert(
                 name.clone(),
                 SceneProperty {
@@ -76,6 +147,10 @@ impl SceneProperties {
                     kind,
                     text,
                     value,
+                    options,
+                    min,
+                    max,
+                    step,
                 },
             );
         }
@@ -86,7 +161,24 @@ impl SceneProperties {
     pub fn apply_overrides(&mut self, overrides: HashMap<String, String>) {
         for (name, raw) in overrides {
             match self.properties.get_mut(&name) {
-                Some(prop) => prop.value = convert_override(&prop.kind, &raw),
+                Some(prop) => {
+                    if prop.kind == "combo"
+                        && !prop.options.is_empty()
+                        && !prop.options.iter().any(|(value, _)| value == &raw)
+                    {
+                        tracing::warn!(
+                            target: "properties",
+                            "'{name}' override '{raw}' doesn't match any of this combo's declared \
+                             option values ({}); setting it anyway",
+                            prop.options
+                                .iter()
+                                .map(|(v, _)| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                    prop.value = convert_override(prop, &raw);
+                }
                 None => {
                     // Unknown property: keep it anyway so scenes that reference
                     // undeclared names (creators do this) still resolve.
@@ -97,6 +189,10 @@ impl SceneProperties {
                             kind: String::new(),
                             text: String::new(),
                             value: guess_value(&raw),
+                            options: Vec::new(),
+                            min: None,
+                            max: None,
+                            step: None,
                         },
                     );
                 }
@@ -217,18 +313,50 @@ fn json_value_as_string(v: &Value) -> String {
     }
 }
 
-fn convert_override(kind: &str, raw: &str) -> Value {
-    match kind {
+fn convert_override(prop: &SceneProperty, raw: &str) -> Value {
+    match prop.kind.as_str() {
         "bool" => Value::Bool(matches!(raw, "1" | "true" | "yes" | "on")),
-        "slider" => raw
-            .parse::<f64>()
-            .ok()
-            .and_then(|f| serde_json::Number::from_f64(f).map(Value::Number))
-            .unwrap_or_else(|| Value::String(raw.to_string())),
-        "combo" => raw
-            .parse::<i64>()
-            .map(|i| Value::Number(i.into()))
-            .unwrap_or_else(|_| Value::String(raw.to_string())),
+        "slider" => {
+            let clamped = match raw.parse::<f64>() {
+                Ok(mut f) => {
+                    // A real slider widget can't produce an out-of-range
+                    // value; a raw CLI/saved override has no such widget to
+                    // keep it honest, so clamp to the declared range here —
+                    // real content always declares both (surveyed 640
+                    // real `slider` declarations, min/max present on every
+                    // one checked).
+                    if let Some(min) = prop.min {
+                        f = f.max(min);
+                    }
+                    if let Some(max) = prop.max {
+                        f = f.min(max);
+                    }
+                    serde_json::Number::from_f64(f).map(Value::Number)
+                }
+                Err(_) => None,
+            };
+            clamped.unwrap_or_else(|| Value::String(raw.to_string()))
+        }
+        // Combo values track whatever JSON type the wallpaper's own
+        // declaration used, not a fixed one: *scene* wallpapers are 100%
+        // string (52/52 real `combo` declarations surveyed — matching
+        // `resolve_scene_json`'s stringified-equality condition mechanic),
+        // but *web* wallpapers are genuinely mixed (43 numeric / 16 string
+        // of 59 surveyed) since their own author-written JS does its own
+        // comparisons — a numeric `backgroundsource` combo (workshop item
+        // 893418273) almost certainly does a strict `===`/`switch` check
+        // that a forced-string override would silently break. An earlier
+        // version of this always produced `Value::String`, correct for
+        // scene wallpapers (where it was verified) but wrong for a web
+        // wallpaper's numeric combo — matching the *already-declared*
+        // value's own type, instead of assuming one, is correct for both.
+        "combo" => match &prop.value {
+            Value::Number(_) => raw
+                .parse::<i64>()
+                .map(|i| Value::Number(i.into()))
+                .unwrap_or_else(|_| Value::String(raw.to_string())),
+            _ => Value::String(raw.to_string()),
+        },
         // color properties are "r g b" strings in WE; keep raw text
         _ => Value::String(raw.to_string()),
     }
@@ -298,6 +426,10 @@ mod tests {
                 kind: kind.to_string(),
                 text: String::new(),
                 value,
+                options: Vec::new(),
+                min: None,
+                max: None,
+                step: None,
             },
         );
         p
@@ -335,5 +467,196 @@ mod tests {
         });
         props.resolve_scene_json(&mut node);
         assert_eq!(node["alpha"]["value"], Value::from(0.25));
+    }
+
+    /// Shaped after a real declaration (workshop item 3598808038's
+    /// `effect` property): every real `combo` declaration checked (111
+    /// across 271 cached Workshop items) stores `value` as a JSON string
+    /// matching one of `options[].value`, never a bare number — a
+    /// `--set-property`/saved override must preserve that, or any
+    /// downstream code expecting `.as_str()` on the effective value breaks.
+    #[test]
+    fn combo_override_stays_a_json_string_not_a_number() {
+        let project = serde_json::json!({
+            "general": { "properties": {
+                "effect": {
+                    "type": "combo",
+                    "value": "1",
+                    "options": [
+                        {"label": "Layers", "value": "0"},
+                        {"label": "Particles", "value": "1"}
+                    ]
+                }
+            }}
+        });
+        let mut props = SceneProperties::default();
+        props.load_from_project_json(&project);
+        assert_eq!(props.get("effect"), Some(&Value::String("1".to_string())));
+
+        let mut overrides = HashMap::new();
+        overrides.insert("effect".to_string(), "0".to_string());
+        props.apply_overrides(overrides);
+        assert_eq!(
+            props.get("effect"),
+            Some(&Value::String("0".to_string())),
+            "combo override must stay a JSON string, matching the scene's own declared type"
+        );
+    }
+
+    /// Shaped after a real *web*-wallpaper combo declaration (workshop item
+    /// 893418273's `backgroundsource`: `"value": 1`, options `1..4`, a bare
+    /// JSON number, not a string). Surveyed 59 real web-wallpaper `combo`
+    /// declarations: 43 numeric, 16 string — genuinely mixed, unlike scene
+    /// wallpapers' 52/52 string. A forced-string override here would break
+    /// a real wallpaper's own `===`/`switch` check against the number.
+    #[test]
+    fn combo_override_stays_numeric_when_the_declaration_is_numeric() {
+        let project = serde_json::json!({
+            "general": { "properties": {
+                "backgroundsource": {
+                    "type": "combo",
+                    "value": 1,
+                    "options": [
+                        {"label": "Color", "value": 1},
+                        {"label": "Image", "value": 2},
+                        {"label": "ImageSlideShow", "value": 3},
+                        {"label": "Video", "value": 4}
+                    ]
+                }
+            }}
+        });
+        let mut props = SceneProperties::default();
+        props.load_from_project_json(&project);
+        assert_eq!(props.get("backgroundsource"), Some(&Value::from(1)));
+
+        let mut overrides = HashMap::new();
+        overrides.insert("backgroundsource".to_string(), "3".to_string());
+        props.apply_overrides(overrides);
+        assert_eq!(
+            props.get("backgroundsource"),
+            Some(&Value::from(3)),
+            "combo override must stay numeric when the declaration itself is numeric"
+        );
+    }
+
+    /// The same numeric-valued declaration's `options` must still parse —
+    /// an earlier version's `.as_str()`-only extraction silently dropped
+    /// every option whose `value` was a bare number, leaving `options`
+    /// empty for exactly this real, common shape.
+    #[test]
+    fn combo_options_parse_numeric_values_too() {
+        let project = serde_json::json!({
+            "general": { "properties": {
+                "backgroundsource": {
+                    "type": "combo",
+                    "value": 1,
+                    "options": [
+                        {"label": "Color", "value": 1},
+                        {"label": "ImageSlideShow", "value": 3}
+                    ]
+                }
+            }}
+        });
+        let mut props = SceneProperties::default();
+        props.load_from_project_json(&project);
+        let prop = props.properties.get("backgroundsource").unwrap();
+        assert_eq!(
+            prop.options,
+            vec![
+                ("1".to_string(), "Color".to_string()),
+                ("3".to_string(), "ImageSlideShow".to_string()),
+            ]
+        );
+    }
+
+    /// `options` parses into `(value, label)` pairs a picker can present —
+    /// shaped after the same real `effect` declaration.
+    #[test]
+    fn combo_options_parse_with_values_and_labels() {
+        let project = serde_json::json!({
+            "general": { "properties": {
+                "effect": {
+                    "type": "combo",
+                    "value": "1",
+                    "options": [
+                        {"label": "Layers", "value": "0"},
+                        {"label": "Particles", "value": "1"}
+                    ]
+                }
+            }}
+        });
+        let mut props = SceneProperties::default();
+        props.load_from_project_json(&project);
+        let effect = props.properties.get("effect").unwrap();
+        assert_eq!(
+            effect.options,
+            vec![
+                ("0".to_string(), "Layers".to_string()),
+                ("1".to_string(), "Particles".to_string()),
+            ]
+        );
+    }
+
+    /// Shaped after a real declaration (3598808038's `dirtmouth` slider):
+    /// a raw CLI/saved override has no widget to keep it in range the way
+    /// a real slider would, so it must be clamped to the declared
+    /// `min`/`max` rather than passed through as-is.
+    #[test]
+    fn slider_override_clamps_to_declared_range() {
+        let project = serde_json::json!({
+            "general": { "properties": {
+                "dirtmouth": {"type": "slider", "value": 0.5, "min": 0, "max": 1, "step": 0.1}
+            }}
+        });
+        let mut props = SceneProperties::default();
+        props.load_from_project_json(&project);
+
+        let mut overrides = HashMap::new();
+        overrides.insert("dirtmouth".to_string(), "5.0".to_string());
+        props.apply_overrides(overrides);
+        assert_eq!(props.get("dirtmouth"), Some(&Value::from(1.0)));
+
+        let mut overrides = HashMap::new();
+        overrides.insert("dirtmouth".to_string(), "-2.0".to_string());
+        props.apply_overrides(overrides);
+        assert_eq!(props.get("dirtmouth"), Some(&Value::from(0.0)));
+
+        // In-range values pass through unclamped.
+        let mut overrides = HashMap::new();
+        overrides.insert("dirtmouth".to_string(), "0.7".to_string());
+        props.apply_overrides(overrides);
+        assert_eq!(props.get("dirtmouth"), Some(&Value::from(0.7)));
+    }
+
+    /// Real content ships decorative `text`/`group`/type-less declarations
+    /// (HTML separators, section headers) that aren't real settings —
+    /// `is_settable()` is what a `list-properties`-style UI should filter
+    /// on to avoid presenting a `<hr>` as something the user can set.
+    #[test]
+    fn is_settable_excludes_decorative_property_types() {
+        let project = serde_json::json!({
+            "general": { "properties": {
+                "speed": {"type": "slider", "value": 1.0},
+                "tint": {"type": "color", "value": "1 1 1"},
+                "enabled": {"type": "bool", "value": true},
+                "mode": {"type": "combo", "value": "0", "options": []},
+                "banner": {"type": "text", "value": "<hr>"},
+                "section": {"type": "group", "value": ""},
+                "untyped_label": {"value": "1"}
+            }}
+        });
+        let mut props = SceneProperties::default();
+        props.load_from_project_json(&project);
+
+        let settable: std::collections::BTreeSet<&str> = props
+            .properties
+            .values()
+            .filter(|p| p.is_settable())
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(
+            settable,
+            ["speed", "tint", "enabled", "mode"].into_iter().collect()
+        );
     }
 }
