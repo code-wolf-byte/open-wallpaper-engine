@@ -162,7 +162,8 @@ Or drive it from the command line:
 # List everything Wallpaper Engine has installed
 wp-engine list
 
-# Apply a wallpaper by Workshop ID (blocks until Ctrl-C)
+# Apply a wallpaper by Workshop ID — returns immediately; the wallpaper keeps
+# running in the background daemon (started automatically on first use)
 wp-engine set 1275921440
 
 # Apply any scene directory, video, image, or HTML file
@@ -170,13 +171,31 @@ wp-engine set-file ~/wallpapers/my-scene/
 
 # Override a wallpaper's user properties (repeatable)
 wp-engine set 1275921440 --set-property "schemecolor=1 0.2 0.2"
+
+# See what's showing, or remove it and stop the daemon
+wp-engine status
+wp-engine stop
 ```
+
+On Linux there is only ever one renderer: `set`, `set-file`, `run`, and the GUI
+all hand their wallpaper to a single background daemon, replacing whatever it
+was showing, so the wallpaper keeps running after the terminal or GUI window
+closes. Pass `--foreground` to `set`/`set-file`/`run` to render in the current
+process until Ctrl-C instead. To start the wallpaper with your session, run
+`wp-engine run` (it restores your saved `config` setup) from your compositor's
+autostart, or run `wp-engine daemon` as a service and `wp-engine run` after it.
+The daemon's socket and lock live in `$XDG_RUNTIME_DIR/wp-engine/`; a daemon
+started in the background logs to `$XDG_STATE_HOME/wp-engine/daemon.log`.
 
 | Command | Purpose |
 | --- | --- |
 | `list` | List installed Workshop wallpapers |
 | `set <id>` | Apply a wallpaper by Workshop ID |
 | `set-file <path>` | Apply a scene directory, video, image, or HTML file |
+| `run` | Apply the saved `config` setup (per-screen wallpapers, default) |
+| `status` | Show what the background daemon is displaying |
+| `stop` | Remove the wallpaper and stop the background daemon |
+| `daemon` | Run the daemon in the foreground (normally auto-started) |
 | `info <id>` | Show a Workshop item's metadata |
 | `list-properties <id>` | Show the properties a wallpaper exposes |
 | `probe` | List GPU adapters visible to the process |

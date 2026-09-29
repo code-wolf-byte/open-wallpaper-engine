@@ -35,7 +35,7 @@ enum Command {
         #[arg(long, help = "Filter by type: video, scene, web, application")]
         r#type: Option<String>,
     },
-    /// Apply a wallpaper by Steam Workshop ID (CLI, blocks until Ctrl-C)
+    /// Apply a wallpaper by Steam Workshop ID (via the background daemon)
     Set {
         id: String,
         /// Override a user property: NAME=VALUE (repeatable; bare NAME = true)
@@ -47,8 +47,12 @@ enum Command {
         /// Persist these --set-property/--quality overrides for next time (see `config`)
         #[arg(long)]
         save: bool,
+        /// Render in this process until Ctrl-C instead of handing the
+        /// wallpaper to the background daemon
+        #[arg(long)]
+        foreground: bool,
     },
-    /// Apply a scene directory, video, image, or HTML file (CLI, blocks until Ctrl-C)
+    /// Apply a scene directory, video, image, or HTML file (via the background daemon)
     SetFile {
         path: PathBuf,
         /// Override a user property: NAME=VALUE (repeatable; bare NAME = true)
@@ -60,6 +64,10 @@ enum Command {
         /// Persist these --set-property/--quality overrides for next time (see `config`)
         #[arg(long)]
         save: bool,
+        /// Render in this process until Ctrl-C instead of handing the
+        /// wallpaper to the background daemon
+        #[arg(long)]
+        foreground: bool,
     },
     /// List the user-configurable properties of a Workshop item
     ListProperties { id: String },
@@ -118,7 +126,20 @@ enum Command {
         action: ConfigAction,
     },
     /// Run using persisted settings — see `config` to set them up first
-    Run,
+    Run {
+        /// Render in this process until Ctrl-C instead of handing the
+        /// wallpaper to the background daemon
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Run the single-instance wallpaper daemon in the foreground (it is
+    /// started automatically in the background when needed; run it directly
+    /// for systemd/autostart or to watch its log)
+    Daemon,
+    /// Show what the background daemon is displaying
+    Status,
+    /// Remove the wallpaper and stop the background daemon
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -172,15 +193,19 @@ fn main() {
 
     let cli = Cli::parse();
     wp_engine::logging::init(cli.verbose);
+    #[cfg(target_os = "linux")]
+    wp_engine::daemon::set_spawn_verbosity(cli.verbose);
     tracing::debug!(target: "cli", verbosity = cli.verbose, "wp-engine starting");
 
     let result = match cli.command {
         // No subcommand → open GUI
         None => run_ui(),
         Some(Command::List { r#type }) => cmd_list(r#type),
-        Some(Command::Set { id, properties, quality, save }) => cmd_set(&id, properties, quality, save),
-        Some(Command::SetFile { path, properties, quality, save }) => {
-            cmd_set_file(&path, properties, quality, save)
+        Some(Command::Set { id, properties, quality, save, foreground }) => {
+            cmd_set(&id, properties, quality, save, foreground)
+        }
+        Some(Command::SetFile { path, properties, quality, save, foreground }) => {
+            cmd_set_file(&path, properties, quality, save, foreground)
         }
         Some(Command::ListProperties { id }) => cmd_list_properties(&id),
         Some(Command::Info { id }) => cmd_info(&id),
@@ -199,7 +224,10 @@ fn main() {
         }) => cmd_preview_scene(&id_or_path, width, height),
         Some(Command::TestScene { id_or_path, frames }) => cmd_test_scene(&id_or_path, frames),
         Some(Command::Config { action }) => cmd_config(action),
-        Some(Command::Run) => cmd_run(),
+        Some(Command::Run { foreground }) => cmd_run(foreground),
+        Some(Command::Daemon) => cmd_daemon(),
+        Some(Command::Status) => cmd_status(),
+        Some(Command::Stop) => cmd_stop(),
     };
 
     if let Err(e) = result {
@@ -298,7 +326,13 @@ fn cmd_info(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_set(id: &str, properties: Vec<String>, quality: Option<String>, save: bool) -> Result<()> {
+fn cmd_set(
+    id: &str,
+    properties: Vec<String>,
+    quality: Option<String>,
+    save: bool,
+    foreground: bool,
+) -> Result<()> {
     let w = workshop::find_by_id(id).ok_or_else(|| anyhow!("workshop item '{id}' not found"))?;
 
     println!("Loading: {}", w.path.display());
@@ -306,10 +340,7 @@ fn cmd_set(id: &str, properties: Vec<String>, quality: Option<String>, save: boo
 
     let mut context = ApplicationContext::new(w.path.clone());
     apply_saved_settings(&mut context, id, &properties, quality.as_deref(), save)?;
-    let mut app = WallpaperApplication::new(context);
-    app.setup()?;
-    println!("Wallpaper active. Press Ctrl-C to exit.");
-    app.show()
+    launch(context, Some(w.title().to_string()), foreground)
 }
 
 /// Installs property overrides and a quality level on `context` in priority
@@ -551,7 +582,7 @@ fn resolve_id_or_path(id_or_path: &str) -> Result<PathBuf> {
 /// happen to declare a property with the same name. Playlists are still
 /// data-only (no rotation timer exists) — only each playlist's first item
 /// is ever actually reachable through `run` today.
-fn cmd_run() -> Result<()> {
+fn cmd_run(foreground: bool) -> Result<()> {
     let settings = wp_engine::settings::WpSettings::load();
 
     let default_id_or_path = settings
@@ -603,10 +634,92 @@ fn cmd_run() -> Result<()> {
     }
 
     apply_saved_settings(&mut context, &default_id_or_path, &[], None, false)?;
+    launch(context, Some(default_id_or_path), foreground)
+}
+
+/// Show `context`'s wallpaper: by default hand it to the single background
+/// daemon (starting it if needed) and return, replacing whatever it was
+/// showing; with `foreground`, render in this process until Ctrl-C.
+///
+/// macOS always renders in the foreground — its backend needs the process
+/// main thread, and its GUI launches wallpapers as `set-file` children.
+fn launch(context: ApplicationContext, title: Option<String>, foreground: bool) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use wp_engine::daemon::{self, ApplySpec, Request};
+        if !foreground {
+            daemon::request_or_spawn(&Request::Apply(ApplySpec::from_context(&context, title)))?;
+            println!("Wallpaper active (background daemon). `wp-engine stop` removes it.");
+            return Ok(());
+        }
+        if daemon::is_running() {
+            eprintln!(
+                "warning: a wp-engine daemon is also running — both will draw the wallpaper \
+                 (`wp-engine stop` stops it)"
+            );
+        }
+    }
+    let _ = (&title, foreground);
     let mut app = WallpaperApplication::new(context);
     app.setup()?;
     println!("Wallpaper active. Press Ctrl-C to exit.");
     app.show()
+}
+
+#[cfg(target_os = "linux")]
+fn cmd_daemon() -> Result<()> {
+    wp_engine::daemon::run_daemon()
+}
+
+#[cfg(target_os = "linux")]
+fn cmd_status() -> Result<()> {
+    use wp_engine::daemon::{self, Request, Response};
+    if !daemon::is_running() {
+        println!("Daemon: not running");
+        return Ok(());
+    }
+    let Response::Status(status) = daemon::request(&Request::Status)? else {
+        return Err(anyhow!("unexpected daemon reply to status"));
+    };
+    println!("Daemon: running (pid {})", status.pid);
+    match status.active {
+        Some(active) => {
+            if let Some(title) = &active.title {
+                println!("Wallpaper: {title}");
+            }
+            println!("Path: {}", active.background.display());
+            println!("Quality: {}", active.quality);
+        }
+        None => println!("Wallpaper: none"),
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cmd_stop() -> Result<()> {
+    use wp_engine::daemon::{self, Request};
+    if !daemon::is_running() {
+        println!("Daemon: not running");
+        return Ok(());
+    }
+    daemon::request(&Request::Shutdown)?;
+    println!("Daemon stopped.");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cmd_daemon() -> Result<()> {
+    Err(anyhow!("the background daemon is Linux-only"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cmd_status() -> Result<()> {
+    cmd_daemon()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cmd_stop() -> Result<()> {
+    cmd_daemon()
 }
 
 fn cmd_probe() -> Result<()> {
@@ -642,7 +755,13 @@ fn cmd_probe() -> Result<()> {
     Ok(())
 }
 
-fn cmd_set_file(path: &PathBuf, properties: Vec<String>, quality: Option<String>, save: bool) -> Result<()> {
+fn cmd_set_file(
+    path: &PathBuf,
+    properties: Vec<String>,
+    quality: Option<String>,
+    save: bool,
+    foreground: bool,
+) -> Result<()> {
     if !path.exists() {
         return Err(anyhow!("file not found: {}", path.display()));
     }
@@ -652,10 +771,8 @@ fn cmd_set_file(path: &PathBuf, properties: Vec<String>, quality: Option<String>
     let mut context = ApplicationContext::new(path.clone());
     let key = path.display().to_string();
     apply_saved_settings(&mut context, &key, &properties, quality.as_deref(), save)?;
-    let mut app = WallpaperApplication::new(context);
-    app.setup()?;
-    println!("Wallpaper active. Press Ctrl-C to exit.");
-    app.show()
+    let title = path.file_name().map(|n| n.to_string_lossy().into_owned());
+    launch(context, title, foreground)
 }
 
 fn cmd_pkg_info(path: &std::path::Path, dump: Option<&std::path::Path>) -> Result<()> {

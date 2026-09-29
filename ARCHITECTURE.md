@@ -198,6 +198,16 @@ frame sources.
 renderer, and block until SIGINT/SIGTERM. `main.rs` `set`/`set-file`
 delegate to it.
 
+On Linux `src/daemon` makes that lifecycle a per-session singleton: `wp-engine
+daemon` takes an exclusive `flock` on `$XDG_RUNTIME_DIR/wp-engine/daemon.lock`,
+listens on `daemon.sock`, and owns the one `WallpaperApplication`. `set`,
+`set-file`, `run`, and the GUI are clients — they serialize their
+`ApplicationContext` into an `ApplySpec` (one JSON line per connection),
+spawning the daemon detached (`setsid`) if it isn't running, and the daemon
+drops the old application before building the new one, so applies replace
+rather than stack. The GUI forwards live quality/volume changes the same way.
+`--foreground` keeps the in-process path; macOS always uses it.
+
 ### 12. User Properties
 
 `src/engine/properties.rs` loads `project.json` `general.properties`,

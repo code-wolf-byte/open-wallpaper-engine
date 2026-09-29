@@ -1,6 +1,8 @@
 use crate::platform::RenderQuality;
-use crate::platform::{display::detect_platform, WallpaperHandle};
-use crate::render::{RenderSettings, WallpaperContent};
+use crate::platform::WallpaperHandle;
+use crate::render::RenderSettings;
+#[cfg(not(target_os = "linux"))]
+use crate::{platform::display::detect_platform, render::WallpaperContent};
 use crate::workshop::{self, Wallpaper, WallpaperType};
 use egui::{pos2, vec2, Align, Color32, CornerRadius, FontId, Layout, Rect, Sense};
 use std::collections::HashMap;
@@ -41,8 +43,15 @@ pub struct WpApp {
     thumbnails: HashMap<String, egui::TextureHandle>,
     thumb_queue: Vec<usize>,
 
+    /// In-process renderer — macOS only; on Linux the daemon owns it.
     renderer: Option<WallpaperHandle>,
     active_title: Option<String>,
+    /// Live quality/volume changes forwarded to the daemon.
+    #[cfg(target_os = "linux")]
+    daemon: DaemonLink,
+    /// What the daemon was already showing when the GUI opened.
+    #[cfg(target_os = "linux")]
+    initial_status: Option<mpsc::Receiver<crate::daemon::DaemonStatus>>,
     status: StatusMsg,
 
     file_input: String,
@@ -55,7 +64,50 @@ pub struct WpApp {
     audio_choice: usize,
 }
 
-type ApplyResult = Result<(WallpaperHandle, String), String>;
+/// `None` handle when the daemon owns the renderer.
+type ApplyResult = Result<(Option<WallpaperHandle>, String), String>;
+
+/// A worker thread that forwards live setting changes to the daemon, so a
+/// dragged slider never blocks the UI on the socket (or on an apply the
+/// daemon is still busy with). Changes are dropped when no daemon runs:
+/// the next apply carries the current values anyway.
+#[cfg(target_os = "linux")]
+struct DaemonLink {
+    tx: mpsc::Sender<crate::daemon::Request>,
+}
+
+#[cfg(target_os = "linux")]
+impl DaemonLink {
+    fn new() -> Self {
+        use crate::daemon::{self, Request};
+        let (tx, rx) = mpsc::channel::<Request>();
+        std::thread::spawn(move || {
+            while let Ok(first) = rx.recv() {
+                // Coalesce a burst (slider drag) down to the latest of each.
+                let (mut quality, mut volume) = (None, None);
+                for req in std::iter::once(first).chain(rx.try_iter()) {
+                    match req {
+                        Request::SetVolume { .. } => volume = Some(req),
+                        other => quality = Some(other),
+                    }
+                }
+                if !daemon::is_running() {
+                    continue;
+                }
+                for req in [quality, volume].into_iter().flatten() {
+                    if let Err(e) = daemon::request(&req) {
+                        tracing::warn!(target: "app", "daemon update failed: {e:#}");
+                    }
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    fn send(&self, req: crate::daemon::Request) {
+        let _ = self.tx.send(req);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TypeFilter {
@@ -132,6 +184,19 @@ impl WpApp {
             StatusMsg::ok(format!("{count} wallpaper(s) found"))
         };
 
+        #[cfg(target_os = "linux")]
+        let initial_status = crate::daemon::is_running().then(|| {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                if let Ok(crate::daemon::Response::Status(status)) =
+                    crate::daemon::request(&crate::daemon::Request::Status)
+                {
+                    let _ = tx.send(status);
+                }
+            });
+            rx
+        });
+
         Self {
             wallpapers,
             filtered,
@@ -142,6 +207,10 @@ impl WpApp {
             thumb_queue: Vec::new(),
             renderer: None,
             active_title: None,
+            #[cfg(target_os = "linux")]
+            daemon: DaemonLink::new(),
+            #[cfg(target_os = "linux")]
+            initial_status,
             status,
             file_input: String::new(),
             settings: Arc::new(Mutex::new(RenderSettings::default())),
@@ -217,6 +286,9 @@ impl WpApp {
     // ── Wallpaper application ─────────────────────────────────────────────────
 
     fn apply_path(&mut self, path: PathBuf, display_title: String) {
+        #[cfg(target_os = "linux")]
+        self.apply_via_daemon(path, display_title);
+        #[cfg(not(target_os = "linux"))]
         match WallpaperContent::from_path(&path) {
             Err(e) => self.status = StatusMsg::err(format!("Load failed: {e}")),
             Ok(content) => self.apply_content(content, display_title),
@@ -227,16 +299,22 @@ impl WpApp {
         let Some(idx) = self.selected else { return };
 
         let title = self.wallpapers[idx].title().to_string();
-        // `from_wallpaper` borrows wallpapers[idx] and returns an owned Result —
-        // the borrow ends here, so self is free to mutate below.
-        let content = WallpaperContent::from_wallpaper(&self.wallpapers[idx]);
+        #[cfg(target_os = "linux")]
+        self.apply_via_daemon(self.wallpapers[idx].path.clone(), title);
+        #[cfg(not(target_os = "linux"))]
+        {
+            // `from_wallpaper` borrows wallpapers[idx] and returns an owned Result —
+            // the borrow ends here, so self is free to mutate below.
+            let content = WallpaperContent::from_wallpaper(&self.wallpapers[idx]);
 
-        match content {
-            Err(e) => self.status = StatusMsg::err(e.to_string()),
-            Ok(content) => self.apply_content(content, title),
+            match content {
+                Err(e) => self.status = StatusMsg::err(e.to_string()),
+                Ok(content) => self.apply_content(content, title),
+            }
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn apply_content(&mut self, content: WallpaperContent, display_title: String) {
         let old_renderer = self.renderer.take();
         let settings = Arc::clone(&self.settings);
@@ -251,7 +329,7 @@ impl WpApp {
                     crate::render::ScreenContent::single(content),
                     crate::render::ScreenSettings::single(settings),
                 )
-                .map(|handle| (handle, display_title.clone()))
+                .map(|handle| (Some(handle), display_title.clone()))
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
@@ -260,13 +338,81 @@ impl WpApp {
         self.status = StatusMsg::ok("Applying...");
     }
 
+    /// Hand the wallpaper to the background daemon (starting it if needed),
+    /// so it keeps running after this window closes.
+    #[cfg(target_os = "linux")]
+    fn apply_via_daemon(&mut self, path: PathBuf, display_title: String) {
+        use crate::daemon::{self, ApplySpec, Request};
+        let spec = {
+            let s = self.settings.lock().unwrap();
+            ApplySpec {
+                background: path,
+                quality: Some(s.quality.label().to_string()),
+                volume: Some(s.volume),
+                title: Some(display_title.clone()),
+                ..Default::default()
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let device = crate::platform::audio::preferred_device();
+            let result = daemon::request_or_spawn(&Request::SetAudioDevice { device })
+                .and_then(|_| daemon::request(&Request::Apply(spec)))
+                .map(|_| (None, display_title))
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+
+        self.pending_apply = Some(rx);
+        self.status = StatusMsg::ok("Applying...");
+    }
+
+    /// Remove the wallpaper the daemon is showing (the daemon stays up).
+    #[cfg(target_os = "linux")]
+    fn clear_wallpaper(&mut self) {
+        std::thread::spawn(|| {
+            if let Err(e) = crate::daemon::request(&crate::daemon::Request::Clear) {
+                tracing::warn!(target: "app", "clearing wallpaper failed: {e:#}");
+            }
+        });
+        self.active_title = None;
+        self.status = StatusMsg::ok("Wallpaper removed");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn poll_initial_status(&mut self) {
+        let Some(rx) = &self.initial_status else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(status) => {
+                if let Some(active) = status.active {
+                    self.active_title = Some(
+                        active
+                            .title
+                            .unwrap_or_else(|| active.background.display().to_string()),
+                    );
+                    if let Some(q) = RenderQuality::parse(&active.quality) {
+                        self.settings.lock().unwrap().quality = q;
+                    }
+                }
+                self.initial_status = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.initial_status = None,
+        }
+    }
+
     fn poll_pending_apply(&mut self) {
         let Some(rx) = &self.pending_apply else {
             return;
         };
         match rx.try_recv() {
             Ok(Ok((handle, title))) => {
-                self.renderer = Some(handle);
+                if let Some(handle) = handle {
+                    self.renderer = Some(handle);
+                }
                 self.active_title = Some(title.clone());
                 self.status = StatusMsg::ok(format!("Applied \"{title}\""));
                 self.pending_apply = None;
@@ -289,7 +435,13 @@ impl WpApp {
 impl eframe::App for WpApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_pending_apply();
-        if self.pending_apply.is_some() {
+        #[cfg(target_os = "linux")]
+        self.poll_initial_status();
+        #[cfg(target_os = "linux")]
+        let waiting = self.pending_apply.is_some() || self.initial_status.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let waiting = self.pending_apply.is_some();
+        if waiting {
             ctx.request_repaint();
         }
         self.flush_thumb_queue(ctx);
@@ -357,7 +509,7 @@ impl WpApp {
             });
     }
 
-    fn render_status_bar(&self, ctx: &egui::Context) {
+    fn render_status_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("status_bar")
             .frame(
                 egui::Frame::default()
@@ -372,6 +524,10 @@ impl WpApp {
                                 .color(ACCENT_GREEN)
                                 .size(12.0),
                         );
+                        #[cfg(target_os = "linux")]
+                        if ui.small_button("■ Stop").clicked() {
+                            self.clear_wallpaper();
+                        }
                         ui.separator();
                     }
                     let color = if self.status.error {
@@ -620,18 +776,35 @@ impl WpApp {
             );
             {
                 let mut s = self.settings.lock().unwrap();
-                ui.add(
-                    egui::Slider::new(&mut s.volume, 0.0..=1.0)
-                        .text("Volume")
-                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                );
+                let volume_changed = ui
+                    .add(
+                        egui::Slider::new(&mut s.volume, 0.0..=1.0)
+                            .text("Volume")
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                    )
+                    .changed();
+                let mut quality_changed = false;
                 egui::ComboBox::from_label("Quality")
                     .selected_text(s.quality.label())
                     .show_ui(ui, |ui| {
                         for q in RenderQuality::ALL {
-                            ui.selectable_value(&mut s.quality, q, q.label());
+                            quality_changed |=
+                                ui.selectable_value(&mut s.quality, q, q.label()).changed();
                         }
                     });
+                #[cfg(target_os = "linux")]
+                {
+                    use crate::daemon::Request;
+                    if volume_changed {
+                        self.daemon.send(Request::SetVolume { volume: s.volume });
+                    }
+                    if quality_changed {
+                        self.daemon.send(Request::SetQuality {
+                            quality: s.quality.label().to_string(),
+                        });
+                    }
+                }
+                let _ = (volume_changed, quality_changed);
             }
             ui.label(
                 egui::RichText::new("Render Settings")
