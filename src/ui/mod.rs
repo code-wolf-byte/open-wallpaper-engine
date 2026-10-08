@@ -582,10 +582,13 @@ impl WpApp {
             .unwrap_or_default();
         let can_apply = (matches!(
             wtype,
-            WallpaperType::Video | WallpaperType::Scene | WallpaperType::Unknown
+            WallpaperType::Video
+                | WallpaperType::Scene
+                | WallpaperType::Preset
+                | WallpaperType::Unknown
         ) || (matches!(wtype, WallpaperType::Web)
             && crate::render::web::is_supported()))
-            && (file_exists || matches!(wtype, WallpaperType::Scene));
+            && (file_exists || matches!(wtype, WallpaperType::Scene | WallpaperType::Preset));
         let thumb = self.thumbnails.get(&workshop_id).cloned();
 
         // ── Render ────────────────────────────────────────────────────────────
@@ -773,11 +776,6 @@ impl WpApp {
 
             // ── Render Settings ───────────────────────────────────────────────
             ui.separator();
-            ui.label(
-                egui::RichText::new("Audio playback coming soon")
-                    .color(TEXT_MUTED)
-                    .small(),
-            );
             {
                 let mut s = self.settings.lock().unwrap();
                 let volume_changed = ui
