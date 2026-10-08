@@ -38,12 +38,19 @@ function Vec2(x, y) {
 }
 function Vec3(x, y, z) {
     if (typeof x === 'string') { var p = __wp_parse(x); x = p[0]; y = p[1]; z = p[2]; }
-    else if (x !== null && typeof x === 'object') { z = x.z; y = x.y; x = x.x; }
+    // new Vec3(vec2, z) extends a Vec2.
+    else if (x !== null && typeof x === 'object') { z = (x.z === undefined) ? y : x.z; y = x.y; x = x.x; }
     this.x = __wp_num(x, 0); this.y = __wp_num(y, 0); this.z = __wp_num(z, 0);
 }
 function Vec4(x, y, z, w) {
     if (typeof x === 'string') { var p = __wp_parse(x); x = p[0]; y = p[1]; z = p[2]; w = p[3]; }
-    else if (x !== null && typeof x === 'object') { w = x.w; z = x.z; y = x.y; x = x.x; }
+    // new Vec4(vec3, w) / new Vec4(vec2, z, w) extend a smaller vector.
+    else if (x !== null && typeof x === 'object') {
+        var o = x;
+        if (o.z === undefined) { w = z; z = y; } else if (o.w === undefined) { w = y; } else { w = o.w; }
+        if (o.z !== undefined) { z = o.z; }
+        y = o.y; x = o.x;
+    }
     this.x = __wp_num(x, 0); this.y = __wp_num(y, 0); this.z = __wp_num(z, 0); this.w = __wp_num(w, 0);
 }
 
@@ -81,6 +88,19 @@ function Vec4(x, y, z, w) {
     };
     Vec2.prototype.perpendicular = function () { return new Vec2(-this.y, this.x); };
 })();
+
+// A 4x4 column-major matrix, as `getTransformMatrix()` returns.
+function Mat4(m) { this.m = Array.isArray(m) ? m.slice() : [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]; }
+Mat4.prototype.copy = function () { return new Mat4(this.m); };
+Mat4.prototype.translation = function (v) {
+    if (v) { this.m[12] = v.x; this.m[13] = v.y; this.m[14] = v.z; return this; }
+    return new Vec3(this.m[12], this.m[13], this.m[14]);
+};
+Mat4.prototype.right = function () { return new Vec3(this.m[0], this.m[1], this.m[2]); };
+Mat4.prototype.up = function () { return new Vec3(this.m[4], this.m[5], this.m[6]); };
+Mat4.prototype.forward = function () { return new Vec3(this.m[8], this.m[9], this.m[10]); };
+
+var MediaPlaybackEvent = { PLAYBACK_STOPPED: 0, PLAYBACK_PLAYING: 1, PLAYBACK_PAUSED: 2 };
 
 // ── Math helpers ───────────────────────────────────────────────────────────
 
@@ -351,6 +371,10 @@ WPLayer.prototype.getAnimation = function (name) {
     };
 };
 
+WPLayer.prototype.getChildren = function () {
+    var me = this.__index;
+    return __wp.objects.filter(function (o) { return o && o.__init.parentIndex === me; });
+};
 WPLayer.prototype.getParent = function () {
     var p = this.__init.parentIndex;
     return (typeof p === 'number' && p >= 0) ? (__wp.objects[p] || null) : null;
@@ -449,12 +473,12 @@ WPLayer.prototype.getTransformMatrix = function () {
     var sx = Math.sin(a.x * r), cx = Math.cos(a.x * r);
     var sy = Math.sin(a.y * r), cy = Math.cos(a.y * r);
     var sz = Math.sin(a.z * r), cz = Math.cos(a.z * r);
-    return [
+    return new Mat4([
         cz * cy * s.x, sz * cy * s.x, -sy * s.x, 0,
         (cz * sy * sx - sz * cx) * s.y, (sz * sy * sx + cz * cx) * s.y, cy * sx * s.y, 0,
         (cz * sy * cx + sz * sx) * s.z, (sz * sy * cx - cz * sx) * s.z, cy * cx * s.z, 0,
         o.x, o.y, o.z, 1
-    ];
+    ]);
 };
 WPLayer.prototype.lookAt = function (target) {
     var d = new Vec3(target).subtract(this.__s.origin), len = d.length(), a = this.angles;
@@ -514,6 +538,7 @@ var thisScene = {
         if (layer) { __wp.commands.push(['sort', layer.__index, Number(index) || 0]); }
     },
     getInitialLayerConfig: function (layer) {
+        if (typeof layer === 'string' || typeof layer === 'number') { layer = thisScene.getLayer(layer); }
         return layer ? JSON.parse(JSON.stringify(layer.__init.raw || {})) : null;
     },
     createLayer: function (config) {

@@ -1740,9 +1740,44 @@ struct ParticleGpuAssets {
 /// A scene `sound` object's playback stream, kept with its owner's identity
 /// so SceneScript can find it by layer name or id.
 pub(crate) struct SceneSound {
-    pub name: Option<String>,
-    pub id: Option<i64>,
+    /// Index of the owning object in `scene.objects` (or a script-created one).
+    pub object: usize,
     pub playback: crate::engine::audio::SoundPlayback,
+}
+
+/// Start a `sound` object's first decodable file, held silent when
+/// `startsilent` is set.
+fn start_scene_sound(
+    dir: &Path,
+    obj: &crate::engine::scene::SceneObject,
+) -> Option<crate::engine::audio::SoundPlayback> {
+    let sound = obj.sound.as_ref()?;
+    let start_silent = obj
+        .startsilent
+        .as_ref()
+        .and_then(|v| {
+            v.as_bool()
+                .or_else(|| v.get("value").and_then(|i| i.as_bool()))
+        })
+        .unwrap_or(false);
+    let volume = obj
+        .volume
+        .as_ref()
+        .and_then(crate::engine::scene::parse_value_f32)
+        .unwrap_or(1.0);
+    let mode = obj.playbackmode.as_ref().and_then(|v| v.as_str());
+    let looping = mode != Some("nointerrupt") && mode != Some("once");
+    let files: Vec<String> = match sound {
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        serde_json::Value::String(s) => vec![s.clone()],
+        _ => Vec::new(),
+    };
+    files.into_iter().find_map(|f| {
+        crate::engine::audio::SoundPlayback::start(&dir.join(&f), volume, looping, !start_silent)
+    })
 }
 
 pub struct GpuSceneInstance {
@@ -2420,51 +2455,15 @@ impl GpuSceneInstance {
 
         // Sound objects: decode each file and play it looped; `startsilent`
         // ones are held ready but silent so a script can `play()` them.
-        let mut sounds = Vec::new();
-        for obj in &resolved.scene.objects {
-            let Some(sound) = obj.sound.as_ref() else {
-                continue;
-            };
-            let start_silent = obj
-                .startsilent
-                .as_ref()
-                .and_then(|v| {
-                    v.as_bool()
-                        .or_else(|| v.get("value").and_then(|i| i.as_bool()))
-                })
-                .unwrap_or(false);
-            let volume = obj
-                .volume
-                .as_ref()
-                .and_then(crate::engine::scene::parse_value_f32)
-                .unwrap_or(1.0);
-            let mode = obj.playbackmode.as_ref().and_then(|v| v.as_str());
-            let looping = mode != Some("nointerrupt") && mode != Some("once");
-            // `sound` is an array of file paths; play the first that decodes.
-            let files: Vec<String> = match sound {
-                serde_json::Value::Array(a) => a
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect(),
-                serde_json::Value::String(s) => vec![s.clone()],
-                _ => Vec::new(),
-            };
-            for f in files {
-                if let Some(p) = crate::engine::audio::SoundPlayback::start(
-                    &dir.join(&f),
-                    volume,
-                    looping,
-                    !start_silent,
-                ) {
-                    sounds.push(SceneSound {
-                        name: obj.name.clone(),
-                        id: obj.id,
-                        playback: p,
-                    });
-                    break;
-                }
-            }
-        }
+        let sounds: Vec<SceneSound> = resolved
+            .scene
+            .objects
+            .iter()
+            .enumerate()
+            .filter_map(|(object, obj)| {
+                start_scene_sound(dir, obj).map(|playback| SceneSound { object, playback })
+            })
+            .collect();
 
         // Computed early (not just before `build_shadow_atlas` needs it, its
         // original spot) so the FBO-pool setup below can also gate
@@ -3699,6 +3698,15 @@ impl GpuSceneInstance {
                 return;
             }
         };
+        if obj.sound.is_some() {
+            if let Some(playback) = start_scene_sound(&self.scene_dir, &obj) {
+                self.sounds.push(SceneSound {
+                    object: index,
+                    playback,
+                });
+            }
+            return;
+        }
         if self.scene_pkg.is_none() {
             self.scene_pkg =
                 crate::engine::pkg::Package::from_file(&self.scene_dir.join("scene.pkg")).ok();
@@ -3736,13 +3744,9 @@ impl GpuSceneInstance {
 
     /// Sound controls belonging to scene object `index`.
     fn sounds_of(&self, index: usize) -> Vec<std::sync::Arc<crate::engine::audio::SoundControl>> {
-        let name = self.transform_graph.name.get(index).cloned().flatten();
-        let id = self.transform_graph.id.get(index).copied().flatten();
         self.sounds
             .iter()
-            .filter(|s| {
-                (id.is_some() && s.id == id) || (id.is_none() && name.is_some() && s.name == name)
-            })
+            .filter(|s| s.object == index)
             .map(|s| s.playback.control())
             .collect()
     }
@@ -6283,6 +6287,36 @@ mod hit_tests {
         assert!(point_in_convex_quad([100.0, 140.0], &q));
         assert!(!point_in_convex_quad([190.0, 50.0], &q));
     }
+    /// Debug aid: run a scene's scripts headlessly (no GPU) for a few
+    /// frames and print every script log line. `WP_SCRIPT_SCENE=<id|dir>`.
+    #[test]
+    #[ignore]
+    fn run_scene_scripts() {
+        let Ok(target) = std::env::var("WP_SCRIPT_SCENE") else {
+            return;
+        };
+        let dir = crate::workshop::find_item_dir(&target, None)
+            .unwrap_or_else(|| std::path::PathBuf::from(&target));
+        let resolved = crate::engine::render::ResolvedScene::from_directory(&dir).unwrap();
+        let mut host = build_script_host(
+            &dir,
+            &resolved.scene,
+            &resolved.transform_graph,
+            [resolved.width, resolved.height],
+        );
+        for f in 0..30 {
+            host.frame(f as f32 * 0.5, 0.5, 0.5);
+            let c = host.collect();
+            if f == 0 {
+                eprintln!(
+                    "frame 0: {} objects changed, {} commands",
+                    c.objects.len(),
+                    c.commands.len()
+                );
+            }
+        }
+    }
+
     /// End to end against a real Workshop scene with clickable layers
     /// (2348914357: clicking the radio/music buttons toggles them). Needs
     /// the item installed and a GPU, hence ignored by default.

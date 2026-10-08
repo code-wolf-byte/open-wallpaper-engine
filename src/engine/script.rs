@@ -585,6 +585,9 @@ impl ScriptHost {
         };
         for line in v["logs"].as_array().into_iter().flatten() {
             if let Some(line) = line.as_str() {
+                if cfg!(test) && std::env::var_os("WP_SCRIPT_SCENE").is_some() {
+                    eprintln!("{line}");
+                }
                 if line.starts_with("error") {
                     tracing::warn!(target: "script", "{line}");
                 } else {
