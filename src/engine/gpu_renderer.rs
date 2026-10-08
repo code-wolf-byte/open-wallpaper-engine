@@ -1858,6 +1858,8 @@ pub struct GpuSceneInstance {
     hovered: Option<usize>,
     pressed: Option<usize>,
     last_cursor_scene: [f32; 2],
+    /// Keyframed property animations (`"animation"` timelines).
+    timelines: Vec<TimelineEntry>,
     /// Parallel to `scene_effects`: false once a script hides the effect.
     effect_enabled: Vec<bool>,
     /// Per-object draw position; starts as the object index, and
@@ -2323,6 +2325,13 @@ impl GpuSceneInstance {
 
     fn build(mut renderer: GpuSceneRenderer, dir: &Path) -> Result<Self> {
         let resolved = super::render::ResolvedScene::from_directory(dir)?;
+        // The unparsed scene.json: scripts and timelines read fields the
+        // typed model drops.
+        let raw_scene: serde_json::Value = crate::engine::assets::AssetStore::from_directory(dir)
+            .ok()
+            .and_then(|a| a.scene_json().ok())
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
         let w = resolved.width;
         let h = resolved.height;
 
@@ -2847,7 +2856,14 @@ impl GpuSceneInstance {
             start: Instant::now(),
             last_time: 0.0,
             mouse_norm: [0.5, 0.5],
-            scripts: build_script_host(dir, &resolved.scene, &resolved.transform_graph, [w, h]),
+            scripts: build_script_host(
+                dir,
+                &resolved.scene,
+                &resolved.transform_graph,
+                [w, h],
+                &raw_scene,
+            ),
+            timelines: build_timelines(&raw_scene, &resolved.transform_graph),
             object_visible: resolved
                 .scene
                 .objects
@@ -3354,6 +3370,100 @@ impl GpuSceneInstance {
         }
     }
 
+    /// Advance keyframe animations and apply the properties they move.
+    fn tick_timelines(&mut self, delta: f32) {
+        use crate::engine::script::{ObjectChange, ScriptChanges};
+        if self.timelines.is_empty() {
+            return;
+        }
+        let mut changes: Vec<(usize, ObjectChange)> = Vec::new();
+        let mut events: Vec<(usize, String)> = Vec::new();
+        let mut synced: Vec<(usize, String, serde_json::Value)> = Vec::new();
+        for t in &mut self.timelines {
+            for name in t.anim.advance(delta) {
+                events.push((t.object, name));
+            }
+            let mut v = t.anim.sample();
+            if t.anim.relative {
+                for (k, x) in v.iter_mut().enumerate() {
+                    *x += t.base.get(k).copied().unwrap_or(0.0);
+                }
+            }
+            if t.last.as_ref() == Some(&v) {
+                continue;
+            }
+            t.last = Some(v.clone());
+            let idx = match changes.iter().position(|(o, _)| *o == t.object) {
+                Some(i) => i,
+                None => {
+                    changes.push((t.object, ObjectChange::default()));
+                    changes.len() - 1
+                }
+            };
+            let c = &mut changes[idx].1;
+            let v3 = |fill: f32| -> [f32; 3] {
+                std::array::from_fn(|k| {
+                    v.get(k).copied().or(t.base.get(k).copied()).unwrap_or(fill)
+                })
+            };
+            let json = if v.len() == 1 {
+                serde_json::json!(v[0])
+            } else {
+                serde_json::json!(v)
+            };
+            match t.key.as_str() {
+                "origin" => c.origin = Some(v3(0.0)),
+                "scale" => c.scale = Some(v3(1.0)),
+                "angles" => c.angles = Some(v3(0.0)),
+                "color" => c.color = Some(v3(1.0)),
+                "alpha" => c.alpha = v.first().copied(),
+                "brightness" => c.brightness = v.first().copied(),
+                key => {
+                    c.extra.insert(key.to_string(), json.clone());
+                }
+            }
+            synced.push((t.object, t.key.clone(), json));
+        }
+        if self.scripts.has_scripts() {
+            for (object, key, value) in &synced {
+                self.scripts.sync_property(*object, key, value);
+            }
+            for (object, name) in &events {
+                self.scripts.dispatch_event(
+                    *object,
+                    "animationEvent",
+                    &serde_json::json!({ "name": name }),
+                );
+            }
+        }
+        if !changes.is_empty() {
+            self.apply_script_changes(ScriptChanges {
+                objects: changes,
+                commands: Vec::new(),
+            });
+        }
+    }
+
+    /// `thisLayer.getAnimation(name).play()` & co: control the animations on
+    /// object `index` named `property` (by animation name or property key),
+    /// along with the animations grouped with them.
+    fn control_timeline(&mut self, index: usize, property: &str, op: &str, frame: Option<f32>) {
+        let matched: Vec<String> = self
+            .timelines
+            .iter()
+            .filter(|t| t.object == index)
+            .filter(|t| t.key == property || t.anim.name.as_deref() == Some(property))
+            .flat_map(|t| std::iter::once(t.key.clone()).chain(t.anim.children.iter().cloned()))
+            .collect();
+        for t in self.timelines.iter_mut().filter(|t| t.object == index) {
+            let grouped = matched.contains(&t.key)
+                || t.anim.parent.as_ref().is_some_and(|p| matched.contains(p));
+            if grouped {
+                t.anim.control(op, frame);
+            }
+        }
+    }
+
     /// Run this frame's SceneScripts and apply what they changed.
     fn tick_scripts(&mut self, time: f32, delta: f32) {
         if !self.scripts.has_scripts() {
@@ -3577,6 +3687,12 @@ impl GpuSceneInstance {
                     }
                 }
                 ScriptCommand::Sort { index, to } => self.sort_object(index, to),
+                ScriptCommand::Animation {
+                    index,
+                    property,
+                    op,
+                    frame,
+                } => self.control_timeline(index, &property, &op, frame),
                 ScriptCommand::Create { index, config } => {
                     self.create_object(index, &config);
                     visibility_changed = true;
@@ -4024,6 +4140,7 @@ impl GpuSceneInstance {
         self.last_time = time;
         let dynamics = self.dynamics.update(time, delta, self.mouse_norm);
 
+        self.tick_timelines(delta);
         self.tick_scripts(time, delta);
 
         // Refresh the g_AudioSpectrum* UBO from the latest captured window, and
@@ -6298,11 +6415,17 @@ mod hit_tests {
         let dir = crate::workshop::find_item_dir(&target, None)
             .unwrap_or_else(|| std::path::PathBuf::from(&target));
         let resolved = crate::engine::render::ResolvedScene::from_directory(&dir).unwrap();
+        let raw_scene: serde_json::Value = crate::engine::assets::AssetStore::from_directory(&dir)
+            .ok()
+            .and_then(|a| a.scene_json().ok())
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
         let mut host = build_script_host(
             &dir,
             &resolved.scene,
             &resolved.transform_graph,
             [resolved.width, resolved.height],
+            &raw_scene,
         );
         for f in 0..30 {
             host.frame(f as f32 * 0.5, 0.5, 0.5);
@@ -6315,6 +6438,51 @@ mod hit_tests {
                 );
             }
         }
+    }
+
+    /// A real intro sequence (3453730450): layers keyed to fade in over the
+    /// first ~13 s start hidden and end fully visible.
+    #[test]
+    #[ignore]
+    fn keyframed_alpha_fades_in() {
+        let Some(dir) = crate::workshop::find_item_dir("3453730450", None) else {
+            eprintln!("workshop item 3453730450 not installed; skipping");
+            return;
+        };
+        let mut scene = GpuSceneInstance::open(&dir).expect("scene loads");
+        let animated: Vec<usize> = scene
+            .timelines
+            .iter()
+            .filter(|t| t.key == "alpha")
+            .map(|t| t.object)
+            .collect();
+        assert!(!animated.is_empty());
+        let alpha_of = |s: &GpuSceneInstance, o: usize| {
+            s.layers
+                .iter()
+                .find(|l| l.order_index == o)
+                .map(|l| l.alpha)
+        };
+        scene.tick_timelines(0.1);
+        let early: Vec<f32> = animated
+            .iter()
+            .filter_map(|o| alpha_of(&scene, *o))
+            .collect();
+        assert!(
+            early.iter().all(|a| *a < 0.05),
+            "hidden at start: {early:?}"
+        );
+        for _ in 0..140 {
+            scene.tick_timelines(0.1);
+        }
+        let late: Vec<f32> = animated
+            .iter()
+            .filter_map(|o| alpha_of(&scene, *o))
+            .collect();
+        assert!(
+            late.iter().filter(|a| **a > 0.3).count() >= late.len() - 1,
+            "faded in: {late:?}"
+        );
     }
 
     /// End to end against a real Workshop scene with clickable layers
@@ -6354,6 +6522,85 @@ mod hit_tests {
     }
 }
 
+/// One property's keyframe animation on one object.
+struct TimelineEntry {
+    object: usize,
+    /// `origin`/`alpha`/…, or a script-style extra key (`instance.rate`,
+    /// `effects.<e>.<pass>.<constant>`).
+    key: String,
+    /// Base value, which transform keyframes are offsets from.
+    base: Vec<f32>,
+    anim: crate::engine::timeline::PropertyAnimation,
+    /// Last value applied, to skip re-applying an idle animation.
+    last: Option<Vec<f32>>,
+}
+
+/// Collect every animated property from the raw scene.json objects.
+fn build_timelines(
+    raw_scene: &serde_json::Value,
+    graph: &crate::engine::render::TransformGraph,
+) -> Vec<TimelineEntry> {
+    use crate::engine::timeline::PropertyAnimation;
+    let mut out = Vec::new();
+    let objects = raw_scene.get("objects").and_then(|o| o.as_array());
+    for (i, raw) in objects.into_iter().flatten().enumerate() {
+        let mut props: Vec<(String, &serde_json::Value)> =
+            ["origin", "scale", "angles", "alpha", "color", "brightness"]
+                .iter()
+                .filter_map(|k| raw.get(*k).map(|v| (k.to_string(), v)))
+                .collect();
+        if let Some(m) = raw.get("instanceoverride").and_then(|v| v.as_object()) {
+            props.extend(m.iter().map(|(k, v)| (format!("instance.{k}"), v)));
+        }
+        for (e, eff) in raw
+            .get("effects")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            for (p, pass) in eff
+                .get("passes")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if let Some(m) = pass.get("constantshadervalues").and_then(|v| v.as_object()) {
+                    props.extend(m.iter().map(|(k, v)| (format!("effects.{e}.{p}.{k}"), v)));
+                }
+            }
+        }
+        for (key, value) in props {
+            let Some(anim) = value
+                .get("animation")
+                .and_then(|a| PropertyAnimation::parse(&key, a))
+            else {
+                continue;
+            };
+            let local = graph
+                .local
+                .get(i)
+                .copied()
+                .unwrap_or(crate::engine::render::Xform::IDENTITY);
+            let base: Vec<f32> = match key.as_str() {
+                "origin" => local.t.iter().map(|v| *v as f32).collect(),
+                "scale" => local.s.iter().map(|v| *v as f32).collect(),
+                "angles" => local.r.iter().map(|v| *v as f32).collect(),
+                _ => Vec::new(),
+            };
+            out.push(TimelineEntry {
+                object: i,
+                key,
+                base,
+                anim,
+                last: None,
+            });
+        }
+    }
+    out
+}
+
 /// Build the scene's SceneScript runtime: one layer proxy per scene object
 /// (indexed like `scene.objects`, the same index `order_index` and the
 /// transform graph use), then one instance per scripted property.
@@ -6362,6 +6609,7 @@ fn build_script_host(
     scene: &crate::engine::scene::Scene,
     graph: &crate::engine::render::TransformGraph,
     canvas: [u32; 2],
+    raw_scene: &serde_json::Value,
 ) -> crate::engine::script::ScriptHost {
     use crate::engine::scene::{parse_value_f32, parse_value_vec3};
     use crate::engine::script::{ObjectInit, ScriptHost};
@@ -6374,11 +6622,6 @@ fn build_script_host(
         host = host.with_storage(path);
     }
     // The raw scene.json entries back `thisScene.getInitialLayerConfig`.
-    let raw_scene: serde_json::Value = crate::engine::assets::AssetStore::from_directory(dir)
-        .ok()
-        .and_then(|a| a.scene_json().ok())
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
     let raw_objects: Vec<serde_json::Value> = raw_scene
         .get("objects")
         .and_then(|o| o.as_array())

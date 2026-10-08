@@ -556,6 +556,36 @@ impl ScriptHost {
         self.run(&src);
     }
 
+    /// Fire `handler(event)` on the scripts of object `index`.
+    pub fn dispatch_event(&mut self, index: usize, handler: &str, event: &Value) {
+        self.run(&format!(
+            "__wp_dispatch({index}, {}, {event});",
+            js_str(handler)
+        ));
+    }
+
+    /// Set a layer property from outside the scripts (a keyframe animation)
+    /// so scripts read the current value; not reported back by `collect`.
+    /// Angles are radians here, like everywhere on the Rust side.
+    pub fn sync_property(&mut self, index: usize, key: &str, value: &Value) {
+        let value = if key == "angles" {
+            match value.as_array() {
+                Some(a) => Value::Array(
+                    a.iter()
+                        .map(|v| serde_json::json!(v.as_f64().unwrap_or(0.0).to_degrees()))
+                        .collect(),
+                ),
+                None => value.clone(),
+            }
+        } else {
+            value.clone()
+        };
+        self.run(&format!(
+            "(function(l, k, v) {{ if (l) {{ if (Array.isArray(v)) {{ v = v.join(' '); }} l.__s[k] = __wp_coerce(k, l.__kinds[k], v); }} }})(__wp.objects[{index}], {}, {value});",
+            js_str(key)
+        ));
+    }
+
     /// Objects with at least one handler among `events`.
     pub fn objects_with_handlers(&mut self, events: &[&str]) -> Vec<usize> {
         let list = serde_json::to_string(events).unwrap_or_else(|_| "[]".into());
