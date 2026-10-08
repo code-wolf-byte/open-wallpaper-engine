@@ -12,6 +12,62 @@ pub struct RenderSettings {
     pub volume: f32,
     /// Frame-rate cap for animated content.
     pub fps: u32,
+    /// How video, image and web content fits an output of another aspect.
+    pub scaling: ScaleMode,
+}
+
+/// How a frame of one aspect ratio fills an output of another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScaleMode {
+    /// Cover the output, cropping the overflow (WE's default).
+    #[default]
+    Fill,
+    /// Fit inside the output, with black bars.
+    Fit,
+    /// Stretch to the output, ignoring aspect.
+    Stretch,
+    /// Native size, centred (cropped or bordered).
+    Center,
+}
+
+impl ScaleMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fill" | "cover" => Some(Self::Fill),
+            "fit" | "contain" => Some(Self::Fit),
+            "stretch" => Some(Self::Stretch),
+            "center" | "centre" => Some(Self::Center),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fill => "fill",
+            Self::Fit => "fit",
+            Self::Stretch => "stretch",
+            Self::Center => "center",
+        }
+    }
+
+    /// `(uv_scale, uv_offset)` mapping output UV to source UV
+    /// (`src = dst * scale + offset`); source UVs outside `[0,1]` are black.
+    pub fn uv_transform(self, src: (u32, u32), dst: (u32, u32)) -> ([f32; 2], [f32; 2]) {
+        let (sw, sh) = (src.0.max(1) as f32, src.1.max(1) as f32);
+        let (dw, dh) = (dst.0.max(1) as f32, dst.1.max(1) as f32);
+        let scale = match self {
+            Self::Stretch => return ([1.0, 1.0], [0.0, 0.0]),
+            Self::Fill => (dw / sw).max(dh / sh),
+            Self::Fit => (dw / sw).min(dh / sh),
+            Self::Center => 1.0,
+        };
+        let uv_scale = [dw / (sw * scale), dh / (sh * scale)];
+        (
+            uv_scale,
+            [(1.0 - uv_scale[0]) * 0.5, (1.0 - uv_scale[1]) * 0.5],
+        )
+    }
 }
 
 /// The frame-rate cap when none is configured.
@@ -23,7 +79,30 @@ impl Default for RenderSettings {
             quality: RenderQuality::Ultra,
             volume: 1.0,
             fps: DEFAULT_FPS,
+            scaling: ScaleMode::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+    #[test]
+    fn fill_crops_and_fit_letterboxes() {
+        // 16:9 video on a 4:3 output.
+        let (s, o) = ScaleMode::Fill.uv_transform((1920, 1080), (1600, 1200));
+        assert!((s[1] - 1.0).abs() < 1e-5 && s[0] < 1.0);
+        assert!((o[0] - (1.0 - s[0]) / 2.0).abs() < 1e-6);
+        let (s, _) = ScaleMode::Fit.uv_transform((1920, 1080), (1600, 1200));
+        assert!((s[0] - 1.0).abs() < 1e-5 && s[1] > 1.0);
+        assert_eq!(
+            ScaleMode::Stretch.uv_transform((1, 1), (5, 5)),
+            ([1.0, 1.0], [0.0, 0.0])
+        );
+        let (s, o) = ScaleMode::Center.uv_transform((100, 100), (200, 100));
+        assert_eq!(s, [2.0, 1.0]);
+        assert_eq!(o, [-0.5, 0.0]);
     }
 }
 

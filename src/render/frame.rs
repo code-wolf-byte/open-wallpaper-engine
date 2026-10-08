@@ -24,6 +24,8 @@ pub enum FrameSource {
         /// `None` for real video and CPU-scene-fallback, which share this
         /// same variant but have no page to receive input.
         web_input: Option<SyncSender<super::web::WebInputEvent>>,
+        /// A video's soundtrack, playing while this source lives.
+        audio: Option<crate::engine::audio::StreamingAudio>,
     },
 }
 
@@ -77,6 +79,7 @@ impl FrameSource {
                     current: first,
                     rx,
                     web_input: None,
+                    audio: None,
                 })
             }
             // Web wallpapers reuse the `Video` variant rather than adding one:
@@ -89,10 +92,12 @@ impl FrameSource {
                     current: Arc::new(first),
                     rx,
                     web_input: Some(input_tx),
+                    audio: None,
                 })
             }
             WallpaperContent::Video { path } => {
                 let (tx, rx) = sync_channel::<Arc<RgbaImage>>(2);
+                let audio = crate::engine::audio::StreamingAudio::start(&path);
 
                 thread::spawn(move || {
                     if let Err(e) = super::ffmpeg::video_decode_loop(&path, &tx) {
@@ -110,6 +115,7 @@ impl FrameSource {
                     current: first,
                     rx,
                     web_input: None,
+                    audio,
                 })
             }
         }

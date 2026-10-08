@@ -11,7 +11,7 @@ use super::{GpuDevice, RenderQuality};
 // expects for wl_shm::Format::Argb8888.
 
 const SHADER: &str = r#"
-struct Params { dst_w: u32, dst_h: u32 }
+struct Params { dst_w: u32, dst_h: u32, uv_scale: vec2<f32>, uv_offset: vec2<f32> }
 
 @group(0) @binding(0) var src_tex  : texture_2d<f32>;
 @group(0) @binding(1) var src_samp : sampler;
@@ -21,9 +21,12 @@ struct Params { dst_w: u32, dst_h: u32 }
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if gid.x >= params.dst_w || gid.y >= params.dst_h { return; }
-    let uv = (vec2<f32>(gid.xy) + 0.5)
-             / vec2<f32>(f32(params.dst_w), f32(params.dst_h));
-    let c  = textureSampleLevel(src_tex, src_samp, uv, 0.0);
+    let dst_uv = (vec2<f32>(gid.xy) + 0.5)
+                 / vec2<f32>(f32(params.dst_w), f32(params.dst_h));
+    let uv = dst_uv * params.uv_scale + params.uv_offset;
+    var c = textureSampleLevel(src_tex, src_samp, uv, 0.0);
+    // Outside the source (fit/center borders): black.
+    if any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) { c = vec4<f32>(0.0, 0.0, 0.0, 1.0); }
     let r  = u32(clamp(c.r, 0.0, 1.0) * 255.0 + 0.5);
     let g  = u32(clamp(c.g, 0.0, 1.0) * 255.0 + 0.5);
     let b  = u32(clamp(c.b, 0.0, 1.0) * 255.0 + 0.5);
@@ -150,7 +153,9 @@ impl GpuScaler {
         dst_w: u32,
         dst_h: u32,
         quality: RenderQuality,
+        mode: crate::render::ScaleMode,
     ) -> Vec<u8> {
+        let uv = mode.uv_transform((src.width(), src.height()), (dst_w, dst_h));
         let scale = quality.source_scale();
         let downsampled: Option<RgbaImage> = if scale < 1.0 {
             let sw = ((src.width() as f32) * scale).max(1.0) as u32;
@@ -161,18 +166,24 @@ impl GpuScaler {
         };
         let upload_src: &RgbaImage = downsampled.as_ref().unwrap_or(src);
 
-        match self.scale_gpu(upload_src, dst_w, dst_h) {
+        match self.scale_gpu(upload_src, dst_w, dst_h, uv) {
             Ok(pixels) => pixels,
             Err(e) => {
                 tracing::warn!(target: "scaler", "GPU scale failed, falling back to CPU: {e}");
-                self.scale_cpu(src, dst_w, dst_h)
+                self.scale_cpu(src, dst_w, dst_h, uv)
             }
         }
     }
 
     // ── GPU path ──────────────────────────────────────────────────────────────
 
-    fn scale_gpu(&self, src: &RgbaImage, dst_w: u32, dst_h: u32) -> Result<Vec<u8>> {
+    fn scale_gpu(
+        &self,
+        src: &RgbaImage,
+        dst_w: u32,
+        dst_h: u32,
+        (uv_scale, uv_offset): ([f32; 2], [f32; 2]),
+    ) -> Result<Vec<u8>> {
         let src_w = src.width();
         let src_h = src.height();
 
@@ -231,13 +242,16 @@ impl GpuScaler {
             mapped_at_creation: false,
         });
 
-        // Params uniform: [dst_w, dst_h] packed as two LE u32s.
-        let mut params_bytes = [0u8; 8];
-        params_bytes[..4].copy_from_slice(&dst_w.to_le_bytes());
-        params_bytes[4..].copy_from_slice(&dst_h.to_le_bytes());
+        // Params uniform: dst_w, dst_h (u32), uv_scale, uv_offset (vec2<f32>).
+        let mut params_bytes = Vec::with_capacity(24);
+        params_bytes.extend_from_slice(&dst_w.to_le_bytes());
+        params_bytes.extend_from_slice(&dst_h.to_le_bytes());
+        for v in uv_scale.iter().chain(uv_offset.iter()) {
+            params_bytes.extend_from_slice(&v.to_le_bytes());
+        }
         let params_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scaler_params"),
-            size: 8,
+            size: params_bytes.len() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -313,15 +327,67 @@ impl GpuScaler {
 
     // ── CPU fallback ──────────────────────────────────────────────────────────
 
-    fn scale_cpu(&self, src: &RgbaImage, dst_w: u32, dst_h: u32) -> Vec<u8> {
-        let scaled = image::imageops::resize(src, dst_w, dst_h, FilterType::Lanczos3);
+    fn scale_cpu(
+        &self,
+        src: &RgbaImage,
+        dst_w: u32,
+        dst_h: u32,
+        (uv_scale, uv_offset): ([f32; 2], [f32; 2]),
+    ) -> Vec<u8> {
         let mut out = Vec::with_capacity((dst_w * dst_h * 4) as usize);
-        for chunk in scaled.chunks_exact(4) {
-            out.push(chunk[2]); // B
-            out.push(chunk[1]); // G
-            out.push(chunk[0]); // R
-            out.push(chunk[3]); // A
+        if uv_scale == [1.0, 1.0] && uv_offset == [0.0, 0.0] {
+            let scaled = image::imageops::resize(src, dst_w, dst_h, FilterType::Lanczos3);
+            for chunk in scaled.chunks_exact(4) {
+                out.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
+            }
+            return out;
+        }
+        // Non-stretch modes: nearest sampling through the same UV mapping
+        // as the GPU shader (this path only runs when the GPU failed).
+        let (sw, sh) = (src.width() as f32, src.height() as f32);
+        for y in 0..dst_h {
+            for x in 0..dst_w {
+                let u = (x as f32 + 0.5) / dst_w as f32 * uv_scale[0] + uv_offset[0];
+                let v = (y as f32 + 0.5) / dst_h as f32 * uv_scale[1] + uv_offset[1];
+                if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                    out.extend_from_slice(&[0, 0, 0, 255]);
+                    continue;
+                }
+                let px = src.get_pixel(
+                    ((u * sw) as u32).min(src.width() - 1),
+                    ((v * sh) as u32).min(src.height() - 1),
+                );
+                out.extend_from_slice(&[px[2], px[1], px[0], 255]);
+            }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fit mode letterboxes on the GPU: a 2:1 red image in a square output
+    /// leaves the top and bottom rows black. Skips without a GPU.
+    #[test]
+    fn fit_letterboxes_on_the_gpu() {
+        let Ok(gpu) = GpuDevice::open_best() else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let scaler = GpuScaler::from_device(gpu).unwrap();
+        let src = RgbaImage::from_pixel(8, 4, image::Rgba([255, 0, 0, 255]));
+        let out = scaler.scale(
+            &src,
+            8,
+            8,
+            RenderQuality::Ultra,
+            crate::render::ScaleMode::Fit,
+        );
+        let px = |x: usize, y: usize| &out[(y * 8 + x) * 4..(y * 8 + x) * 4 + 4];
+        assert_eq!(px(4, 0), &[0, 0, 0, 255], "top bar is black");
+        assert_eq!(px(4, 4), &[0, 0, 255, 255], "middle is red (BGRA)");
+        assert_eq!(px(4, 7), &[0, 0, 0, 255], "bottom bar is black");
     }
 }

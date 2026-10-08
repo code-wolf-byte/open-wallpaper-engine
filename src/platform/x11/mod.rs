@@ -571,7 +571,16 @@ fn wallpaper_loop(
 
         if !paused {
             for output in &mut outputs {
-                let quality = output.settings.lock().unwrap().quality;
+                let (quality, scaling) = {
+                    let s = output.settings.lock().unwrap();
+                    (s.quality, s.scaling)
+                };
+                // Scenes size themselves; the fit modes are for video, image
+                // and web content.
+                let mode = match &output.renderer {
+                    ContentRenderer::Scene(_) => crate::render::ScaleMode::Stretch,
+                    ContentRenderer::Frames(_) => scaling,
+                };
                 let frame = output.renderer.next_frame()?;
                 // `GpuScaler` emits ARGB8888-LE, i.e. bytes [B, G, R, A] — already
                 // the byte order a Z_PIXMAP wants on a little-endian server, and
@@ -582,6 +591,7 @@ fn wallpaper_loop(
                     output.named.rect.width as u32,
                     output.named.rect.height as u32,
                     quality,
+                    mode,
                 );
                 put_image_chunked(&conn, pixmap, gc, depth, output.named.rect, &pixels)?;
             }

@@ -212,6 +212,9 @@ enum ConfigAction {
     SetPlayback { condition: String, action: String },
     /// Cap the frame rate of animated wallpapers (1-240)
     SetFps { fps: u32 },
+    /// How video, image and web wallpapers fit the screen: fill (crop,
+    /// default), fit (black bars), stretch, or center
+    SetScaling { mode: String },
 }
 
 fn main() {
@@ -627,6 +630,13 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
                 ));
             }
             println!("While {condition}: {}", a.label());
+        }
+        ConfigAction::SetScaling { mode } => {
+            let m = wp_engine::render::ScaleMode::parse(&mode).ok_or_else(|| {
+                anyhow!("invalid mode '{mode}' (expected fill, fit, stretch or center)")
+            })?;
+            settings.scaling = Some(m);
+            println!("Scaling: {}", m.label());
         }
         ConfigAction::SetFps { fps } => {
             if !(1..=240).contains(&fps) {

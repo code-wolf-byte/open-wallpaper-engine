@@ -441,6 +441,182 @@ fn decode_audio_file_for_default_output(
     Some((samples, config))
 }
 
+/// A file's audio track playing on its own thread (a video wallpaper's
+/// soundtrack). Decodes incrementally rather than up front — videos can run
+/// for many minutes — and loops at the end. Dropping it stops playback.
+pub struct StreamingAudio {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for StreamingAudio {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl StreamingAudio {
+    /// Start playing `path`'s best audio stream; `None` when it has none or
+    /// there is no output device.
+    pub fn start(path: &std::path::Path) -> Option<Self> {
+        ffmpeg_next::init().ok()?;
+        let has_audio = ffmpeg_next::format::input(&path)
+            .ok()?
+            .streams()
+            .best(ffmpeg_next::media::Type::Audio)
+            .is_some();
+        if !has_audio {
+            return None;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let path = path.to_path_buf();
+        let flag = stop.clone();
+        // cpal streams aren't Send: the thread that decodes also owns the
+        // output stream, and lives until `stop`.
+        let thread = std::thread::Builder::new()
+            .name("video-audio".into())
+            .spawn(move || {
+                if let Err(e) = stream_file_audio(&path, &flag) {
+                    tracing::warn!(target: "audio", "video audio for {}: {e}", path.display());
+                }
+            })
+            .ok()?;
+        Some(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+fn stream_file_audio(path: &std::path::Path, stop: &AtomicBool) -> anyhow::Result<()> {
+    use ffmpeg_next::util::format::sample::{Sample, Type};
+    use std::sync::mpsc::{sync_channel, TryRecvError};
+
+    let device = cpal::default_host()
+        .default_output_device()
+        .ok_or_else(|| anyhow::anyhow!("no audio output device"))?;
+    let config = device.default_output_config()?;
+    let out_rate = config.sample_rate().0;
+    let out_ch = config.channels() as usize;
+
+    let (tx, rx) = sync_channel::<Vec<f32>>(16);
+    let mut chunk: Vec<f32> = Vec::new();
+    let mut pos = 0usize;
+    let stream = device.build_output_stream(
+        &config.into(),
+        move |out: &mut [f32], _| {
+            let gain = output_gain();
+            for s in out.iter_mut() {
+                if pos >= chunk.len() {
+                    match rx.try_recv() {
+                        Ok(next) => {
+                            chunk = next;
+                            pos = 0;
+                        }
+                        Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
+                            *s = 0.0;
+                            continue;
+                        }
+                    }
+                }
+                *s = chunk.get(pos).copied().unwrap_or(0.0) * gain;
+                pos += 1;
+            }
+        },
+        |e| tracing::warn!(target: "audio", "video audio stream error: {e}"),
+        None,
+    )?;
+    stream.play()?;
+
+    let mut ictx = ffmpeg_next::format::input(&path)?;
+    let audio = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Audio)
+        .ok_or_else(|| anyhow::anyhow!("no audio stream"))?;
+    let index = audio.index();
+    let mut decoder = ffmpeg_next::codec::context::Context::from_parameters(audio.parameters())?
+        .decoder()
+        .audio()?;
+    let out_layout = if out_ch >= 2 {
+        ffmpeg_next::util::channel_layout::ChannelLayout::STEREO
+    } else {
+        ffmpeg_next::util::channel_layout::ChannelLayout::MONO
+    };
+    let in_layout = if decoder.channel_layout().is_empty() {
+        if decoder.channels() >= 2 {
+            ffmpeg_next::util::channel_layout::ChannelLayout::STEREO
+        } else {
+            ffmpeg_next::util::channel_layout::ChannelLayout::MONO
+        }
+    } else {
+        decoder.channel_layout()
+    };
+    let mut resampler = ffmpeg_next::software::resampling::Context::get(
+        decoder.format(),
+        in_layout,
+        decoder.rate(),
+        Sample::F32(Type::Packed),
+        out_layout,
+        out_rate,
+    )?;
+
+    let mut frame = ffmpeg_next::frame::Audio::empty();
+    let mut resampled = ffmpeg_next::frame::Audio::empty();
+    // Send a resampled frame; false once the stream should end.
+    let mut push = |resampled: &ffmpeg_next::frame::Audio| -> bool {
+        let n = resampled.samples() * out_ch.min(2);
+        let data: &[f32] = bytemuck::cast_slice(resampled.data(0));
+        let mut samples = data[..n.min(data.len())].to_vec();
+        // A device with more than two channels gets stereo on its first two.
+        if out_ch > 2 {
+            samples = samples
+                .chunks(2)
+                .flat_map(|lr| {
+                    let mut f = vec![0.0; out_ch];
+                    f[0] = lr[0];
+                    f[1] = *lr.get(1).unwrap_or(&lr[0]);
+                    f
+                })
+                .collect();
+        }
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            match tx.try_send(samples) {
+                Ok(()) => return true,
+                Err(std::sync::mpsc::TrySendError::Full(back)) => {
+                    samples = back;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
+            }
+        }
+    };
+
+    loop {
+        for (s, packet) in ictx.packets() {
+            if s.index() != index || decoder.send_packet(&packet).is_err() {
+                continue;
+            }
+            while decoder.receive_frame(&mut frame).is_ok() {
+                if resampler.run(&frame, &mut resampled).is_ok() && !push(&resampled) {
+                    return Ok(());
+                }
+            }
+        }
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        // Loop: back to the start without re-opening the file.
+        ictx.seek(0, ..)?;
+        decoder.flush();
+    }
+}
+
 /// Decode an audio file to interleaved f32 samples at `out_rate`/`out_ch` using
 /// ffmpeg's decoder + software resampler. Returns `None` on any failure.
 fn decode_audio_file(path: &std::path::Path, out_rate: u32, out_ch: usize) -> Option<Vec<f32>> {

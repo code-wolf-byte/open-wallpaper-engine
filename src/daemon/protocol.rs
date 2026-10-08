@@ -28,6 +28,8 @@ pub struct ApplySpec {
     pub volume: Option<f32>,
     #[serde(default)]
     pub fps: Option<u32>,
+    #[serde(default)]
+    pub scaling: Option<crate::render::ScaleMode>,
     /// Per-screen quality, keyed like `screens`.
     #[serde(default)]
     pub screen_quality: HashMap<String, String>,
@@ -42,9 +44,9 @@ impl ApplySpec {
     /// client's.
     pub fn from_context(context: &ApplicationContext, title: Option<String>) -> Self {
         let absolute = |p: &PathBuf| std::path::absolute(p).unwrap_or_else(|_| p.clone());
-        let (quality, volume, fps) = {
+        let (quality, volume, fps, scaling) = {
             let s = context.settings.lock().unwrap();
-            (s.quality, s.volume, s.fps)
+            (s.quality, s.volume, s.fps, s.scaling)
         };
         Self {
             background: absolute(&context.background),
@@ -57,6 +59,7 @@ impl ApplySpec {
             quality: Some(quality.label().to_string()),
             volume: Some(volume),
             fps: Some(fps),
+            scaling: Some(scaling),
             screen_quality: context
                 .screen_settings
                 .iter()
@@ -88,8 +91,14 @@ impl ApplySpec {
             if let Some(f) = self.fps {
                 s.fps = f.clamp(1, 240);
             }
+            if let Some(m) = self.scaling {
+                s.scaling = m;
+            }
         }
-        let fps = context.settings.lock().unwrap().fps;
+        let (fps, scaling) = {
+            let s = context.settings.lock().unwrap();
+            (s.fps, s.scaling)
+        };
         for (screen, q) in self.screen_quality {
             if let Some(quality) = RenderQuality::parse(&q) {
                 context.screen_settings.insert(
@@ -97,6 +106,7 @@ impl ApplySpec {
                     std::sync::Arc::new(std::sync::Mutex::new(RenderSettings {
                         quality,
                         fps,
+                        scaling,
                         ..Default::default()
                     })),
                 );
