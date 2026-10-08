@@ -10,14 +10,27 @@ pub struct RenderSettings {
     /// Master volume in 0.0–1.0, applied to every wallpaper audio stream via
     /// `engine::audio::set_master_volume` each frame.
     pub volume: f32,
+    /// Frame-rate cap for animated content.
+    pub fps: u32,
 }
+
+/// The frame-rate cap when none is configured.
+pub const DEFAULT_FPS: u32 = 30;
 
 impl Default for RenderSettings {
     fn default() -> Self {
         Self {
             quality: RenderQuality::Ultra,
             volume: 1.0,
+            fps: DEFAULT_FPS,
         }
+    }
+}
+
+impl RenderSettings {
+    /// Minimum time between frames for the configured cap (1–240 fps).
+    pub fn frame_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(1.0 / self.fps.clamp(1, 240) as f64)
     }
 }
 

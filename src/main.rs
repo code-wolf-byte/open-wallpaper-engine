@@ -180,6 +180,12 @@ enum ConfigAction {
     },
     /// Remove a playlist
     RemovePlaylist { name: String },
+    /// Set what happens while a condition holds: CONDITION is focus,
+    /// maximized, fullscreen, audio, battery or lock; ACTION is run, mute,
+    /// pause or stop (pause and free memory)
+    SetPlayback { condition: String, action: String },
+    /// Cap the frame rate of animated wallpapers (1-240)
+    SetFps { fps: u32 },
 }
 
 fn main() {
@@ -550,6 +556,24 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
                 },
             );
         }
+        ConfigAction::SetPlayback { condition, action } => {
+            let a = wp_engine::engine::playback_gate::PlaybackAction::parse(&action).ok_or_else(
+                || anyhow!("invalid action '{action}' (expected run, mute, pause or stop)"),
+            )?;
+            if !settings.playback.set(&condition, a) {
+                return Err(anyhow!(
+                    "invalid condition '{condition}' (expected focus, maximized, fullscreen, audio, battery or lock)"
+                ));
+            }
+            println!("While {condition}: {}", a.label());
+        }
+        ConfigAction::SetFps { fps } => {
+            if !(1..=240).contains(&fps) {
+                return Err(anyhow!("fps must be between 1 and 240"));
+            }
+            settings.fps = Some(fps);
+            println!("Frame-rate cap: {fps} fps");
+        }
         ConfigAction::RemovePlaylist { name } => {
             if settings.playlists.remove(&name).is_some() {
                 println!("Removed playlist: {name}");
@@ -648,6 +672,7 @@ fn cmd_run(foreground: bool) -> Result<()> {
                         screen.clone(),
                         Arc::new(Mutex::new(wp_engine::render::RenderSettings {
                             quality: q,
+                            fps: context.settings.lock().unwrap().fps,
                             ..Default::default()
                         })),
                     );

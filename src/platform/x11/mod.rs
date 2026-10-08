@@ -26,6 +26,8 @@ use x11rb::protocol::xproto::{
     ImageFormat, KeyButMask, Pixmap, PropMode, Window,
 };
 use x11rb::rust_connection::RustConnection;
+
+use crate::engine::playback_gate::PlaybackAction;
 use x11rb::wrapper::ConnectionExt as _;
 
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
@@ -34,7 +36,6 @@ use crate::platform;
 use crate::render::{FrameSource, RenderSettings, ScreenContent, ScreenSettings, WallpaperContent};
 
 /// Frames per second for animated content. Matches `FrameSource`'s own target.
-const TARGET_FPS: f32 = 30.0;
 
 /// How often to re-check playback-pause conditions (battery, session lock,
 /// fullscreen/maximized app) — see `engine::playback_gate`. Real I/O (sysfs
@@ -290,6 +291,18 @@ struct EwmhAtoms {
     fullscreen: Atom,
     maximized_vert: Atom,
     maximized_horz: Atom,
+    window_type: Atom,
+    type_desktop: Atom,
+    type_dock: Atom,
+}
+
+/// The active window's state, for the playback policy.
+#[derive(Debug, Default, Clone, Copy)]
+struct ActiveWindow {
+    fullscreen: bool,
+    maximized: bool,
+    /// An application window (not the desktop or a panel) is active.
+    focused: bool,
 }
 
 impl EwmhAtoms {
@@ -302,28 +315,37 @@ impl EwmhAtoms {
             fullscreen: atom(b"_NET_WM_STATE_FULLSCREEN")?,
             maximized_vert: atom(b"_NET_WM_STATE_MAXIMIZED_VERT")?,
             maximized_horz: atom(b"_NET_WM_STATE_MAXIMIZED_HORZ")?,
+            window_type: atom(b"_NET_WM_WINDOW_TYPE")?,
+            type_desktop: atom(b"_NET_WM_WINDOW_TYPE_DESKTOP")?,
+            type_dock: atom(b"_NET_WM_WINDOW_TYPE_DOCK")?,
         })
     }
 
-    /// `(fullscreen, maximized)` for whichever window `_NET_ACTIVE_WINDOW`
-    /// currently names, or `(false, false)` when there's no active window,
-    /// the window manager doesn't publish one, or any request fails — a WM
-    /// with no EWMH support at all must degrade to "never pauses," not
-    /// error the whole render loop.
-    fn check(&self, conn: &impl Connection, root: Window) -> (bool, bool) {
+    /// The state of whichever window `_NET_ACTIVE_WINDOW` names; all false
+    /// when there's no active window, the window manager doesn't publish
+    /// one, or a request fails — a WM without EWMH support degrades to
+    /// "never pauses" rather than erroring the render loop.
+    fn check(&self, conn: &impl Connection, root: Window) -> ActiveWindow {
         let Some(active) = read_window32(conn, root, self.active_window) else {
-            return (false, false);
+            return ActiveWindow::default();
         };
         if active == 0 || active == root {
-            return (false, false);
+            return ActiveWindow::default();
         }
+        let types = read_atoms32(conn, active, self.window_type).unwrap_or_default();
+        let focused = !types.contains(&self.type_desktop) && !types.contains(&self.type_dock);
         let Some(states) = read_atoms32(conn, active, self.wm_state) else {
-            return (false, false);
+            return ActiveWindow {
+                focused,
+                ..Default::default()
+            };
         };
-        let fullscreen = states.contains(&self.fullscreen);
-        let maximized =
-            states.contains(&self.maximized_vert) && states.contains(&self.maximized_horz);
-        (fullscreen, maximized)
+        ActiveWindow {
+            fullscreen: states.contains(&self.fullscreen),
+            maximized: states.contains(&self.maximized_vert)
+                && states.contains(&self.maximized_horz),
+            focused,
+        }
     }
 }
 
@@ -477,13 +499,19 @@ fn wallpaper_loop(
     // `PAUSE_CHECK_INTERVAL` throttle rather than every frame, since both
     // involve real I/O (sysfs reads, a D-Bus round trip) a 30fps loop
     // shouldn't pay for every tick.
-    let pause_conditions = crate::engine::playback_gate::PauseConditions::from_env();
+    let policy = crate::engine::playback_gate::PlaybackPolicy::load();
+    let media = if policy.watches_audio() {
+        crate::engine::media::MediaWatcher::start()
+    } else {
+        None
+    };
+    let mut media_playing = false;
+    let mut stopped = false;
     let ewmh = EwmhAtoms::intern(&conn)?;
     let mut lock_watcher = platform::power::LockWatcher::start();
     let mut playback_state = crate::engine::playback_gate::PlaybackState::default();
     let mut last_pause_check = Instant::now() - PAUSE_CHECK_INTERVAL;
 
-    let frame_budget = Duration::from_secs_f32(1.0 / TARGET_FPS);
     // Any output still animating keeps the whole loop going; a genuinely
     // static desktop (every output static) holds the pixmap and sleeps.
     let animated = outputs.iter().any(|o| o.renderer.is_animated());
@@ -496,20 +524,50 @@ fn wallpaper_loop(
 
         if started.duration_since(last_pause_check) >= PAUSE_CHECK_INTERVAL {
             last_pause_check = started;
-            let (fullscreen_app, maximized_app) = ewmh.check(&conn, root);
+            let active = ewmh.check(&conn, root);
+            while let Some(info) = media.as_ref().and_then(|m| m.try_recv()) {
+                media_playing = info.playback_state == crate::engine::media::PlaybackState::Playing;
+            }
             playback_state = crate::engine::playback_gate::PlaybackState {
                 on_battery: platform::power::is_on_battery(),
                 locked_or_sleeping: lock_watcher
                     .as_mut()
                     .map(|w| w.is_locked())
                     .unwrap_or(false),
-                fullscreen_app,
-                maximized_app,
+                fullscreen_app: active.fullscreen,
+                maximized_app: active.maximized,
+                focused_app: active.focused,
+                other_audio: media_playing,
             };
         }
-        let paused = crate::engine::playback_gate::should_pause(&pause_conditions, &playback_state);
-        crate::engine::audio::set_muted(paused);
+        let action = crate::engine::playback_gate::decide(&policy, &playback_state);
+        let paused = action.halts();
+        crate::engine::audio::set_muted(action >= PlaybackAction::Mute);
         crate::engine::audio::set_master_volume(settings.default.lock().unwrap().volume);
+
+        // Stop: drop each output's renderer (scene GPU resources, decoder
+        // threads), keeping its last frame on the pixmap; rebuild on resume.
+        if action == PlaybackAction::Stop && !stopped {
+            stopped = true;
+            for output in &mut outputs {
+                let last = output.renderer.next_frame().ok();
+                let still = last.unwrap_or_else(|| Arc::new(image::RgbaImage::new(1, 1)));
+                output.renderer = ContentRenderer::Frames(FrameSource::Static(still));
+            }
+            tracing::info!(target: "wallpaper", "playback stopped; renderer released");
+        } else if action != PlaybackAction::Stop && stopped {
+            stopped = false;
+            for output in &mut outputs {
+                let resolved = content.resolve(output.named.name.as_deref());
+                match build_content_renderer(resolved, device.clone(), queue.clone()) {
+                    Ok(r) => output.renderer = r,
+                    Err(e) => {
+                        tracing::error!(target: "wallpaper", "resuming output {:?}: {e}", output.named.name)
+                    }
+                }
+            }
+            tracing::info!(target: "wallpaper", "playback resumed");
+        }
 
         if !paused {
             for output in &mut outputs {
@@ -637,7 +695,7 @@ fn wallpaper_loop(
         let budget = if paused {
             PAUSE_CHECK_INTERVAL
         } else {
-            frame_budget
+            settings.default.lock().unwrap().frame_interval()
         };
         if let Some(rest) = budget.checked_sub(started.elapsed()) {
             thread::sleep(rest);
