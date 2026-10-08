@@ -584,7 +584,17 @@ fn wallpaper_loop(
                     ((py - rect.y as i32) as f32 / rect.height.max(1) as f32).clamp(0.0, 1.0),
                 ];
                 match &mut output.renderer {
-                    ContentRenderer::Scene(scene) => scene.set_mouse(norm),
+                    ContentRenderer::Scene(scene) => {
+                        scene.set_mouse(norm);
+                        // The button mask is global: only count presses made
+                        // on the bare desktop (no window under the pointer).
+                        let mask: u16 = pointer.mask.into();
+                        if pointer.child == x11rb::NONE {
+                            scene.set_mouse_button(mask & u16::from(KeyButMask::BUTTON1) != 0);
+                        } else {
+                            scene.set_mouse_button(false);
+                        }
+                    }
                     ContentRenderer::Frames(fs) => {
                         // Polled, not event-driven (see `OutputInstance`'s own
                         // doc comment) — mirrors the C++ reference's own

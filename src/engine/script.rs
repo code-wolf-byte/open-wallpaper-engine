@@ -443,6 +443,29 @@ impl ScriptHost {
         self.run(&src);
     }
 
+    /// Expose scene.json's `general` settings (`bloom`, `camerashake`,
+    /// `clearcolor`…) on `thisScene`, unwrapping `{"value": …}` entries.
+    /// Read-only: changing them from a script has no effect yet.
+    pub fn set_scene_general(&mut self, general: &Value) {
+        let Some(m) = general.as_object() else {
+            return;
+        };
+        let mut flat = serde_json::Map::new();
+        for (k, v) in m {
+            let v = match v {
+                Value::Object(o) => o.get("value").cloned().unwrap_or(Value::Null),
+                other => other.clone(),
+            };
+            if !v.is_null() && !k.starts_with("__") {
+                flat.insert(k.clone(), v);
+            }
+        }
+        self.run(&format!(
+            "(function(g) {{ for (var k in g) {{ if (!(k in thisScene)) {{ thisScene[k] = g[k]; }} }} }})({});",
+            Value::Object(flat)
+        ));
+    }
+
     /// Live user-property change: updates `engine.userProperties` and calls
     /// every instance's `applyUserProperties(changed)`.
     pub fn apply_user_properties(&mut self, changed: &Value) {
@@ -1015,6 +1038,22 @@ mod tests {
         h.frame(0.0, 0.0, 0.016);
         assert_eq!(change(&mut h).alpha, Some(3.0));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scene_general_settings_are_readable() {
+        let mut h = host_with_object();
+        h.set_scene_general(
+            &serde_json::json!({"bloom": {"value": true}, "bloomstrength": 2.5, "getLayer": 1}),
+        );
+        h.attach(
+            0,
+            Some("text"),
+            "export function update(v) { return thisScene.bloom + ' ' + thisScene.bloomstrength + ' ' + typeof thisScene.getLayer; }",
+            None,
+        );
+        h.frame(0.0, 0.0, 0.016);
+        assert_eq!(change(&mut h).text.as_deref(), Some("true 2.5 function"));
     }
 
     #[test]

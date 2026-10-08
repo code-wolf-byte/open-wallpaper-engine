@@ -1804,6 +1804,17 @@ pub struct GpuSceneInstance {
     /// `input.*` and cursor events.
     cursor_scene: [f32; 2],
     cursor_left_down: bool,
+    /// Left-button transitions since the last frame, in order, so a click
+    /// that starts and ends between two frames still registers.
+    pending_buttons: Vec<bool>,
+    /// Objects with cursor handlers (`cursorClick` & co), hit-tested each
+    /// frame; empty for the vast majority of scenes.
+    cursor_targets: Vec<usize>,
+    /// The handler object under the cursor last frame, and the one a press
+    /// started on (receives the matching `cursorUp`/`cursorClick`).
+    hovered: Option<usize>,
+    pressed: Option<usize>,
+    last_cursor_scene: [f32; 2],
     /// Desktop-audio capture, started only when an effect reads
     /// `g_AudioSpectrum*` (else `None` and the spectrum stays silent). Polled
     /// once per frame into the renderer's `audio_buf`.
@@ -2909,6 +2920,11 @@ impl GpuSceneInstance {
             scripts_want_audio: false,
             cursor_scene: [w as f32 * 0.5, h as f32 * 0.5],
             cursor_left_down: false,
+            pending_buttons: Vec::new(),
+            cursor_targets: Vec::new(),
+            hovered: None,
+            pressed: None,
+            last_cursor_scene: [w as f32 * 0.5, h as f32 * 0.5],
             audio_capture,
             sounds,
             #[cfg(target_os = "linux")]
@@ -2926,6 +2942,9 @@ impl GpuSceneInstance {
         // Hidden ancestors hide their subtree; script-referenced hidden
         // objects are built but start hidden.
         instance.refresh_layer_visibility();
+        instance.cursor_targets = instance
+            .scripts
+            .objects_with_handlers(crate::engine::script::CURSOR_EVENTS);
         Ok(instance)
     }
 
@@ -3430,6 +3449,7 @@ impl GpuSceneInstance {
             self.cursor_screen(),
             self.cursor_left_down,
         );
+        self.dispatch_cursor_events();
         self.scripts
             .frame(time, crate::engine::script::local_time_of_day(), delta);
         let changes = self.scripts.collect();
@@ -3442,6 +3462,78 @@ impl GpuSceneInstance {
             if self.audio_capture.is_none() {
                 self.audio_capture = crate::engine::audio::AudioCapture::start();
             }
+        }
+    }
+
+    /// Fire `cursorEnter`/`Leave`/`Move`/`Down`/`Up`/`Click` on handler
+    /// objects from this frame's pointer state.
+    fn dispatch_cursor_events(&mut self) {
+        let buttons = std::mem::take(&mut self.pending_buttons);
+        if self.cursor_targets.is_empty() {
+            return;
+        }
+        let pos = self.cursor_scene;
+        let hit = self.hit_test(self.mouse_norm);
+        if hit != self.hovered {
+            if let Some(old) = self.hovered {
+                self.scripts.dispatch_cursor(old, "cursorLeave", pos);
+            }
+            if let Some(new) = hit {
+                self.scripts.dispatch_cursor(new, "cursorEnter", pos);
+            }
+            self.hovered = hit;
+        }
+        if pos != self.last_cursor_scene {
+            self.last_cursor_scene = pos;
+            if let Some(h) = hit {
+                self.scripts.dispatch_cursor(h, "cursorMove", pos);
+            }
+            // A drag keeps reporting to the layer it started on.
+            if let Some(p) = self.pressed.filter(|p| Some(*p) != hit) {
+                self.scripts.dispatch_cursor(p, "cursorMove", pos);
+            }
+        }
+        for down in buttons {
+            if down {
+                self.pressed = hit;
+                if let Some(h) = hit {
+                    self.scripts.dispatch_cursor(h, "cursorDown", pos);
+                }
+            } else if let Some(p) = self.pressed.take() {
+                self.scripts.dispatch_cursor(p, "cursorUp", pos);
+                if hit == Some(p) {
+                    self.scripts.dispatch_cursor(p, "cursorClick", pos);
+                }
+            }
+        }
+    }
+
+    /// The topmost cursor-handler object whose quad contains the cursor
+    /// (`norm`: `[0,1]²`, top-left origin). Hidden layers still count:
+    /// real content uses invisible hitboxes that toggle themselves.
+    fn hit_test(&self, norm: [f32; 2]) -> Option<usize> {
+        let (w, h) = (self.width as f32, self.height as f32);
+        // Output pixels, Y-up, origin at the centre — the space `rect` is in.
+        let p = [(norm[0] - 0.5) * w, (0.5 - norm[1]) * h];
+        self.layers
+            .iter()
+            .filter(|l| self.cursor_targets.contains(&l.order_index))
+            .filter(|l| {
+                let corners: [[f32; 2]; 4] = match l.quad_corners {
+                    Some(c) => c.map(|c| [c[0] * w * 0.5, c[1] * h * 0.5]),
+                    None => quad_corners_px(l.rect, l.angle, w, h),
+                };
+                point_in_convex_quad(p, &corners)
+            })
+            .map(|l| l.order_index)
+            .max()
+    }
+
+    /// Record a left-button press or release (from the platform layer).
+    pub fn set_mouse_button(&mut self, left_down: bool) {
+        if left_down != self.cursor_left_down {
+            self.cursor_left_down = left_down;
+            self.pending_buttons.push(left_down);
         }
     }
 
@@ -5926,6 +6018,89 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
     }
 }
 
+/// A layer quad's corners in output pixels (Y-up, centred), from its NDC
+/// `rect` (centre, half-extent) and z-rotation.
+fn quad_corners_px(rect: [f32; 4], angle: f32, w: f32, h: f32) -> [[f32; 2]; 4] {
+    let (cx, cy) = (rect[0] * w * 0.5, rect[1] * h * 0.5);
+    let (hx, hy) = (rect[2] * w * 0.5, rect[3] * h * 0.5);
+    let (s, c) = angle.sin_cos();
+    [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]]
+        .map(|[x, y]| [cx + x * c - y * s, cy + x * s + y * c])
+}
+
+/// Whether `p` lies inside the convex quad `q` (either winding).
+fn point_in_convex_quad(p: [f32; 2], q: &[[f32; 2]; 4]) -> bool {
+    let mut sign = 0.0f32;
+    for i in 0..4 {
+        let a = q[i];
+        let b = q[(i + 1) % 4];
+        let cross = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+        if cross.abs() < f32::EPSILON {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if cross.signum() != sign {
+            return false;
+        }
+    }
+    sign != 0.0
+}
+
+#[cfg(test)]
+mod hit_tests {
+    use super::*;
+
+    #[test]
+    fn hit_test_geometry() {
+        // A 200x100 px quad centred at (100, 50) px in a 1000x500 output.
+        let rect = [0.2, 0.2, 0.2, 0.2];
+        let q = quad_corners_px(rect, 0.0, 1000.0, 500.0);
+        assert!(point_in_convex_quad([100.0, 50.0], &q));
+        assert!(point_in_convex_quad([199.0, 74.0], &q));
+        assert!(!point_in_convex_quad([201.0, 50.0], &q));
+        // Rotated 90°: the long axis is now vertical.
+        let q = quad_corners_px(rect, std::f32::consts::FRAC_PI_2, 1000.0, 500.0);
+        assert!(point_in_convex_quad([100.0, 140.0], &q));
+        assert!(!point_in_convex_quad([190.0, 50.0], &q));
+    }
+    /// End to end against a real Workshop scene with clickable layers
+    /// (2348914357: clicking the radio/music buttons toggles them). Needs
+    /// the item installed and a GPU, hence ignored by default.
+    #[test]
+    #[ignore]
+    fn clicking_a_scripted_button_toggles_it() {
+        let Some(dir) = crate::workshop::find_item_dir("2348914357", None) else {
+            eprintln!("workshop item 2348914357 not installed; skipping");
+            return;
+        };
+        let mut scene = GpuSceneInstance::open(&dir).expect("scene loads");
+        assert!(!scene.cursor_targets.is_empty(), "scene has click targets");
+        scene.render();
+        let target = scene
+            .layers
+            .iter()
+            .find(|l| scene.cursor_targets.contains(&l.order_index))
+            .expect("a click target has a layer");
+        let (idx, before) = (target.order_index, scene.object_visible[target.order_index]);
+        let norm = [(target.rect[0] + 1.0) * 0.5, (1.0 - target.rect[1]) * 0.5];
+        assert_eq!(
+            scene.hit_test(norm),
+            Some(idx),
+            "hit test finds the target at its centre"
+        );
+        scene.set_mouse(norm);
+        scene.render();
+        scene.set_mouse_button(true);
+        scene.set_mouse_button(false);
+        scene.render();
+        assert_eq!(
+            scene.object_visible[idx], !before,
+            "the click toggled the layer"
+        );
+    }
+}
+
 /// Build the scene's SceneScript runtime: one layer proxy per scene object
 /// (indexed like `scene.objects`, the same index `order_index` and the
 /// transform graph use), then one instance per scripted property.
@@ -5946,13 +6121,19 @@ fn build_script_host(
         host = host.with_storage(path);
     }
     // The raw scene.json entries back `thisScene.getInitialLayerConfig`.
-    let raw_objects: Vec<serde_json::Value> =
-        crate::engine::assets::AssetStore::from_directory(dir)
-            .ok()
-            .and_then(|a| a.scene_json().ok())
-            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .and_then(|v| v.get("objects").and_then(|o| o.as_array()).cloned())
-            .unwrap_or_default();
+    let raw_scene: serde_json::Value = crate::engine::assets::AssetStore::from_directory(dir)
+        .ok()
+        .and_then(|a| a.scene_json().ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let raw_objects: Vec<serde_json::Value> = raw_scene
+        .get("objects")
+        .and_then(|o| o.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(general) = raw_scene.get("general") {
+        host.set_scene_general(general);
+    }
 
     let user_props: serde_json::Map<String, serde_json::Value> =
         crate::engine::properties::SceneProperties::from_project_dir(dir)
