@@ -191,6 +191,39 @@ impl WallpaperContent {
 pub struct ScreenContent {
     pub by_output: std::collections::HashMap<String, WallpaperContent>,
     pub default: WallpaperContent,
+    /// Span or clone show `default` from one shared renderer and ignore
+    /// `by_output`.
+    pub layout: ScreenLayout,
+}
+
+/// How a wallpaper covers several monitors (Wallpaper Engine's layout
+/// setting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScreenLayout {
+    /// Each monitor runs its own wallpaper (`screens`, else the default).
+    #[default]
+    PerScreen,
+    /// One wallpaper stretched across the bounding box of all monitors.
+    Span,
+    /// One wallpaper rendered once and shown on every monitor.
+    Clone,
+}
+
+impl ScreenLayout {
+    pub const ALL: [Self; 3] = [Self::PerScreen, Self::Span, Self::Clone];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|l| l.label() == s.trim())
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PerScreen => "per-screen",
+            Self::Span => "span",
+            Self::Clone => "clone",
+        }
+    }
 }
 
 impl ScreenContent {
@@ -201,12 +234,16 @@ impl ScreenContent {
         Self {
             by_output: std::collections::HashMap::new(),
             default: content,
+            layout: ScreenLayout::PerScreen,
         }
     }
 
     /// The content to show on an output with this name (`None` when the
     /// platform can't identify the output, e.g. no xdg-output support).
     pub fn resolve(&self, output_name: Option<&str>) -> WallpaperContent {
+        if self.layout != ScreenLayout::PerScreen {
+            return self.default.clone();
+        }
         output_name
             .and_then(|name| self.by_output.get(name))
             .cloned()
@@ -246,6 +283,7 @@ mod tests {
         let content = ScreenContent {
             by_output,
             default: scene("default"),
+            layout: ScreenLayout::PerScreen,
         };
 
         assert_eq!(scene_dir(&content.resolve(Some("DP-1"))), "dp1-wallpaper");
@@ -264,9 +302,19 @@ mod tests {
         let content = ScreenContent {
             by_output,
             default: scene("default"),
+            layout: ScreenLayout::PerScreen,
         };
 
         assert_eq!(scene_dir(&content.resolve(Some("DP-1"))), "wallpaper-a");
         assert_eq!(scene_dir(&content.resolve(Some("HDMI-1"))), "wallpaper-b");
+    }
+
+    #[test]
+    fn span_and_clone_show_the_default_everywhere() {
+        let mut content = ScreenContent::single(scene("default"));
+        content.by_output.insert("DP-1".into(), scene("dp1"));
+        content.layout = ScreenLayout::Span;
+        assert_eq!(scene_dir(&content.resolve(Some("DP-1"))), "default");
+        assert_eq!(ScreenLayout::parse("clone"), Some(ScreenLayout::Clone));
     }
 }

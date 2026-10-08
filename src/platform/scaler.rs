@@ -155,7 +155,24 @@ impl GpuScaler {
         quality: RenderQuality,
         mode: crate::render::ScaleMode,
     ) -> Vec<u8> {
-        let uv = mode.uv_transform((src.width(), src.height()), (dst_w, dst_h));
+        let full = crate::render::settings::FULL_REGION;
+        self.scale_region(src, dst_w, dst_h, quality, mode, (dst_w, dst_h), full)
+    }
+
+    /// [`scale`](Self::scale) for one monitor's `region` of a spanned
+    /// `canvas` (see `ScaleMode::uv_transform_region`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn scale_region(
+        &self,
+        src: &RgbaImage,
+        dst_w: u32,
+        dst_h: u32,
+        quality: RenderQuality,
+        mode: crate::render::ScaleMode,
+        canvas: (u32, u32),
+        region: [f32; 4],
+    ) -> Vec<u8> {
+        let uv = mode.uv_transform_region((src.width(), src.height()), canvas, region);
         let scale = quality.source_scale();
         let downsampled: Option<RgbaImage> = if scale < 1.0 {
             let sw = ((src.width() as f32) * scale).max(1.0) as u32;

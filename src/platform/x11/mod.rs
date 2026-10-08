@@ -470,7 +470,22 @@ fn wallpaper_loop(
     let gpu_scaler = platform::GpuScaler::from_device(gpu)
         .map_err(|e| anyhow!("GPU scaler init failed: {e}"))?;
 
-    let named_outputs = discover_outputs(&conn, root, root_w, root_h);
+    // Span: one renderer over the whole root window, which already is the
+    // bounding box of every monitor. ponytail: clone still runs one
+    // renderer per monitor here; share one if the duplicate work matters.
+    let named_outputs = if content.layout == crate::render::ScreenLayout::Span {
+        vec![NamedOutput {
+            name: None,
+            rect: OutputRect {
+                x: 0,
+                y: 0,
+                width: root_w,
+                height: root_h,
+            },
+        }]
+    } else {
+        discover_outputs(&conn, root, root_w, root_h)
+    };
     tracing::info!(
         target: "wallpaper",
         "X11 root pixmap {root_w}x{root_h}, depth {depth}, {} output(s)",

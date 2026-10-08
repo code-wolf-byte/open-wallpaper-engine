@@ -241,6 +241,10 @@ enum ConfigAction {
     /// How video, image and web wallpapers fit the screen: fill (crop,
     /// default), fit (black bars), stretch, or center
     SetScaling { mode: String },
+    /// How one wallpaper covers several monitors: per-screen (default; see
+    /// set-screen), span (stretched across all of them) or clone (the same
+    /// picture on each)
+    SetLayout { layout: String },
 }
 
 fn main() {
@@ -679,6 +683,16 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
             })?;
             settings.scaling = Some(m);
             println!("Scaling: {}", m.label());
+        }
+        ConfigAction::SetLayout { layout } => {
+            let l = wp_engine::render::ScreenLayout::parse(&layout).ok_or_else(|| {
+                anyhow!("invalid layout '{layout}' (expected per-screen, span or clone)")
+            })?;
+            settings.layout = Some(l);
+            println!(
+                "Layout: {} (applies the next time a wallpaper is set)",
+                l.label()
+            );
         }
         ConfigAction::SetFps { fps } => {
             if !(1..=240).contains(&fps) {

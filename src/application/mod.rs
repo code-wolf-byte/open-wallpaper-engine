@@ -73,7 +73,13 @@ impl WallpaperApplication {
                 }
             }
         }
-        Ok(ScreenContent { by_output, default })
+        Ok(ScreenContent {
+            by_output,
+            default,
+            layout: crate::settings::WpSettings::load()
+                .layout
+                .unwrap_or_default(),
+        })
     }
 
     /// The [`ScreenSettings`] twin of `resolve_screen_content` — `screen_

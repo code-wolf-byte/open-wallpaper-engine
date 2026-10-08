@@ -5294,17 +5294,25 @@ impl GpuSceneInstance {
         format: wgpu::TextureFormat,
     ) {
         self.render();
+        let full = crate::render::settings::FULL_REGION;
+        self.present_region(view, format, (view_w, view_h), full);
+    }
 
-        // Aspect-fill (cover): sample a centered sub-rect of the scene.
-        let scene_aspect = self.width as f32 / self.height as f32;
-        let view_aspect = view_w.max(1) as f32 / view_h.max(1) as f32;
-        let (uv_scale, uv_offset) = if view_aspect >= scene_aspect {
-            let sy = scene_aspect / view_aspect;
-            ([1.0f32, sy], [0.0f32, (1.0 - sy) * 0.5])
-        } else {
-            let sx = view_aspect / scene_aspect;
-            ([sx, 1.0f32], [(1.0 - sx) * 0.5, 0.0f32])
-        };
+    /// Blit the last rendered frame into `view`, which shows `region` of a
+    /// `canvas` the scene is aspect-filled into (a spanned or cloned
+    /// wallpaper renders once and presents to every monitor this way).
+    pub fn present_region(
+        &mut self,
+        view: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        canvas: (u32, u32),
+        region: [f32; 4],
+    ) {
+        let (uv_scale, uv_offset) = crate::render::ScaleMode::Fill.uv_transform_region(
+            (self.width, self.height),
+            canvas,
+            region,
+        );
         let mut params = [0u8; 16];
         params[0..4].copy_from_slice(&uv_scale[0].to_le_bytes());
         params[4..8].copy_from_slice(&uv_scale[1].to_le_bytes());
