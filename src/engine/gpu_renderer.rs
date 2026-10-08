@@ -1688,6 +1688,9 @@ struct SceneLayerGpu {
     pending_text: Option<String>,
     text_rastered_at: Option<Instant>,
     text_raster_cost: Duration,
+    /// Composition/fullscreen layer: `frames[0]` is refilled each frame
+    /// with the scene drawn beneath it (see `capture_backdrop`).
+    backdrop: Option<crate::engine::render::Backdrop>,
     /// Spritesheet frame a script picked (`getTextureAnimation().setFrame`),
     /// overriding the timed animation.
     script_frame: Option<usize>,
@@ -3370,6 +3373,54 @@ impl GpuSceneInstance {
         }
     }
 
+    /// For a composition/fullscreen layer, copy the scene drawn so far under
+    /// its quad into its texture, so its effects process the backdrop.
+    fn capture_backdrop(&self, encoder: &mut wgpu::CommandEncoder, layer_idx: usize) {
+        let layer = &self.layers[layer_idx];
+        if layer.backdrop.is_none() {
+            return;
+        }
+        let dst = &layer.frames[0];
+        let (w, h) = (self.width as i64, self.height as i64);
+        // Quad → target pixels (texture rows run top-down).
+        let x0 = (((layer.rect[0] - layer.rect[2]) + 1.0) * 0.5 * w as f32).round() as i64;
+        let y0 = ((1.0 - (layer.rect[1] + layer.rect[3])) * 0.5 * h as f32).round() as i64;
+        let (sx, sy) = (x0.max(0), y0.max(0));
+        let (dx, dy) = (sx - x0, sy - y0);
+        let cw = (dst.width() as i64 - dx).min(w - sx);
+        let ch = (dst.height() as i64 - dy).min(h - sy);
+        if cw <= 0 || ch <= 0 {
+            return;
+        }
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.target,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: sx as u32,
+                    y: sy as u32,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: dst,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: dx as u32,
+                    y: dy as u32,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: cw as u32,
+                height: ch as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     /// Advance keyframe animations and apply the properties they move.
     fn tick_timelines(&mut self, delta: f32) {
         use crate::engine::script::{ObjectChange, ScriptChanges};
@@ -4328,6 +4379,7 @@ impl GpuSceneInstance {
         time: f32,
         dynamics: CameraFrameDynamics,
     ) {
+        self.capture_backdrop(encoder, layer_idx);
         {
             let layer = &self.layers[layer_idx];
             let frame_idx = if let Some(f) = layer.script_frame {
@@ -6281,7 +6333,7 @@ fn gpu_layer_from(
         .collect();
     // Textures stay at native resolution; the composite quad and
     // sampler handle scaling to the object's on-screen size.
-    let frames: Vec<wgpu::Texture> = all_frames
+    let mut frames: Vec<wgpu::Texture> = all_frames
         .iter()
         .map(|frame| renderer.upload_texture(frame))
         .collect();
@@ -6327,6 +6379,15 @@ fn gpu_layer_from(
         (rect, l.angle, 0.0, None)
     };
 
+    // A backdrop layer's texture is a copy of the scene under its quad,
+    // sized to that on-screen region.
+    if l.backdrop.is_some() {
+        let px = (
+            ((rect[2] * w as f32).round() as u32).clamp(1, w.max(1)),
+            ((rect[3] * h as f32).round() as u32).clamp(1, h.max(1)),
+        );
+        frames = vec![renderer.create_render_target(px.0, px.1)];
+    }
     SceneLayerGpu {
         frames,
         puppet: l.puppet.clone(),
@@ -6352,6 +6413,7 @@ fn gpu_layer_from(
         effective_size,
         align_offset: std::array::from_fn(|i| l.local_origin[i] - authored_origin[i]),
         script_frame: None,
+        backdrop: l.backdrop,
         pending_text: None,
         text_rastered_at: None,
         text_raster_cost: Duration::ZERO,

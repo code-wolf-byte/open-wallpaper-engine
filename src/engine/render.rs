@@ -133,7 +133,19 @@ pub struct TextDynamic {
     pub last_text: String,
 }
 
+/// What a backdrop layer captures each frame (see `backdrop_layer_from_object`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backdrop {
+    /// The scene beneath the layer's own quad (composition layer).
+    Region,
+    /// The whole scene (fullscreen / projection layer).
+    FullScene,
+}
+
 pub struct Layer {
+    /// `Some` for composition/fullscreen layers, whose texture is the scene
+    /// beneath them rather than an image.
+    pub backdrop: Option<Backdrop>,
     pub name: String,
     pub image: RgbaImage,
     /// Additional animation frames (frame 0 is `image`). Empty = not animated.
@@ -365,7 +377,12 @@ impl ResolvedScene {
                     LoadedImage::single(white_pixel())
                 }
                 Some(path) => {
-                    if is_special_layer(path) {
+                    if let Some(mut layer) = backdrop_layer_from_object(obj, path) {
+                        if layer.size[0] == 0.0 || layer.size[1] == 0.0 {
+                            solid_indices.push(layers.len());
+                        }
+                        layer.order_index = obj_index;
+                        layers.push(layer);
                         continue;
                     }
                     match load_texture_from_dir(dir, path) {
@@ -465,7 +482,12 @@ impl ResolvedScene {
                     LoadedImage::single(white_pixel())
                 }
                 Some(path) => {
-                    if is_special_layer(path) {
+                    if let Some(mut layer) = backdrop_layer_from_object(obj, path) {
+                        if layer.size[0] == 0.0 || layer.size[1] == 0.0 {
+                            solid_indices.push(layers.len());
+                        }
+                        layer.order_index = obj_index;
+                        layers.push(layer);
                         continue;
                     }
                     match load_texture_from_pkg(pkg, path).or_else(|pkg_err| {
@@ -569,7 +591,12 @@ impl ResolvedScene {
                     LoadedImage::single(white_pixel())
                 }
                 Some(path) => {
-                    if is_special_layer(path) {
+                    if let Some(mut layer) = backdrop_layer_from_object(obj, path) {
+                        if layer.size[0] == 0.0 || layer.size[1] == 0.0 {
+                            solid_indices.push(layers.len());
+                        }
+                        layer.order_index = obj_index;
+                        layers.push(layer);
                         continue;
                     }
                     match load_texture_from_pkg(pkg, path) {
@@ -862,7 +889,7 @@ pub fn runtime_layer(dir: &Path, pkg: Option<&Package>, obj: &SceneObject) -> Op
     }
     let path = obj.image.as_deref()?;
     if is_special_layer(path) {
-        return None;
+        return backdrop_layer_from_object(obj, path);
     }
     let resolved_path = resolve_workshop_asset(dir, pkg, path);
     let path = resolved_path.as_str();
@@ -1058,6 +1085,7 @@ fn layer_from_object(
     };
 
     Layer {
+        backdrop: None,
         name: obj.name.clone().unwrap_or_default(),
         image: loaded.image,
         extra_frames: loaded.extra_frames,
@@ -2572,6 +2600,35 @@ fn white_pixel() -> RgbaImage {
 /// no effects is a script/cursor holder ("Player Options" in 2988724897);
 /// stretching its opaque white over the scene hides the whole wallpaper, so
 /// callers only register those that carry effects.
+/// Composition (`composelayer`), fullscreen (`fullscreenlayer`) and
+/// projection (`projectlayer`) layers have no image of their own: their
+/// texture is the scene already drawn beneath them — the region under the
+/// layer for a composition layer, the whole scene otherwise — which their
+/// effects then process (audio bars, fisheye, colour grading, blur…).
+/// Built with a placeholder image; the live renderer captures the backdrop
+/// each frame. Fullscreen and projection layers (and composition layers
+/// without a size) are sized to the scene by `fill_solid_layer_sizes`.
+fn backdrop_layer_from_object(obj: &SceneObject, path: &str) -> Option<Layer> {
+    let p = path.to_lowercase();
+    let kind = if p.contains("composelayer") {
+        Backdrop::Region
+    } else if p.contains("fullscreenlayer") || p.contains("projectlayer") {
+        Backdrop::FullScene
+    } else {
+        return None;
+    };
+    let mut layer = layer_from_object(
+        obj,
+        LoadedImage::single(RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]))),
+        None,
+    );
+    if kind == Backdrop::FullScene {
+        layer.size = [0.0, 0.0, 0.0];
+    }
+    layer.backdrop = Some(kind);
+    Some(layer)
+}
+
 fn fill_solid_layer_sizes(layers: &mut [Layer], solid_indices: &[usize], width: u32, height: u32) {
     for &i in solid_indices {
         if layers[i].size[0] == 0.0 && layers[i].size[1] == 0.0 {
@@ -2583,6 +2640,29 @@ fn fill_solid_layer_sizes(layers: &mut [Layer], solid_indices: &[usize], width: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_and_fullscreen_objects_become_backdrop_layers() {
+        let objs: Vec<SceneObject> = serde_json::from_str(
+            r#"[{"image": "models/util/composelayer.json", "size": "200 100"},
+                {"image": "models/util/fullscreenlayer.json", "size": "200 100"},
+                {"image": "models/util/projectlayer.json"},
+                {"image": "models/other.json"}]"#,
+        )
+        .unwrap();
+        let a = backdrop_layer_from_object(&objs[0], objs[0].image.as_deref().unwrap()).unwrap();
+        assert_eq!(a.backdrop, Some(Backdrop::Region));
+        assert_eq!([a.size[0], a.size[1]], [200.0, 100.0]);
+        let b = backdrop_layer_from_object(&objs[1], objs[1].image.as_deref().unwrap()).unwrap();
+        assert_eq!(b.backdrop, Some(Backdrop::FullScene));
+        assert_eq!(
+            [b.size[0], b.size[1]],
+            [0.0, 0.0],
+            "sized to the scene later"
+        );
+        assert!(backdrop_layer_from_object(&objs[2], "models/util/projectlayer.json").is_some());
+        assert!(backdrop_layer_from_object(&objs[3], "models/other.json").is_none());
+    }
 
     /// Untextured mesh materials are common in real content
     /// (`"textures": [null,null,null]`), and their flat `color` is the only
@@ -2756,6 +2836,7 @@ mod tests {
         let red_image = RgbaImage::from_pixel(100, 100, image::Rgba([255, 0, 0, 255]));
 
         let layers = vec![Layer {
+            backdrop: None,
             local_origin: [0.0; 3],
             local_scale: [1.0; 3],
             local_angles: [0.0; 3],
