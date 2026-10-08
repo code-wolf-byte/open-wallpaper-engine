@@ -21,9 +21,11 @@ use smithay_client_toolkit::{
     shell::WaylandSurface,
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::{mpsc::SyncSender, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -161,6 +163,40 @@ fn build_content_renderer(
     })
 }
 
+/// A surface's renderer. Span and clone layouts give every surface the
+/// same one, so it renders once per frame and each surface presents its
+/// part.
+struct Shared {
+    content: ContentRenderer,
+    /// When `content` last rendered a frame, and that frame read back for
+    /// the SHM path, so other surfaces sharing it within the same frame
+    /// reuse it.
+    rendered_at: Option<Instant>,
+    readback: Option<Arc<image::RgbaImage>>,
+}
+
+type SharedRenderer = Rc<RefCell<Shared>>;
+
+fn shared(content: ContentRenderer) -> SharedRenderer {
+    Rc::new(RefCell::new(Shared {
+        content,
+        rendered_at: None,
+        readback: None,
+    }))
+}
+
+impl Shared {
+    /// Whether to render a new frame now: always for a renderer of its own;
+    /// once per half frame interval for one shared by several surfaces.
+    fn due(&mut self, sharers: usize, interval: Duration) -> bool {
+        let due = sharers <= 1 || self.rendered_at.is_none_or(|t| t.elapsed() >= interval / 2);
+        if due {
+            self.rendered_at = Some(Instant::now());
+        }
+        due
+    }
+}
+
 // ── Internal renderer state ───────────────────────────────────────────────────
 
 /// GPU presentation state for one output surface.
@@ -181,10 +217,14 @@ struct WallpaperSurface {
     height: u32,
     /// Previous frame's SHM pool — kept alive until compositor releases the buffer.
     pool: Option<SlotPool>,
-    /// This output's own independent content — resolved from `ScreenContent`
-    /// by output name at `new_output` time, so different outputs can show
-    /// different wallpapers instead of one renderer shared by every surface.
-    renderer: ContentRenderer,
+    /// This output's content — resolved from `ScreenContent` by output name
+    /// at `new_output` time, so different outputs can show different
+    /// wallpapers; one renderer shared by every surface in span and clone
+    /// layouts.
+    renderer: SharedRenderer,
+    output: wl_output::WlOutput,
+    /// The output's logical rectangle (x, y, w, h), for its share of a span.
+    rect: Option<(i32, i32, i32, i32)>,
     /// This output's own independent `RenderSettings` — resolved from
     /// `ScreenSettings` the same way `renderer` is, so a heavy scene on one
     /// monitor can't force every other monitor's quality down with it.
@@ -282,7 +322,10 @@ impl WallpaperState {
     fn ensure_gpu_surface(&mut self, idx: usize) {
         if !self.allow_gpu_surface
             || self.surfaces[idx].gpu_failed
-            || !matches!(self.surfaces[idx].renderer, ContentRenderer::Scene(_))
+            || !matches!(
+                self.surfaces[idx].renderer.borrow().content,
+                ContentRenderer::Scene(_)
+            )
         {
             return;
         }
@@ -373,6 +416,21 @@ impl WallpaperState {
         })
     }
 
+    /// The canvas surface `idx` shows part of, and which part (normalized
+    /// `[x, y, w, h]`): its share of all outputs' bounding box in a span,
+    /// otherwise its whole self.
+    fn view_of(&self, idx: usize) -> ((u32, u32), [f32; 4]) {
+        let s = &self.surfaces[idx];
+        let own = ((s.width, s.height), crate::render::settings::FULL_REGION);
+        if self.content.layout != crate::render::ScreenLayout::Span {
+            return own;
+        }
+        match s.rect {
+            Some(rect) => span_region(rect, self.surfaces.iter().filter_map(|s| s.rect)),
+            None => own,
+        }
+    }
+
     fn draw_at(&mut self, idx: usize) {
         if self.surfaces[idx].width == 0 || self.surfaces[idx].height == 0 {
             return;
@@ -400,7 +458,7 @@ impl WallpaperState {
         let fps = self.surfaces[idx].settings.lock().unwrap().fps;
         if self.surfaces[idx].web_fps != fps {
             self.surfaces[idx].web_fps = fps;
-            if let ContentRenderer::Frames(fs) = &self.surfaces[idx].renderer {
+            if let ContentRenderer::Frames(fs) = &self.surfaces[idx].renderer.borrow().content {
                 if let Some(tx) = fs.web_input() {
                     let _ = tx.try_send(crate::render::web::WebInputEvent::Fps(fps));
                 }
@@ -443,10 +501,8 @@ impl WallpaperState {
     /// Direct GPU presentation: render the scene straight into the acquired
     /// surface texture — no CPU readback, no SHM copy.
     fn draw_gpu(&mut self, idx: usize) {
-        let (width, height) = (self.surfaces[idx].width, self.surfaces[idx].height);
-
         // Request the next frame callback before present() commits the surface.
-        if self.surfaces[idx].renderer.is_animated() {
+        if self.surfaces[idx].renderer.borrow().content.is_animated() {
             if let Some(qh) = &self.qh {
                 let wl_surf = self.surfaces[idx].layer.wl_surface();
                 wl_surf.frame(qh, wl_surf.clone());
@@ -486,13 +542,22 @@ impl WallpaperState {
 
         let view = frame.texture.create_view(&Default::default());
         let format = self.surfaces[idx].gpu.as_ref().unwrap().format;
-        match &mut self.surfaces[idx].renderer {
+        let (canvas, region) = self.view_of(idx);
+        let interval = self.surfaces[idx].settings.lock().unwrap().frame_interval();
+        let sharers = Rc::strong_count(&self.surfaces[idx].renderer);
+        let mut r = self.surfaces[idx].renderer.borrow_mut();
+        let due = r.due(sharers, interval);
+        match &mut r.content {
             ContentRenderer::Scene(instance) => {
-                instance.render_to_view(&view, width, height, format);
+                if due {
+                    instance.render();
+                }
+                instance.present_region(&view, format, canvas, region);
             }
             // GPU surfaces are only created for scene renderers.
             ContentRenderer::Frames(_) => return,
         }
+        drop(r);
         frame.present();
     }
 
@@ -502,35 +567,27 @@ impl WallpaperState {
         let width = self.surfaces[idx].width;
         let height = self.surfaces[idx].height;
 
-        let frame: Arc<image::RgbaImage> = match &mut self.surfaces[idx].renderer {
-            ContentRenderer::Frames(fs) => Arc::clone(fs.current_frame()),
-            ContentRenderer::Scene(instance) => match instance.render_rgba() {
-                Ok(img) => Arc::new(img),
-                Err(e) => {
-                    tracing::error!(target: "wallpaper", "scene readback failed: {e}");
-                    return;
-                }
-            },
+        let interval = self.surfaces[idx].settings.lock().unwrap().frame_interval();
+        let sharers = Rc::strong_count(&self.surfaces[idx].renderer);
+        let frame: Arc<image::RgbaImage> = {
+            let mut r = self.surfaces[idx].renderer.borrow_mut();
+            let due = r.due(sharers, interval) || r.readback.is_none();
+            match &mut r.content {
+                ContentRenderer::Frames(fs) => Arc::clone(fs.current_frame()),
+                ContentRenderer::Scene(_) if !due => Arc::clone(r.readback.as_ref().unwrap()),
+                ContentRenderer::Scene(instance) => match instance.render_rgba() {
+                    Ok(img) => {
+                        let img = Arc::new(img);
+                        r.readback = Some(Arc::clone(&img));
+                        img
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "wallpaper", "scene readback failed: {e}");
+                        return;
+                    }
+                },
+            }
         };
-        {
-            let raw = frame.as_raw();
-            let (fw, fh) = (frame.width() as usize, frame.height() as usize);
-            let sample = |xf: f64, yf: f64| -> Option<[u8; 4]> {
-                let x = ((fw as f64) * xf) as usize;
-                let y = ((fh as f64) * yf) as usize;
-                let off = (y * fw + x) * 4;
-                raw.get(off..off + 4).map(|s| [s[0], s[1], s[2], s[3]])
-            };
-            eprintln!(
-                "DIAG draw_shm idx={idx} frame={fw}x{fh} corners tl={:?} tr={:?} bl={:?} br={:?} mid={:?}",
-                sample(0.05, 0.05),
-                sample(0.95, 0.05),
-                sample(0.05, 0.95),
-                sample(0.95, 0.95),
-                sample(0.5, 0.5),
-            );
-        }
-
         let row_bytes = width as usize * 4;
         let stride = row_bytes;
         let active_len = stride * height as usize;
@@ -559,15 +616,22 @@ impl WallpaperState {
             let s = self.surfaces[idx].settings.lock().unwrap();
             (s.quality, s.scaling)
         };
-        // Scenes size themselves to the output already; the fit modes are
-        // for video, image and web content.
-        let mode = match &self.surfaces[idx].renderer {
-            ContentRenderer::Scene(_) => crate::render::ScaleMode::Stretch,
+        // Scenes fill the screen, as on the direct GPU path; the fit modes
+        // are for video, image and web content.
+        let mode = match &self.surfaces[idx].renderer.borrow().content {
+            ContentRenderer::Scene(_) => crate::render::ScaleMode::Fill,
             ContentRenderer::Frames(_) => scaling,
         };
-        let pixels = self
-            .gpu_scaler
-            .scale(frame.as_ref(), width, height, quality, mode);
+        let (span, region) = self.view_of(idx);
+        let pixels = self.gpu_scaler.scale_region(
+            frame.as_ref(),
+            width,
+            height,
+            quality,
+            mode,
+            span,
+            region,
+        );
         if pixels.len() != active_len {
             tracing::error!(
                 target: "wallpaper",
@@ -588,7 +652,7 @@ impl WallpaperState {
         // animated sources. The callback fires after the compositor presents
         // this frame, at which point we advance to the next frame and draw again.
         // Static sources draw once on configure and never request more callbacks.
-        if self.surfaces[idx].renderer.is_animated() {
+        if self.surfaces[idx].renderer.borrow().content.is_animated() {
             if let Some(qh) = &self.qh {
                 wl_surf.frame(qh, wl_surf.clone());
             }
@@ -794,7 +858,9 @@ impl CompositorHandler for WallpaperState {
             .position(|s| s.layer.wl_surface() == surface);
         if let Some(idx) = idx {
             self.qh = Some(qh.clone());
-            if let ContentRenderer::Frames(fs) = &mut self.surfaces[idx].renderer {
+            if let ContentRenderer::Frames(fs) =
+                &mut self.surfaces[idx].renderer.borrow_mut().content
+            {
                 fs.try_advance();
             }
             self.draw_at(idx);
@@ -842,13 +908,21 @@ impl OutputHandler for WallpaperState {
         let per_screen = output_name
             .as_deref()
             .is_some_and(|name| self.content.by_output.contains_key(name));
-        let renderer = match build_content_renderer(
-            resolved,
-            self.device.clone(),
-            self.queue.clone(),
-            self.allow_gpu_surface,
-            web,
-        ) {
+        // Span and clone: every output shows the first one's renderer.
+        // ponytail: a spanned web page renders at the first output's size.
+        let existing = (self.content.layout != crate::render::ScreenLayout::PerScreen)
+            .then(|| self.surfaces.first().map(|s| Rc::clone(&s.renderer)))
+            .flatten();
+        let renderer = match existing.map(Ok).unwrap_or_else(|| {
+            build_content_renderer(
+                resolved,
+                self.device.clone(),
+                self.queue.clone(),
+                self.allow_gpu_surface,
+                web,
+            )
+            .map(shared)
+        }) {
             Ok(r) => r,
             Err(e) => {
                 // Don't take down every other (working) output over one
@@ -863,8 +937,13 @@ impl OutputHandler for WallpaperState {
         tracing::info!(
             target: "wallpaper",
             "output {output_name:?}: {} wallpaper",
-            if per_screen { "per-screen" } else { "default" }
+            match self.content.layout {
+                crate::render::ScreenLayout::PerScreen if per_screen => "per-screen",
+                crate::render::ScreenLayout::PerScreen => "default",
+                l => l.label(),
+            }
         );
+        let rect = info.as_ref().and_then(output_rect);
 
         let wl_surface = self.compositor_state.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(
@@ -890,6 +969,8 @@ impl OutputHandler for WallpaperState {
             height: 0,
             pool: None,
             renderer,
+            output,
+            rect,
             settings,
             output_name,
             last_draw: None,
@@ -898,7 +979,21 @@ impl OutputHandler for WallpaperState {
         });
     }
 
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        let rect = self
+            .output_state
+            .info(&output)
+            .as_ref()
+            .and_then(output_rect);
+        for s in self.surfaces.iter_mut().filter(|s| s.output == output) {
+            s.rect = rect;
+        }
+    }
 
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
@@ -972,6 +1067,41 @@ impl SeatHandler for WallpaperState {
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 }
 
+/// The bounding box of `all` output rectangles, and `rect`'s normalized
+/// `[x, y, w, h]` within it.
+fn span_region(
+    (x, y, w, h): (i32, i32, i32, i32),
+    all: impl Iterator<Item = (i32, i32, i32, i32)> + Clone,
+) -> ((u32, u32), [f32; 4]) {
+    let x0 = all.clone().map(|r| r.0).min().unwrap_or(x).min(x);
+    let y0 = all.clone().map(|r| r.1).min().unwrap_or(y).min(y);
+    let x1 = all
+        .clone()
+        .map(|r| r.0 + r.2)
+        .max()
+        .unwrap_or(x + w)
+        .max(x + w);
+    let y1 = all.map(|r| r.1 + r.3).max().unwrap_or(y + h).max(y + h);
+    let (bw, bh) = ((x1 - x0).max(1), (y1 - y0).max(1));
+    (
+        (bw as u32, bh as u32),
+        [
+            (x - x0) as f32 / bw as f32,
+            (y - y0) as f32 / bh as f32,
+            w as f32 / bw as f32,
+            h as f32 / bh as f32,
+        ],
+    )
+}
+
+/// An output's logical rectangle `(x, y, w, h)` in the compositor's global
+/// space.
+fn output_rect(info: &smithay_client_toolkit::output::OutputInfo) -> Option<(i32, i32, i32, i32)> {
+    let (x, y) = info.logical_position?;
+    let (w, h) = info.logical_size?;
+    Some((x, y, w, h))
+}
+
 /// Linux evdev button codes (`linux/input-event-codes.h`) — what
 /// `PointerEventKind::Press`/`Release`'s raw `button` field actually carries.
 const BTN_LEFT: u32 = 0x110;
@@ -1021,9 +1151,12 @@ impl PointerHandler for WallpaperState {
                 continue;
             }
 
-            let norm = pointer_norm(event.position, surface.width, surface.height);
+            // Into the shared canvas when this output shows part of a span.
+            let n = pointer_norm(event.position, surface.width, surface.height);
+            let (_, r) = self.view_of(idx);
+            let norm = [r[0] + n[0] * r[2], r[1] + n[1] * r[3]];
 
-            match &mut self.surfaces[idx].renderer {
+            match &mut self.surfaces[idx].renderer.borrow_mut().content {
                 // ponytail: only tracks while the cursor is over our own
                 // layer surface. The reference additionally queries
                 // Hyprland's IPC socket for a global cursor when another
@@ -1286,17 +1419,26 @@ impl WallpaperState {
         if action == PlaybackAction::Stop && !self.stopped {
             self.stopped = true;
             for s in &mut self.surfaces {
-                let still = match &s.renderer {
+                let mut r = s.renderer.borrow_mut();
+                let still = match &r.content {
                     ContentRenderer::Frames(fs) => Arc::clone(fs.current_frame()),
                     ContentRenderer::Scene(_) => Arc::new(image::RgbaImage::new(1, 1)),
                 };
+                r.content = ContentRenderer::Frames(FrameSource::Static(still));
+                r.readback = None;
+                drop(r);
                 s.gpu = None;
-                s.renderer = ContentRenderer::Frames(FrameSource::Static(still));
             }
             tracing::info!(target: "wallpaper", "playback stopped; renderers released");
         } else if action != PlaybackAction::Stop && self.stopped {
             self.stopped = false;
+            let one_renderer = self.content.layout != crate::render::ScreenLayout::PerScreen;
             for i in 0..self.surfaces.len() {
+                self.surfaces[i].gpu_failed = false;
+                // Span and clone surfaces share surface 0's renderer.
+                if one_renderer && i > 0 {
+                    continue;
+                }
                 let resolved = self
                     .content
                     .resolve(self.surfaces[i].output_name.as_deref());
@@ -1314,10 +1456,7 @@ impl WallpaperState {
                     self.allow_gpu_surface,
                     web,
                 ) {
-                    Ok(r) => {
-                        self.surfaces[i].renderer = r;
-                        self.surfaces[i].gpu_failed = false;
-                    }
+                    Ok(r) => self.surfaces[i].renderer.borrow_mut().content = r,
                     Err(e) => tracing::error!(target: "wallpaper", "resuming output {i}: {e}"),
                 }
             }
@@ -1329,7 +1468,7 @@ impl WallpaperState {
     /// Send `event` to every output showing a web wallpaper.
     fn notify_web(&self, event: crate::render::web::WebInputEvent) {
         for s in &self.surfaces {
-            if let ContentRenderer::Frames(fs) = &s.renderer {
+            if let ContentRenderer::Frames(fs) = &s.renderer.borrow().content {
                 if let Some(tx) = fs.web_input() {
                     let _ = tx.try_send(event);
                 }
@@ -1352,7 +1491,7 @@ impl WallpaperState {
             self.notify_web(crate::render::web::WebInputEvent::Paused(false));
             self.paused = false;
             for idx in 0..self.surfaces.len() {
-                if self.surfaces[idx].renderer.is_animated() {
+                if self.surfaces[idx].renderer.borrow().content.is_animated() {
                     self.draw_at(idx);
                 }
             }
@@ -1364,7 +1503,20 @@ impl WallpaperState {
 
 #[cfg(test)]
 mod tests {
-    use super::{pointer_norm, web_mouse_button, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
+    use super::{pointer_norm, span_region, web_mouse_button, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
+
+    #[test]
+    fn span_regions_split_the_bounding_box() {
+        // 1080p beside a 1440p monitor that sits 360 px higher.
+        let left = (0, 360, 1920, 1080);
+        let right = (1920, 0, 2560, 1440);
+        let all = [left, right];
+        let (canvas, r) = span_region(left, all.iter().copied());
+        assert_eq!(canvas, (4480, 1440));
+        assert_eq!(r, [0.0, 0.25, 1920.0 / 4480.0, 0.75]);
+        let (_, r) = span_region(right, all.iter().copied());
+        assert_eq!(r, [1920.0 / 4480.0, 0.0, 2560.0 / 4480.0, 1.0]);
+    }
 
     #[test]
     fn pointer_norm_is_top_origin_and_clamped() {

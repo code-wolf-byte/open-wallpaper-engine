@@ -70,6 +70,27 @@ impl ScaleMode {
     }
 }
 
+impl ScaleMode {
+    /// [`uv_transform`](Self::uv_transform) for a view showing only
+    /// `region` (`[x, y, w, h]`, normalized) of a `canvas` the source is
+    /// fitted to — one monitor's share of a spanned wallpaper.
+    pub fn uv_transform_region(
+        self,
+        src: (u32, u32),
+        canvas: (u32, u32),
+        region: [f32; 4],
+    ) -> ([f32; 2], [f32; 2]) {
+        let (s, o) = self.uv_transform(src, canvas);
+        (
+            [s[0] * region[2], s[1] * region[3]],
+            [o[0] + s[0] * region[0], o[1] + s[1] * region[1]],
+        )
+    }
+}
+
+/// The whole canvas, for [`ScaleMode::uv_transform_region`].
+pub const FULL_REGION: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
 /// The frame-rate cap when none is configured.
 pub const DEFAULT_FPS: u32 = 30;
 
@@ -87,6 +108,23 @@ impl Default for RenderSettings {
 #[cfg(test)]
 mod scale_tests {
     use super::*;
+
+    #[test]
+    fn a_region_shows_its_part_of_the_canvas() {
+        // A 32:9 video spanned over two 16:9 monitors: the left one shows
+        // exactly the left half.
+        let (s, o) =
+            ScaleMode::Fill.uv_transform_region((3840, 1080), (3840, 1080), [0.0, 0.0, 0.5, 1.0]);
+        assert_eq!((s, o), ([0.5, 1.0], [0.0, 0.0]));
+        let (s, o) =
+            ScaleMode::Fill.uv_transform_region((3840, 1080), (3840, 1080), [0.5, 0.0, 0.5, 1.0]);
+        assert_eq!((s, o), ([0.5, 1.0], [0.5, 0.0]));
+        // The full region is the plain transform.
+        assert_eq!(
+            ScaleMode::Fit.uv_transform_region((1920, 1080), (1600, 1200), FULL_REGION),
+            ScaleMode::Fit.uv_transform((1920, 1080), (1600, 1200))
+        );
+    }
 
     #[test]
     fn fill_crops_and_fit_letterboxes() {

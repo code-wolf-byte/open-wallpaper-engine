@@ -63,6 +63,9 @@ pub struct WpSettings {
     /// The playlist `wp-engine run` plays, if any.
     #[serde(default)]
     pub active_playlist: Option<String>,
+    /// Per-screen, span or clone; `None` = per-screen.
+    #[serde(default)]
+    pub layout: Option<crate::render::ScreenLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

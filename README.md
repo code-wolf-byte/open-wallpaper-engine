@@ -189,7 +189,7 @@ and a shortcut back to the GUI; set `WP_ENGINE_NO_TRAY=1` to hide it.
 
 In the GUI, the details panel edits the selected wallpaper's properties and adds
 it to a playlist or a screen; **⚙ Settings** holds the frame-rate cap, scaling,
-playback rules, screens, playlists and autostart.
+multi-monitor layout, playback rules, screens, playlists and autostart.
 The daemon's socket and lock live in `$XDG_RUNTIME_DIR/wp-engine/`; a daemon
 started in the background logs to `$XDG_STATE_HOME/wp-engine/daemon.log`.
 
@@ -233,6 +233,7 @@ wp-engine config set-playback fullscreen pause
 wp-engine config set-playback audio mute
 wp-engine config set-fps 60
 wp-engine config set-scaling fit          # fill, fit, stretch, center
+wp-engine config set-layout span          # per-screen, span, clone
 
 # A playlist that changes every 30 minutes, played by `wp-engine run`
 wp-engine config set-playlist evening 1275921440 2156479578 --delay 30
@@ -297,6 +298,8 @@ built, and several are deliberately skipped as unreachable.
 - playback rules (run/mute/pause/stop while another app is focused, maximized,
   fullscreen or playing audio, on battery, or while locked), FPS cap
 - playlists: timer, time of day, day of week, or once per login
+- multiple monitors: a wallpaper per screen, one spanned across all of them,
+  or one cloned onto each
 - presentation: Wayland layer-shell (direct `wgpu::Surface`, no readback),
   X11 root pixmap, macOS desktop window, CPU/SHM fallback everywhere
 - application lifecycle (`WallpaperApplication`, `--set-property`, signals)
@@ -306,7 +309,6 @@ built, and several are deliberately skipped as unreachable.
 <details>
 <summary><strong>Known gaps</strong></summary>
 
-- spanning or cloning one wallpaper across monitors
 - Workshop browsing and downloading
 - hardware video decoding
 - only one web wallpaper at a time; keyboard input isn't forwarded to web

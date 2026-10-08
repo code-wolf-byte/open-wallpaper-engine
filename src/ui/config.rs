@@ -6,7 +6,7 @@
 use super::{StatusMsg, WpApp, TEXT_MUTED, TEXT_PRIMARY};
 use crate::engine::playback_gate::PlaybackAction;
 use crate::engine::properties::SceneProperty;
-use crate::render::ScaleMode;
+use crate::render::{ScaleMode, ScreenLayout};
 use crate::settings::{Playlist, WpSettings};
 use serde_json::Value;
 
@@ -353,6 +353,21 @@ impl WpApp {
             self.settings.lock().unwrap().scaling = scaling;
             self.save_settings();
             self.status = StatusMsg::ok("Scaling saved — re-apply the wallpaper to use it");
+        }
+
+        let mut layout = self.saved.layout.unwrap_or_default();
+        let before = layout;
+        egui::ComboBox::from_label("Multiple monitors")
+            .selected_text(layout.label())
+            .show_ui(ui, |ui| {
+                for l in ScreenLayout::ALL {
+                    ui.selectable_value(&mut layout, l, l.label());
+                }
+            });
+        if layout != before {
+            self.saved.layout = Some(layout);
+            self.save_settings();
+            self.status = StatusMsg::ok("Layout saved — re-apply the wallpaper to use it");
         }
 
         let mut autostart = self.autostart;
