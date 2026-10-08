@@ -104,6 +104,23 @@ pub(crate) struct NamedOutput {
     pub rect: OutputRect,
 }
 
+/// Names of the active outputs, for picking a screen to assign.
+pub fn output_names() -> Vec<String> {
+    let Ok((conn, screen_num)) = x11rb::connect(None) else {
+        return Vec::new();
+    };
+    let screen = &conn.setup().roots[screen_num];
+    discover_outputs(
+        &conn,
+        screen.root,
+        screen.width_in_pixels,
+        screen.height_in_pixels,
+    )
+    .into_iter()
+    .filter_map(|o| o.name)
+    .collect()
+}
+
 /// Enumerate connected+active RandR outputs (name + rectangle), falling back
 /// to the whole root window when RandR is missing or reports nothing usable
 /// (headless X, Xvfb, old servers).

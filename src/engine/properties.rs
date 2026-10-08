@@ -466,15 +466,32 @@ pub fn parse_property_arg(arg: &str) -> (String, String) {
     }
 }
 
-/// List a project's declared properties (for the `list-properties` command).
+/// List an item's declared properties with their effective defaults. For a
+/// preset that's the item it builds on, with the preset's values applied.
 pub fn list_properties(dir: &Path) -> Result<Vec<SceneProperty>> {
-    let path = dir.join("project.json");
+    let project = crate::workshop::load_project(dir).ok();
+    let preset = project
+        .as_ref()
+        .and_then(|p| Some((p.dependency.as_deref()?, p.preset.as_ref()?)));
+    let (base, preset) = match preset {
+        Some((dep, values)) => (
+            crate::workshop::find_item_dir(dep, Some(dir)).with_context(|| {
+                format!("preset needs workshop item {dep}, which is not installed")
+            })?,
+            Some(preset_to_overrides(dir, values)),
+        ),
+        None => (dir.to_path_buf(), None),
+    };
+    let path = base.join("project.json");
     let data =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let json: Value =
         serde_json::from_str(&data).with_context(|| format!("parsing {}", path.display()))?;
     let mut props = SceneProperties::default();
     props.load_from_project_json(&json);
+    if let Some(values) = preset {
+        props.apply_overrides(values);
+    }
     Ok(props.iter().cloned().collect())
 }
 

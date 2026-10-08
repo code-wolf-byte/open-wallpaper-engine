@@ -182,8 +182,14 @@ all hand their wallpaper to a single background daemon, replacing whatever it
 was showing, so the wallpaper keeps running after the terminal or GUI window
 closes. Pass `--foreground` to `set`/`set-file`/`run` to render in the current
 process until Ctrl-C instead. To start the wallpaper with your session, run
-`wp-engine run` (it restores your saved `config` setup) from your compositor's
-autostart, or run `wp-engine daemon` as a service and `wp-engine run` after it.
+`wp-engine autostart on` (an XDG autostart entry for `wp-engine run`, which
+restores your saved `config` setup), or run `wp-engine daemon` as a service and
+`wp-engine run` after it. The daemon shows a tray icon with playlist controls
+and a shortcut back to the GUI; set `WP_ENGINE_NO_TRAY=1` to hide it.
+
+In the GUI, the details panel edits the selected wallpaper's properties and adds
+it to a playlist or a screen; **⚙ Settings** holds the frame-rate cap, scaling,
+playback rules, screens, playlists and autostart.
 The daemon's socket and lock live in `$XDG_RUNTIME_DIR/wp-engine/`; a daemon
 started in the background logs to `$XDG_STATE_HOME/wp-engine/daemon.log`.
 
@@ -194,13 +200,14 @@ started in the background logs to `$XDG_STATE_HOME/wp-engine/daemon.log`.
 | `set-file <path>` | Apply a scene directory, video, image, or HTML file |
 | `playlist play <name>` | Rotate through a saved playlist (`next`, `previous`, `stop`) |
 | `config …` | Saved settings: properties, screens, playlists, playback rules, FPS, scaling |
+| `autostart on\|off` | Start `wp-engine run` at login |
 | `run` | Apply the saved `config` setup (per-screen wallpapers, default) |
 | `status` | Show what the background daemon is displaying |
 | `stop` | Remove the wallpaper and stop the background daemon |
 | `daemon` | Run the daemon in the foreground (normally auto-started) |
 | `info <id>` | Show a Workshop item's metadata |
 | `list-properties <id>` | Show the properties a wallpaper exposes |
-| `probe` | List GPU adapters visible to the process |
+| `probe` | List GPU adapters and screen names |
 | `pkg-info <path>` | Inspect or extract a `.pkg` archive |
 | `tex-info <path>` | Inspect a `.tex` texture |
 | `render-scene <id>` | Render one frame to a PNG |
@@ -241,6 +248,7 @@ wp-engine config set-active-playlist evening
 | `WP_ENGINE_FORCE_X11=1` | Take the X11 path even under a Wayland session |
 | `WP_ENGINE_FORCE_SHM=1` | Force the CPU/SHM presentation path |
 | `WP_ENGINE_SKIP_EFFECTS=a,b` | Disable named effects |
+| `WP_ENGINE_NO_TRAY=1` | Run the daemon without a tray icon |
 | `WP_ENGINE_PAUSE_ON_{FOCUS,MAXIMIZED,FULLSCREEN,AUDIO,BATTERY,LOCK}` | Override a playback rule (`run`/`mute`/`pause`/`stop`) |
 | `CEF_PATH` | Reuse an existing CEF distribution instead of downloading one |
 | `SHADERC_LIB_DIR` | Where to find shaderc, if not on the default search path |
@@ -298,8 +306,6 @@ built, and several are deliberately skipped as unreachable.
 <details>
 <summary><strong>Known gaps</strong></summary>
 
-- a GUI for wallpaper properties, playlists, screens and playback rules
-  (all available through `wp-engine config`), a tray icon, and autostart
 - spanning or cloning one wallpaper across monitors
 - Workshop browsing and downloading
 - hardware video decoding

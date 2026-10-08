@@ -28,10 +28,10 @@ extern "C" fn handle_stop_signal(_sig: libc::c_int) {
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
-struct State {
-    app: Option<WallpaperApplication>,
-    title: Option<String>,
-    playlist: Option<crate::schedule::PlaylistRun>,
+pub(super) struct State {
+    pub(super) app: Option<WallpaperApplication>,
+    pub(super) title: Option<String>,
+    pub(super) playlist: Option<crate::schedule::PlaylistRun>,
 }
 
 impl State {
@@ -142,6 +142,9 @@ pub fn run_daemon() -> Result<()> {
     println!("wp-engine daemon listening on {}", socket.display());
 
     let state = Arc::new(Mutex::new(State::default()));
+    let tray = (std::env::var_os("WP_ENGINE_NO_TRAY").is_none())
+        .then(|| super::tray::spawn(Arc::clone(&state)))
+        .flatten();
     while !STOP_REQUESTED.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -161,6 +164,9 @@ pub fn run_daemon() -> Result<()> {
     }
 
     tracing::info!(target: "app", "daemon shutting down");
+    if let Some(tray) = tray {
+        tray.shutdown().wait();
+    }
     // Unlink before the lock goes so a new daemon never sees our socket.
     let _ = std::fs::remove_file(&socket);
     if let Ok(mut state) = state.lock() {
@@ -195,7 +201,7 @@ fn handle_client(stream: UnixStream, state: &Mutex<State>) {
     let _ = (&stream).write_all(out.as_bytes());
 }
 
-fn handle_request(req: Request, state: &Mutex<State>) -> Response {
+pub(super) fn handle_request(req: Request, state: &Mutex<State>) -> Response {
     // A panic inside an earlier apply poisons the mutex; the state is still
     // meaningful (worst case: no wallpaper), so keep serving.
     let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
