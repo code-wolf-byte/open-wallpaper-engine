@@ -1534,6 +1534,9 @@ struct PassOverride {
 /// layers gets separate pipelines because combos/constants can differ).
 struct EffectInstanceDef {
     layer_idx: usize,
+    /// Position in the object's own `effects` list (scripts address effects
+    /// by it: `thisLayer.getEffect(1)`).
+    effect_index: usize,
     name: String,
     /// Verbatim scene.json effect `file` path (e.g. `"effects/clouds/effect.json"`
     /// or a workshop-nested `"effects/workshop/2138904733/foo/effect.json"`) —
@@ -1680,6 +1683,11 @@ struct SceneLayerGpu {
     /// Object size in px before scale — rebuilds `rect` when a script
     /// changes scale.
     effective_size: [f64; 2],
+    /// Text a script set but not yet rasterized (throttled — see
+    /// `flush_text`), and when the last raster happened and how long it took.
+    pending_text: Option<String>,
+    text_rastered_at: Option<Instant>,
+    text_raster_cost: Duration,
     /// Spritesheet frame a script picked (`getTextureAnimation().setFrame`),
     /// overriding the timed animation.
     script_frame: Option<usize>,
@@ -1815,6 +1823,15 @@ pub struct GpuSceneInstance {
     hovered: Option<usize>,
     pressed: Option<usize>,
     last_cursor_scene: [f32; 2],
+    /// Parallel to `scene_effects`: false once a script hides the effect.
+    effect_enabled: Vec<bool>,
+    /// Per-object draw position; starts as the object index, and
+    /// `thisScene.sortLayer` moves objects between their neighbours.
+    draw_rank: Vec<f64>,
+    sort_count: u32,
+    /// For `thisScene.createLayer`: the scene directory and its package.
+    scene_dir: std::path::PathBuf,
+    scene_pkg: Option<crate::engine::pkg::Package>,
     /// Desktop-audio capture, started only when an effect reads
     /// `g_AudioSpectrum*` (else `None` and the spectrum stays silent). Polled
     /// once per frame into the renderer's `audio_buf`.
@@ -2371,91 +2388,13 @@ impl GpuSceneInstance {
             .layers
             .iter()
             .map(|l| {
-                let all_frames: Vec<&RgbaImage> = std::iter::once(&l.image)
-                    .chain(l.extra_frames.iter())
-                    .collect();
-                // Textures stay at native resolution; the composite quad and
-                // sampler handle scaling to the object's on-screen size.
-                let frames: Vec<wgpu::Texture> = all_frames
-                    .iter()
-                    .map(|frame| renderer.upload_texture(frame))
-                    .collect();
-
-                // Unscaled object size: explicit scene.json size, else the
-                // texture's native resolution (CImage.cpp lines 213-222).
-                // True scene-fullscreen layers (models/util/fullscreenlayer.json
-                // etc.) never reach here — they're filtered out upstream by
-                // `is_special_layer` — so an unspecified size always means
-                // "use the texture's own dimensions", never "cover the scene".
-                let effective_size = if l.size[0] > 0.0 && l.size[1] > 0.0 {
-                    [l.size[0], l.size[1]]
-                } else {
-                    [l.image.width() as f64, l.image.height() as f64]
-                };
-                let object_size = (
-                    effective_size[0].round() as u32,
-                    effective_size[1].round() as u32,
-                );
-
-                // Object quad rect in NDC. WE origins are absolute scene
-                // coordinates (Y-up, bottom-left origin) pointing at the
-                // object's center.
-                let size_px = [
-                    effective_size[0] * l.scale[0],
-                    effective_size[1] * l.scale[1],
-                ];
-                let (rect, angle, depth, quad_corners) = if let Some(cam) = &camera3d {
-                    let center = [l.origin[0] as f32, l.origin[1] as f32, l.origin[2] as f32];
-                    let (rect, depth) = project_quad_ndc(cam, center, l.angles, size_px);
-                    let quad_corners = project_quad_corners(cam, center, l.angles, size_px);
-                    (rect, 0.0, depth, quad_corners)
-                } else {
-                    // `general.zoom` scales the whole scene about its center;
-                    // NDC (0,0) is the scene center, so a uniform rect scale
-                    // does it (center and half-extent both × zoom).
-                    let rect = [
-                        (2.0 * l.origin[0] / w as f64 - 1.0) as f32 * zoom,
-                        (2.0 * l.origin[1] / h as f64 - 1.0) as f32 * zoom,
-                        (size_px[0] / w as f64) as f32 * zoom,
-                        (size_px[1] / h as f64) as f32 * zoom,
-                    ];
-                    (rect, l.angle, 0.0, None)
-                };
-
-                SceneLayerGpu {
-                    frames,
-                    puppet: l.puppet.clone(),
-                    puppet_posed_at: 0.0,
-                    video: l.video.clone(),
-                    blend_mode: l.blend_mode,
-                    alpha: l.alpha,
-                    text_dynamic: l.text_dynamic.clone(),
-                    color: l.color,
-                    brightness: l.brightness,
-                    frame_duration_ms: l.frame_duration_ms,
-                    parallax_depth: [l.parallax_depth[0] as f32, l.parallax_depth[1] as f32],
-                    angle,
-                    rect,
-                    quad_corners,
-                    depth,
-                    object_size,
-                    no_interpolation: l.no_interpolation,
-                    clamp_uvs: l.clamp_uvs,
-                    order_index: l.order_index,
-                    object_id: l.object_id,
-                    visible: l.visible_base,
-                    effective_size,
-                    align_offset: {
-                        let authored = resolved
-                            .transform_graph
-                            .local
-                            .get(l.order_index)
-                            .map(|x| x.t)
-                            .unwrap_or(l.local_origin);
-                        std::array::from_fn(|i| l.local_origin[i] - authored[i])
-                    },
-                    script_frame: None,
-                }
+                let authored = resolved
+                    .transform_graph
+                    .local
+                    .get(l.order_index)
+                    .map(|x| x.t)
+                    .unwrap_or(l.local_origin);
+                gpu_layer_from(&renderer, l, w, h, zoom, camera3d.as_ref(), authored)
             })
             .collect();
 
@@ -2925,6 +2864,13 @@ impl GpuSceneInstance {
             hovered: None,
             pressed: None,
             last_cursor_scene: [w as f32 * 0.5, h as f32 * 0.5],
+            effect_enabled: Vec::new(),
+            draw_rank: (0..resolved.scene.objects.len())
+                .map(|i| i as f64)
+                .collect(),
+            sort_count: 0,
+            scene_dir: dir.to_path_buf(),
+            scene_pkg: None,
             audio_capture,
             sounds,
             #[cfg(target_os = "linux")]
@@ -2942,6 +2888,7 @@ impl GpuSceneInstance {
         // Hidden ancestors hide their subtree; script-referenced hidden
         // objects are built but start hidden.
         instance.refresh_layer_visibility();
+        instance.effect_enabled = vec![true; instance.scene_effects.len()];
         instance.cursor_targets = instance
             .scripts
             .objects_with_handlers(crate::engine::script::CURSOR_EVENTS);
@@ -3454,6 +3401,7 @@ impl GpuSceneInstance {
             .frame(time, crate::engine::script::local_time_of_day(), delta);
         let changes = self.scripts.collect();
         self.apply_script_changes(changes);
+        self.flush_text();
 
         // `registerAudioBuffers` usually runs at module load, so this is
         // known after the first frame; start capture then if nothing else did.
@@ -3583,6 +3531,9 @@ impl GpuSceneInstance {
                     snd.set_volume(v);
                 }
             }
+            for (key, value) in &c.extra {
+                self.apply_script_extra(i, key, value);
+            }
             for li in 0..self.layers.len() {
                 if self.layers[li].order_index != i {
                     continue;
@@ -3626,6 +3577,20 @@ impl GpuSceneInstance {
                         }
                     }
                 }
+                ScriptCommand::Sort { index, to } => self.sort_object(index, to),
+                ScriptCommand::Create { index, config } => {
+                    self.create_object(index, &config);
+                    visibility_changed = true;
+                }
+                ScriptCommand::Destroy { index } => {
+                    // Hidden for good rather than removed: per-layer render
+                    // targets are keyed by position in `self.layers`.
+                    if let Some(v) = self.object_visible.get_mut(index) {
+                        *v = false;
+                    }
+                    self.cursor_targets.retain(|t| *t != index);
+                    visibility_changed = true;
+                }
                 other => {
                     tracing::debug!(target: "script", "unhandled script command {other:?}");
                 }
@@ -3637,6 +3602,136 @@ impl GpuSceneInstance {
         if moved.iter().any(|m| *m) {
             self.apply_object_transforms(&moved);
         }
+    }
+
+    /// A script wrote a declared extra property: `instance.<key>` (particle
+    /// override), `effects.<e>.visible`, or `effects.<e>.<pass>.<constant>`.
+    fn apply_script_extra(&mut self, object: usize, key: &str, value: &serde_json::Value) {
+        if let Some(k) = key.strip_prefix("instance.") {
+            for (sys, _) in self
+                .particle_systems
+                .iter_mut()
+                .zip(&self.particle_order)
+                .filter(|(_, o)| **o == object)
+            {
+                sys.set_instance_value(k, value);
+            }
+            return;
+        }
+        let Some(rest) = key.strip_prefix("effects.") else {
+            return;
+        };
+        let mut parts = rest.splitn(3, '.');
+        let Some(e) = parts.next().and_then(|e| e.parse::<usize>().ok()) else {
+            return;
+        };
+        let Some(k) = self
+            .scene_effects
+            .iter()
+            .position(|d| d.layer_idx == object && d.effect_index == e)
+        else {
+            return;
+        };
+        match (parts.next(), parts.next()) {
+            (Some("visible"), None) => {
+                self.effect_enabled[k] = value.as_bool().unwrap_or(true);
+            }
+            (Some(pass), Some(name)) => {
+                let Some(pass) = pass.parse::<usize>().ok() else {
+                    return;
+                };
+                let Some(runtime) = self.effect_runtimes.get_mut(k).and_then(|r| r.as_mut()) else {
+                    return;
+                };
+                if let Some(p) = runtime.passes.get_mut(pass) {
+                    // Vectors come back as arrays; the value parser wants "x y z".
+                    let v = match value {
+                        serde_json::Value::Array(a) => serde_json::Value::String(
+                            a.iter()
+                                .map(|x| x.as_f64().unwrap_or(0.0).to_string())
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        ),
+                        other => other.clone(),
+                    };
+                    insert_value_components(&mut p.values, name, &v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `thisScene.sortLayer(layer, index)`: draw `index`'s object just below
+    /// the object currently at `to`, later sorts landing lower.
+    fn sort_object(&mut self, index: usize, to: usize) {
+        let Some(base) = self.draw_rank.get(to).copied() else {
+            return;
+        };
+        self.sort_count += 1;
+        if let Some(r) = self.draw_rank.get_mut(index) {
+            *r = base - 0.5 + 0.49 / self.sort_count as f64;
+        }
+    }
+
+    /// `thisScene.createLayer(config)`: build object `index` from a
+    /// scene.json-shaped config. Image, solid and text objects only; their
+    /// effects are not instantiated.
+    fn create_object(&mut self, index: usize, config: &serde_json::Value) {
+        use crate::engine::render::Xform;
+        // Keep every per-object table indexed in step with the script side,
+        // even when this object can't be built.
+        let n = index + 1;
+        if self.current_locals.len() < n {
+            self.current_locals.resize(n, Xform::IDENTITY);
+            self.transform_graph.parent.resize(n, None);
+            self.transform_graph.local.resize(n, Xform::IDENTITY);
+            self.transform_graph.name.resize(n, None);
+            self.transform_graph.id.resize(n, None);
+            self.object_visible.resize(n, true);
+            self.propagation_disabled.resize(n, false);
+            let len = self.draw_rank.len();
+            self.draw_rank.extend((len..n).map(|i| i as f64));
+        }
+        let obj: crate::engine::scene::SceneObject = match serde_json::from_value(config.clone()) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(target: "script", "createLayer: bad config: {e}");
+                return;
+            }
+        };
+        if self.scene_pkg.is_none() {
+            self.scene_pkg =
+                crate::engine::pkg::Package::from_file(&self.scene_dir.join("scene.pkg")).ok();
+        }
+        let Some(mut layer) =
+            crate::engine::render::runtime_layer(&self.scene_dir, self.scene_pkg.as_ref(), &obj)
+        else {
+            tracing::debug!(target: "script", "createLayer: object {index} has nothing to draw");
+            return;
+        };
+        layer.order_index = index;
+        let local = crate::engine::render::obj_local_xform(&obj);
+        self.current_locals[index] = local;
+        self.transform_graph.local[index] = local;
+        self.transform_graph.name[index] = obj.name.clone();
+        self.object_visible[index] = obj.is_visible();
+        let gpu = gpu_layer_from(
+            &self.renderer,
+            &layer,
+            self.width,
+            self.height,
+            self.zoom,
+            self.camera3d.as_ref(),
+            local.t,
+        );
+        let (ow, oh) = (gpu.object_size.0.max(1), gpu.object_size.1.max(1));
+        let li = self.layers.len();
+        let device = self.renderer.device().clone();
+        self.fbo_pool
+            .get_or_create(&device, &pingpong_key(li, 0), ow, oh);
+        self.fbo_pool
+            .get_or_create(&device, &pingpong_key(li, 1), ow, oh);
+        self.layers.push(gpu);
     }
 
     /// Sound controls belonging to scene object `index`.
@@ -3652,23 +3747,51 @@ impl GpuSceneInstance {
             .collect()
     }
 
-    /// Re-rasterize a text layer for new content (or a new point size when
-    /// `text` is `None`).
+    /// Queue new text (or, with `None`, a re-raster at a new point size) for
+    /// a text layer; [`Self::flush_text`] rasterizes it.
     fn rerasterize_text(&mut self, li: usize, text: Option<&str>) {
         let layer = &mut self.layers[li];
-        let Some(td) = &mut layer.text_dynamic else {
+        let Some(td) = &layer.text_dynamic else {
             return;
         };
         let new_text = text
             .map(str::to_string)
+            .or_else(|| layer.pending_text.clone())
             .unwrap_or_else(|| td.last_text.clone());
-        if new_text.is_empty() || (new_text == td.last_text && text.is_some()) {
+        if new_text.is_empty() || (text.is_some() && new_text == td.last_text) {
+            layer.pending_text = None;
             return;
         }
-        if let Some(img) = crate::engine::text::rasterize(&td.font_data, &new_text, td.point_size) {
-            // The quad keeps its authored box; only the texture changes.
-            layer.frames[0] = self.renderer.upload_texture(&img);
-            td.last_text = new_text;
+        layer.pending_text = Some(new_text);
+    }
+
+    /// Rasterize pending text. Throttled per layer to every 100 ms, or every
+    /// 10× the last raster's cost when that is longer, so a script that
+    /// rewrites a huge text block every frame (debug overlays, timers with
+    /// milliseconds) can't stall rendering; the newest text always lands.
+    fn flush_text(&mut self) {
+        let now = Instant::now();
+        for li in 0..self.layers.len() {
+            let layer = &mut self.layers[li];
+            let (Some(text), Some(td)) = (&layer.pending_text, &mut layer.text_dynamic) else {
+                continue;
+            };
+            let wait = (layer.text_raster_cost * 10).max(Duration::from_millis(100));
+            if layer
+                .text_rastered_at
+                .is_some_and(|t| now.duration_since(t) < wait)
+            {
+                continue;
+            }
+            let started = Instant::now();
+            if let Some(img) = crate::engine::text::rasterize(&td.font_data, text, td.point_size) {
+                // The quad keeps its authored box; only the texture changes.
+                layer.frames[0] = self.renderer.upload_texture(&img);
+                td.last_text = text.clone();
+            }
+            layer.text_raster_cost = started.elapsed();
+            layer.text_rastered_at = Some(now);
+            layer.pending_text = None;
         }
     }
 
@@ -4010,7 +4133,8 @@ impl GpuSceneInstance {
                     .map(|(i, m)| (m.order_index, DrawItem::Mesh(i))),
             )
             .collect();
-        items.sort_by_key(|(order, _)| *order);
+        let rank = |order: usize| self.draw_rank.get(order).copied().unwrap_or(order as f64);
+        items.sort_by(|(a, _), (b, _)| rank(*a).total_cmp(&rank(*b)));
 
         if self.perspective {
             // Painter's algorithm for 3D scenes: draw image layers strictly
@@ -4133,7 +4257,8 @@ impl GpuSceneInstance {
             let has_effects = self
                 .scene_effects
                 .iter()
-                .any(|inst| inst.layer_idx == obj_index);
+                .zip(&self.effect_enabled)
+                .any(|(inst, on)| *on && inst.layer_idx == obj_index);
 
             // Base material pass (genericimage3-equivalent): reference always
             // renders `texture * g_Color4` into the object's own FBO *before*
@@ -4186,7 +4311,7 @@ impl GpuSceneInstance {
                 .scene_effects
                 .iter()
                 .enumerate()
-                .filter(|(_, inst)| inst.layer_idx == obj_index)
+                .filter(|(k, inst)| inst.layer_idx == obj_index && self.effect_enabled[*k])
             {
                 let Some(runtime) = self
                     .effect_runtimes
@@ -5689,7 +5814,7 @@ fn collect_effects(scene: &crate::engine::model::SceneModel) -> Vec<EffectInstan
         if !obj.is_visible() {
             continue;
         }
-        for eff in &obj.effects {
+        for (effect_index, eff) in obj.effects.iter().enumerate() {
             if !eff.visible {
                 continue;
             }
@@ -5726,6 +5851,7 @@ fn collect_effects(scene: &crate::engine::model::SceneModel) -> Vec<EffectInstan
 
             result.push(EffectInstanceDef {
                 layer_idx: i,
+                effect_index,
                 name,
                 file: file.clone(),
                 pass_overrides,
@@ -6018,6 +6144,99 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
     }
 }
 
+/// Upload one CPU `Layer` and derive its GPU-side quad. `authored_origin` is
+/// the object's scene.json origin, before alignment.
+fn gpu_layer_from(
+    renderer: &GpuSceneRenderer,
+    l: &crate::engine::render::Layer,
+    w: u32,
+    h: u32,
+    zoom: f32,
+    camera3d: Option<&crate::engine::camera3d::PerspectiveCamera>,
+    authored_origin: [f64; 3],
+) -> SceneLayerGpu {
+    let all_frames: Vec<&RgbaImage> = std::iter::once(&l.image)
+        .chain(l.extra_frames.iter())
+        .collect();
+    // Textures stay at native resolution; the composite quad and
+    // sampler handle scaling to the object's on-screen size.
+    let frames: Vec<wgpu::Texture> = all_frames
+        .iter()
+        .map(|frame| renderer.upload_texture(frame))
+        .collect();
+
+    // Unscaled object size: explicit scene.json size, else the
+    // texture's native resolution (CImage.cpp lines 213-222).
+    // True scene-fullscreen layers (models/util/fullscreenlayer.json
+    // etc.) never reach here — they're filtered out upstream by
+    // `is_special_layer` — so an unspecified size always means
+    // "use the texture's own dimensions", never "cover the scene".
+    let effective_size = if l.size[0] > 0.0 && l.size[1] > 0.0 {
+        [l.size[0], l.size[1]]
+    } else {
+        [l.image.width() as f64, l.image.height() as f64]
+    };
+    let object_size = (
+        effective_size[0].round() as u32,
+        effective_size[1].round() as u32,
+    );
+
+    // Object quad rect in NDC. WE origins are absolute scene
+    // coordinates (Y-up, bottom-left origin) pointing at the
+    // object's center.
+    let size_px = [
+        effective_size[0] * l.scale[0],
+        effective_size[1] * l.scale[1],
+    ];
+    let (rect, angle, depth, quad_corners) = if let Some(cam) = camera3d {
+        let center = [l.origin[0] as f32, l.origin[1] as f32, l.origin[2] as f32];
+        let (rect, depth) = project_quad_ndc(cam, center, l.angles, size_px);
+        let quad_corners = project_quad_corners(cam, center, l.angles, size_px);
+        (rect, 0.0, depth, quad_corners)
+    } else {
+        // `general.zoom` scales the whole scene about its center;
+        // NDC (0,0) is the scene center, so a uniform rect scale
+        // does it (center and half-extent both × zoom).
+        let rect = [
+            (2.0 * l.origin[0] / w as f64 - 1.0) as f32 * zoom,
+            (2.0 * l.origin[1] / h as f64 - 1.0) as f32 * zoom,
+            (size_px[0] / w as f64) as f32 * zoom,
+            (size_px[1] / h as f64) as f32 * zoom,
+        ];
+        (rect, l.angle, 0.0, None)
+    };
+
+    SceneLayerGpu {
+        frames,
+        puppet: l.puppet.clone(),
+        puppet_posed_at: 0.0,
+        video: l.video.clone(),
+        blend_mode: l.blend_mode,
+        alpha: l.alpha,
+        text_dynamic: l.text_dynamic.clone(),
+        color: l.color,
+        brightness: l.brightness,
+        frame_duration_ms: l.frame_duration_ms,
+        parallax_depth: [l.parallax_depth[0] as f32, l.parallax_depth[1] as f32],
+        angle,
+        rect,
+        quad_corners,
+        depth,
+        object_size,
+        no_interpolation: l.no_interpolation,
+        clamp_uvs: l.clamp_uvs,
+        order_index: l.order_index,
+        object_id: l.object_id,
+        visible: l.visible_base,
+        effective_size,
+        align_offset: std::array::from_fn(|i| l.local_origin[i] - authored_origin[i]),
+        script_frame: None,
+        pending_text: None,
+        text_rastered_at: None,
+        text_raster_cost: Duration::ZERO,
+    }
+}
+
 /// A layer quad's corners in output pixels (Y-up, centred), from its NDC
 /// `rect` (centre, half-extent) and z-rotation.
 fn quad_corners_px(rect: [f32; 4], angle: f32, w: f32, h: f32) -> [[f32; 2]; 4] {
@@ -6216,6 +6435,52 @@ fn build_script_host(
         for (prop, value) in props {
             if let Some((script, authored)) = crate::engine::script::scripted(value) {
                 host.attach(i, Some(prop), script, authored);
+            }
+        }
+        // Scripted particle overrides and effect constants/visibility, read
+        // from the raw entry (the typed model drops their scripts).
+        let Some(raw) = raw_objects.get(i) else {
+            continue;
+        };
+        let mut extras: Vec<(String, &serde_json::Value)> = Vec::new();
+        if let Some(m) = raw.get("instanceoverride").and_then(|v| v.as_object()) {
+            extras.extend(m.iter().map(|(k, v)| (format!("instance.{k}"), v)));
+        }
+        for (e, eff) in raw
+            .get("effects")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            if let Some(v) = eff.get("visible") {
+                extras.push((format!("effects.{e}.visible"), v));
+            }
+            for (p, pass) in eff
+                .get("passes")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if let Some(m) = pass.get("constantshadervalues").and_then(|v| v.as_object()) {
+                    extras.extend(m.iter().map(|(k, v)| (format!("effects.{e}.{p}.{k}"), v)));
+                }
+            }
+        }
+        for (key, value) in extras {
+            if let Some((script, authored)) = crate::engine::script::scripted(Some(value)) {
+                let initial = value
+                    .get("value")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                host.declare_property(
+                    i,
+                    &key,
+                    crate::engine::script::value_kind(&initial),
+                    &initial,
+                );
+                host.attach(i, Some(&key), script, authored);
             }
         }
     }

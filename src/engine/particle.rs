@@ -1894,6 +1894,39 @@ impl ParticleSystem {
         }
     }
 
+    /// Change one `instanceoverride` value live (SceneScript
+    /// `thisLayer.instance.<key> = …`). `count` (the pool size) only applies
+    /// at load and is ignored here.
+    pub fn set_instance_value(&mut self, key: &str, value: &serde_json::Value) {
+        let num = || match value {
+            serde_json::Value::Number(n) => n.as_f64().map(|v| v as f32),
+            serde_json::Value::String(s) => s.trim().parse().ok(),
+            _ => None,
+        };
+        let vec3 = || -> Option<[f32; 3]> {
+            match value {
+                serde_json::Value::Array(a) if a.len() >= 3 => {
+                    Some(std::array::from_fn(|i| a[i].as_f64().unwrap_or(0.0) as f32))
+                }
+                other => value_as_vec3_pub(other),
+            }
+        };
+        match key {
+            "alpha" => self.alpha_mult = num().unwrap_or(self.alpha_mult),
+            "rate" => self.rate_mult = num().unwrap_or(self.rate_mult).max(0.0),
+            "size" => self.size_mult = num().unwrap_or(self.size_mult),
+            "speed" => self.speed_mult = num().unwrap_or(self.speed_mult),
+            "lifetime" => self.lifetime_mult = num().unwrap_or(self.lifetime_mult),
+            "colorn" => self.colorn_mult = vec3().unwrap_or(self.colorn_mult),
+            "color" => {
+                if let Some(c) = vec3() {
+                    self.color_override = Some(c.map(|v| v.clamp(0.0, 255.0) as u8));
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Apply the scene-global constant force (`general.gravity*`/`wind*`).
     pub fn set_scene_force(&mut self, force: [f32; 2]) {
         self.scene_force = force;

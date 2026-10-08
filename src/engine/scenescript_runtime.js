@@ -355,8 +355,82 @@ WPLayer.prototype.getParent = function () {
     var p = this.__init.parentIndex;
     return (typeof p === 'number' && p >= 0) ? (__wp.objects[p] || null) : null;
 };
-WPLayer.prototype.getEffect = function () { return null; };
-WPLayer.prototype.getEffectCount = function () { return 0; };
+// Values in scene.json may be wrapped as {"value": …}; vectors arrive as
+// "x y z" strings.
+function __wp_raw_value(v) {
+    v = __wp_value(v);
+    if (typeof v === 'string') {
+        var parts = v.trim().split(/\s+/);
+        if (parts.length >= 2 && parts.length <= 4 && parts.every(function (p) { return p !== '' && isFinite(Number(p)); })) {
+            return parts.length === 2 ? new Vec2(v) : (parts.length === 3 ? new Vec3(v) : new Vec4(v));
+        }
+    }
+    return v;
+}
+
+// A Proxy whose properties read and write `layer.__s[prefix + name]`, falling
+// back to `defaults` (raw scene.json values) until a script writes one.
+function __wp_keyed_proxy(layer, prefix, defaults, fallback) {
+    return new Proxy({}, {
+        get: function (t, k) {
+            if (typeof k !== 'string') { return undefined; }
+            var key = prefix + k;
+            if (key in layer.__s) { return __wp_clone(layer.__s[key]); }
+            if (defaults && k in defaults) { return __wp_raw_value(defaults[k]); }
+            return fallback;
+        },
+        set: function (t, k, v) { layer.__set(prefix + k, __wp_clone(v)); return true; },
+        has: function (t, k) { return (prefix + k) in layer.__s || !!(defaults && k in defaults); }
+    });
+}
+
+WPLayer.prototype.__effects = function () {
+    var e = this.__init.raw && this.__init.raw.effects;
+    return Array.isArray(e) ? e : [];
+};
+WPLayer.prototype.getEffectCount = function () { return this.__effects().length; };
+WPLayer.prototype.getEffect = function (nameOrIndex) {
+    var effects = this.__effects(), e = -1;
+    if (typeof nameOrIndex === 'number') { e = nameOrIndex; }
+    else {
+        for (var i = 0; i < effects.length; i++) {
+            var f = String(effects[i].file || '');
+            if (effects[i].name === nameOrIndex || f.indexOf('/' + nameOrIndex + '/') >= 0) { e = i; break; }
+        }
+    }
+    var raw = effects[e];
+    if (!raw) { return null; }
+    if (!this.__effectCache) { this.__effectCache = {}; }
+    if (this.__effectCache[e]) { return this.__effectCache[e]; }
+    var layer = this, passes = Array.isArray(raw.passes) ? raw.passes : [];
+    var visKey = 'effects.' + e + '.visible';
+    var fx = {
+        name: raw.name || '',
+        getMaterialCount: function () { return passes.length; },
+        getMaterial: function (p) {
+            p = p | 0;
+            var consts = (passes[p] && passes[p].constantshadervalues) || {};
+            return __wp_keyed_proxy(layer, 'effects.' + e + '.' + p + '.', consts, undefined);
+        }
+    };
+    Object.defineProperty(fx, 'visible', {
+        get: function () { return (visKey in layer.__s) ? layer.__s[visKey] : __wp_value(raw.visible) !== false; },
+        set: function (v) { layer.__set(visKey, !!v); }
+    });
+    this.__effectCache[e] = fx;
+    return fx;
+};
+
+// Particle instance controls (`instanceoverride` in scene.json).
+Object.defineProperty(WPLayer.prototype, 'instance', {
+    get: function () {
+        if (!this.__instance) {
+            var raw = (this.__init.raw && this.__init.raw.instanceoverride) || {};
+            this.__instance = __wp_keyed_proxy(this, 'instance.', raw, 1);
+        }
+        return this.__instance;
+    }
+});
 
 // Object-attachment API. Rotation composition follows the engine's own
 // additive-Euler model (`render::Xform::compose`); there is no bone data, so
@@ -417,8 +491,15 @@ WPLayer.prototype.disablepropagation = function () { this.__propagationDisabled 
 
 // ── thisScene ──────────────────────────────────────────────────────────────
 
+// Scene settings default to WE's own defaults; `set_scene_general` copies
+// scene.json's `general` values over them.
 var thisScene = {
-    __props: {},
+    bloom: false, bloomstrength: 2, bloomthreshold: 0.65,
+    camerafade: true, cameraparallax: false, cameraparallaxamount: 0.5, cameraparallaxdelay: 0.1,
+    cameraparallaxmouseinfluence: 0, camerashake: false, camerashakeamplitude: 0.5,
+    camerashakeroughness: 1, camerashakespeed: 3, clearenabled: true,
+    clearcolor: new Vec3(0, 0, 0), ambientcolor: new Vec3(0.2, 0.2, 0.2), skylightcolor: new Vec3(0.3, 0.3, 0.3),
+    fov: 50, zoom: 1,
     getLayer: function (nameOrId) {
         var objs = __wp.objects;
         for (var i = 0; i < objs.length; i++) {
