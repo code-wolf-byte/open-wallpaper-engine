@@ -923,7 +923,15 @@ impl PointerHandler for WallpaperState {
                 // Hyprland's IPC socket for a global cursor when another
                 // window has it; add that (or the equivalent per-compositor
                 // call) if parallax-under-windows matters.
-                ContentRenderer::Scene(scene) => scene.set_mouse(norm),
+                ContentRenderer::Scene(scene) => {
+                    scene.set_mouse(norm);
+                    // Background layer surfaces only see the pointer when
+                    // nothing covers the desktop, so every press here is
+                    // a press on the wallpaper.
+                    if button == Some(BTN_LEFT) {
+                        scene.set_mouse_button(pressed);
+                    }
+                }
                 ContentRenderer::Frames(fs) => {
                     let Some(tx) = fs.web_input() else { continue };
                     let event = match button {
