@@ -50,6 +50,31 @@ impl ApplicationContext {
         }
     }
 
+    /// A context for a workshop ID or path with its saved per-wallpaper
+    /// settings (property overrides, quality) applied — what `set` does
+    /// before CLI flags, and what the daemon uses for playlist items.
+    pub fn for_wallpaper(id_or_path: &str) -> anyhow::Result<Self> {
+        let path = match crate::workshop::find_by_id(id_or_path) {
+            Some(w) => w.path,
+            None => {
+                let p = PathBuf::from(id_or_path);
+                if !p.exists() {
+                    anyhow::bail!("not a directory and workshop item '{id_or_path}' not found");
+                }
+                p
+            }
+        };
+        let saved = crate::settings::WpSettings::load();
+        let mut context = Self::new(path);
+        context
+            .properties
+            .extend(saved.property_overrides(id_or_path));
+        if let Some(q) = saved.quality_override(id_or_path) {
+            context.settings.lock().unwrap().quality = q;
+        }
+        Ok(context)
+    }
+
     /// Add `--set-property` style arguments (`name=value`, bare `name` = "1").
     pub fn add_property_args<I, S>(&mut self, args: I)
     where

@@ -31,6 +31,49 @@ const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 struct State {
     app: Option<WallpaperApplication>,
     title: Option<String>,
+    playlist: Option<crate::schedule::PlaylistRun>,
+}
+
+impl State {
+    /// Show a wallpaper from its saved per-wallpaper settings.
+    fn apply_item(&mut self, id_or_path: &str) -> Result<()> {
+        self.app = None;
+        self.title = None;
+        let context = crate::application::ApplicationContext::for_wallpaper(id_or_path)?;
+        let mut app = WallpaperApplication::new(context);
+        app.setup()?;
+        self.title = Some(
+            crate::workshop::find_by_id(id_or_path)
+                .map(|w| w.title().to_string())
+                .unwrap_or_else(|| id_or_path.to_string()),
+        );
+        self.app = Some(app);
+        Ok(())
+    }
+
+    /// Switch the playing playlist to item `index`.
+    fn play_index(&mut self, index: usize) -> Result<()> {
+        let Some(run) = self.playlist.as_mut() else {
+            return Err(anyhow!("no playlist is playing"));
+        };
+        run.switch_to(index, std::time::Instant::now());
+        let (name, idx, item) = (run.name.clone(), run.index, run.current().to_string());
+        crate::schedule::save_position(&name, idx);
+        tracing::info!(target: "app", playlist = %name, item = %item, "playlist item");
+        self.apply_item(&item)
+    }
+
+    /// Advance the playlist when its schedule says so.
+    fn tick_playlist(&mut self) {
+        let Some(run) = &self.playlist else {
+            return;
+        };
+        if let Some(next) = run.due(std::time::Instant::now(), crate::schedule::LocalTime::now()) {
+            if let Err(e) = self.play_index(next) {
+                tracing::warn!(target: "app", "playlist switch failed: {e:#}");
+            }
+        }
+    }
 }
 
 /// Holds the exclusive `flock` for as long as it lives; the kernel drops the
@@ -107,6 +150,11 @@ pub fn run_daemon() -> Result<()> {
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
+                // `try_lock`: an apply in progress holds the lock; the
+                // schedule can wait for the next pass.
+                if let Ok(mut s) = state.try_lock() {
+                    s.tick_playlist();
+                }
             }
             Err(e) => tracing::warn!(target: "app", "daemon accept failed: {e}"),
         }
@@ -155,6 +203,8 @@ fn handle_request(req: Request, state: &Mutex<State>) -> Response {
         Request::Ping => Response::Ok,
         Request::Status => Response::Status(status(&state)),
         Request::Apply(spec) => {
+            // An explicit wallpaper ends any playlist rotation.
+            state.playlist = None;
             let title = spec.title.clone();
             // Stop the old renderer before `WallpaperApplication::new`
             // swaps the process-global property overrides under it.
@@ -212,7 +262,57 @@ fn handle_request(req: Request, state: &Mutex<State>) -> Response {
             crate::platform::audio::set_preferred_device(device);
             Response::Ok
         }
+        Request::PlayPlaylist { name } => {
+            let settings = crate::settings::WpSettings::load();
+            let Some(playlist) = settings.playlists.get(&name).cloned() else {
+                return Response::Error {
+                    message: format!("no playlist named '{name}'"),
+                };
+            };
+            let resume = crate::schedule::load_positions().get(&name).copied();
+            let Some(run) = crate::schedule::PlaylistRun::start(
+                &name,
+                playlist,
+                resume,
+                crate::schedule::LocalTime::now(),
+            ) else {
+                return Response::Error {
+                    message: format!("playlist '{name}' is empty"),
+                };
+            };
+            let first = run.index;
+            state.playlist = Some(run);
+            match state.play_index(first) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
+            }
+        }
+        Request::NextItem | Request::PreviousItem => {
+            let Some(run) = &state.playlist else {
+                return Response::Error {
+                    message: "no playlist is playing".into(),
+                };
+            };
+            let index = if matches!(req, Request::NextItem) {
+                run.next_index()
+            } else {
+                run.previous_index()
+            };
+            match state.play_index(index) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
+            }
+        }
+        Request::StopPlaylist => {
+            state.playlist = None;
+            Response::Ok
+        }
         Request::Clear => {
+            state.playlist = None;
             state.app = None;
             state.title = None;
             Response::Ok
@@ -235,6 +335,10 @@ fn status(state: &State) -> DaemonStatus {
                 quality: context.settings.lock().unwrap().quality.label().to_string(),
             }
         }),
+        playlist: state
+            .playlist
+            .as_ref()
+            .map(|r| (r.name.clone(), r.index, r.playlist.items.len())),
     }
 }
 

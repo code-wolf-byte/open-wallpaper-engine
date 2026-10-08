@@ -140,6 +140,23 @@ enum Command {
     Status,
     /// Remove the wallpaper and stop the background daemon
     Stop,
+    /// Control playlist playback in the background daemon
+    Playlist {
+        #[command(subcommand)]
+        action: PlaylistAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlaylistAction {
+    /// Start playing a saved playlist (see `config set-playlist`)
+    Play { name: String },
+    /// Skip to the next item
+    Next,
+    /// Go back to the previous item
+    Previous,
+    /// Stop rotating, keeping the current wallpaper
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -173,11 +190,20 @@ enum ConfigAction {
         items: Vec<String>,
         #[arg(long, default_value_t = 60)]
         delay: u32,
+        /// timer (every --delay minutes), daytime (each item at its --times
+        /// entry), dayofweek (item N on weekday N, Monday first), or login
+        /// (next item each time playback starts)
         #[arg(long, default_value = "timer")]
         mode: String,
+        /// sequential or random
         #[arg(long, default_value = "sequential")]
         order: String,
+        /// daytime mode: comma-separated start times, one per item ("07:00,19:30")
+        #[arg(long, value_delimiter = ',')]
+        times: Vec<String>,
     },
+    /// Make `wp-engine run` play this playlist (omit NAME to clear)
+    SetActivePlaylist { name: Option<String> },
     /// Remove a playlist
     RemovePlaylist { name: String },
     /// Set what happens while a condition holds: CONDITION is focus,
@@ -242,6 +268,7 @@ fn main() {
         Some(Command::Daemon) => cmd_daemon(),
         Some(Command::Status) => cmd_status(),
         Some(Command::Stop) => cmd_stop(),
+        Some(Command::Playlist { action }) => cmd_playlist(action),
     };
 
     if let Err(e) = result {
@@ -544,7 +571,29 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
             delay,
             mode,
             order,
+            times,
         } => {
+            if !["timer", "daytime", "dayofweek", "login"].contains(&mode.as_str()) {
+                return Err(anyhow!(
+                    "invalid mode '{mode}' (expected timer, daytime, dayofweek or login)"
+                ));
+            }
+            if !["sequential", "random"].contains(&order.as_str()) {
+                return Err(anyhow!(
+                    "invalid order '{order}' (expected sequential or random)"
+                ));
+            }
+            if mode == "daytime" {
+                if times.len() != items.len() {
+                    return Err(anyhow!("daytime mode needs one --times entry per item"));
+                }
+                if let Some(bad) = times
+                    .iter()
+                    .find(|t| wp_engine::schedule::parse_time_of_day(t).is_none())
+                {
+                    return Err(anyhow!("invalid time '{bad}' (expected HH:MM)"));
+                }
+            }
             println!("Playlist '{name}': {} item(s)", items.len());
             settings.playlists.insert(
                 name,
@@ -553,8 +602,20 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
                     delay_minutes: delay,
                     mode,
                     order,
+                    times,
                 },
             );
+        }
+        ConfigAction::SetActivePlaylist { name } => {
+            if let Some(n) = &name {
+                if !settings.playlists.contains_key(n) {
+                    return Err(anyhow!("no playlist named '{n}'"));
+                }
+                println!("`wp-engine run` plays playlist '{n}'");
+            } else {
+                println!("No active playlist");
+            }
+            settings.active_playlist = name;
         }
         ConfigAction::SetPlayback { condition, action } => {
             let a = wp_engine::engine::playback_gate::PlaybackAction::parse(&action).ok_or_else(
@@ -623,11 +684,17 @@ fn resolve_scene_dir(id_or_path: &str) -> Result<PathBuf> {
 /// `engine::properties`), so only the *default* background's saved
 /// overrides are applied — a per-screen wallpaper's own saved overrides
 /// aren't isolated from each other yet if two different screens' wallpapers
-/// happen to declare a property with the same name. Playlists are still
-/// data-only (no rotation timer exists) — only each playlist's first item
-/// is ever actually reachable through `run` today.
+/// happen to declare a property with the same name. With an active
+/// playlist (`config set-active-playlist`), the daemon plays that instead.
 fn cmd_run(foreground: bool) -> Result<()> {
     let settings = wp_engine::settings::WpSettings::load();
+
+    #[cfg(target_os = "linux")]
+    if let (Some(name), false) = (&settings.active_playlist, foreground) {
+        cmd_playlist(PlaylistAction::Play { name: name.clone() })?;
+        println!("Playing playlist '{name}' (background daemon).");
+        return Ok(());
+    }
 
     let default_id_or_path = settings
         .screens
@@ -743,6 +810,9 @@ fn cmd_status() -> Result<()> {
         }
         None => println!("Wallpaper: none"),
     }
+    if let Some((name, index, count)) = status.playlist {
+        println!("Playlist: {name} (item {} of {count})", index + 1);
+    }
     Ok(())
 }
 
@@ -761,6 +831,32 @@ fn cmd_stop() -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn cmd_daemon() -> Result<()> {
     Err(anyhow!("the background daemon is Linux-only"))
+}
+
+#[cfg(target_os = "linux")]
+fn cmd_playlist(action: PlaylistAction) -> Result<()> {
+    use wp_engine::daemon::{self, Request, Response};
+    let req = match &action {
+        PlaylistAction::Play { name } => Request::PlayPlaylist { name: name.clone() },
+        PlaylistAction::Next => Request::NextItem,
+        PlaylistAction::Previous => Request::PreviousItem,
+        PlaylistAction::Stop => Request::StopPlaylist,
+    };
+    let reply = if matches!(action, PlaylistAction::Play { .. }) {
+        daemon::request_or_spawn(&req)?
+    } else {
+        daemon::request(&req)?
+    };
+    if let Response::Error { message } = reply {
+        return Err(anyhow!(message));
+    }
+    println!("OK");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cmd_playlist(_action: PlaylistAction) -> Result<()> {
+    cmd_daemon()
 }
 
 #[cfg(not(target_os = "linux"))]
