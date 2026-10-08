@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+mod config;
+
 // ── Layout constants ──────────────────────────────────────────────────────────
 
 const CARD_W: f32 = 220.0;
@@ -62,6 +64,15 @@ pub struct WpApp {
     audio_devices: Option<Vec<crate::platform::audio::CaptureOption>>,
     /// Index into `audio_devices`; 0 is "Automatic".
     audio_choice: usize,
+
+    /// `settings.json`, edited by the property editor and settings window.
+    saved: crate::settings::WpSettings,
+    prop_editor: Option<config::PropertyEditor>,
+    show_settings: bool,
+    /// Output names for "Use on screen", listed on first use.
+    outputs: Option<Vec<String>>,
+    new_playlist: String,
+    autostart: bool,
 }
 
 /// `None` handle when the daemon owns the renderer.
@@ -83,18 +94,15 @@ impl DaemonLink {
         let (tx, rx) = mpsc::channel::<Request>();
         std::thread::spawn(move || {
             while let Ok(first) = rx.recv() {
-                // Coalesce a burst (slider drag) down to the latest of each.
-                let (mut quality, mut volume) = (None, None);
+                // Coalesce a burst (slider drag) down to the latest of each kind.
+                let mut latest = HashMap::new();
                 for req in std::iter::once(first).chain(rx.try_iter()) {
-                    match req {
-                        Request::SetVolume { .. } => volume = Some(req),
-                        other => quality = Some(other),
-                    }
+                    latest.insert(std::mem::discriminant(&req), req);
                 }
                 if !daemon::is_running() {
                     continue;
                 }
-                for req in [quality, volume].into_iter().flatten() {
+                for req in latest.into_values() {
                     if let Err(e) = daemon::request(&req) {
                         tracing::warn!(target: "app", "daemon update failed: {e:#}");
                     }
@@ -179,6 +187,7 @@ impl WpApp {
         setup_theme(&cc.egui_ctx);
 
         let wallpapers = workshop::scan_wallpapers();
+        let saved = crate::settings::WpSettings::load();
         let count = wallpapers.len();
         let filtered = (0..count).collect();
 
@@ -217,10 +226,20 @@ impl WpApp {
             initial_status,
             status,
             file_input: String::new(),
-            settings: Arc::new(Mutex::new(RenderSettings::default())),
+            settings: Arc::new(Mutex::new(RenderSettings {
+                fps: saved.fps.unwrap_or(crate::render::settings::DEFAULT_FPS),
+                scaling: saved.scaling.unwrap_or_default(),
+                ..Default::default()
+            })),
             pending_apply: None,
             audio_devices: None,
             audio_choice: 0,
+            saved,
+            prop_editor: None,
+            show_settings: false,
+            outputs: None,
+            new_playlist: String::new(),
+            autostart: crate::settings::autostart_enabled(),
         }
     }
 
@@ -290,12 +309,13 @@ impl WpApp {
     // ── Wallpaper application ─────────────────────────────────────────────────
 
     fn apply_path(&mut self, path: PathBuf, display_title: String) {
+        let properties = self.saved.property_overrides(&path.to_string_lossy());
         #[cfg(target_os = "linux")]
-        self.apply_via_daemon(path, display_title);
+        self.apply_via_daemon(path, display_title, properties);
         #[cfg(not(target_os = "linux"))]
         match WallpaperContent::from_path(&path) {
             Err(e) => self.status = StatusMsg::err(format!("Load failed: {e}")),
-            Ok(content) => self.apply_content(content, display_title),
+            Ok(content) => self.apply_content(content, display_title, properties),
         }
     }
 
@@ -303,8 +323,15 @@ impl WpApp {
         let Some(idx) = self.selected else { return };
 
         let title = self.wallpapers[idx].title().to_string();
+        // Keyed by workshop ID, as `normalize_key` would, without a rescan.
+        let properties: HashMap<String, String> = self
+            .saved
+            .properties
+            .get(&self.wallpapers[idx].workshop_id)
+            .map(|m| m.clone().into_iter().collect())
+            .unwrap_or_default();
         #[cfg(target_os = "linux")]
-        self.apply_via_daemon(self.wallpapers[idx].path.clone(), title);
+        self.apply_via_daemon(self.wallpapers[idx].path.clone(), title, properties);
         #[cfg(not(target_os = "linux"))]
         {
             // `from_wallpaper` borrows wallpapers[idx] and returns an owned Result —
@@ -313,13 +340,19 @@ impl WpApp {
 
             match content {
                 Err(e) => self.status = StatusMsg::err(e.to_string()),
-                Ok(content) => self.apply_content(content, title),
+                Ok(content) => self.apply_content(content, title, properties),
             }
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn apply_content(&mut self, content: WallpaperContent, display_title: String) {
+    fn apply_content(
+        &mut self,
+        content: WallpaperContent,
+        display_title: String,
+        properties: HashMap<String, String>,
+    ) {
+        crate::engine::properties::set_global_overrides(properties);
         let old_renderer = self.renderer.take();
         let settings = Arc::clone(&self.settings);
         let (tx, rx) = mpsc::channel();
@@ -345,12 +378,18 @@ impl WpApp {
     /// Hand the wallpaper to the background daemon (starting it if needed),
     /// so it keeps running after this window closes.
     #[cfg(target_os = "linux")]
-    fn apply_via_daemon(&mut self, path: PathBuf, display_title: String) {
+    fn apply_via_daemon(
+        &mut self,
+        path: PathBuf,
+        display_title: String,
+        properties: HashMap<String, String>,
+    ) {
         use crate::daemon::{self, ApplySpec, Request};
         let spec = {
             let s = self.settings.lock().unwrap();
             ApplySpec {
                 background: path,
+                properties,
                 quality: Some(s.quality.label().to_string()),
                 volume: Some(s.volume),
                 title: Some(display_title.clone()),
@@ -453,6 +492,7 @@ impl eframe::App for WpApp {
         self.render_sidebar(ctx);
         self.render_status_bar(ctx);
         self.render_grid(ctx);
+        self.render_settings_window(ctx);
     }
 }
 
@@ -509,6 +549,14 @@ impl WpApp {
                             .color(TEXT_MUTED)
                             .size(12.0),
                     );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("⚙ Settings").clicked() {
+                            self.show_settings = !self.show_settings;
+                            // `wp-engine config` may have changed it meanwhile.
+                            self.saved = crate::settings::WpSettings::load();
+                            self.autostart = crate::settings::autostart_enabled();
+                        }
+                    });
                 });
             });
     }
@@ -591,228 +639,240 @@ impl WpApp {
             && (file_exists || matches!(wtype, WallpaperType::Scene | WallpaperType::Preset));
         let thumb = self.thumbnails.get(&workshop_id).cloned();
 
-        // ── Render ────────────────────────────────────────────────────────────
-
-        // Preview (full width, 16:9)
-        let pw = ui.available_width();
-        let ph = pw * 9.0 / 16.0;
-        let (preview_rect, _) = ui.allocate_exact_size(vec2(pw, ph), Sense::hover());
-        {
-            let p = ui.painter_at(preview_rect);
-            p.rect_filled(preview_rect, CornerRadius::same(6), Color32::from_gray(16));
-            if let Some(tex) = &thumb {
-                p.image(
-                    tex.id(),
-                    preview_rect,
-                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-            } else {
-                p.text(
-                    preview_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "No Preview",
-                    FontId::proportional(12.0),
-                    TEXT_MUTED,
-                );
-            }
-        }
-
-        ui.add_space(10.0);
-
-        // Title
-        ui.label(
-            egui::RichText::new(&title)
-                .size(15.0)
-                .color(TEXT_PRIMARY)
-                .strong(),
-        );
-        ui.add_space(4.0);
-
-        // Type badge
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Type ").color(TEXT_MUTED).size(12.0));
-            egui::Frame::default()
-                .fill(type_badge_color(&wtype))
-                .corner_radius(CornerRadius::same(3))
-                .inner_margin(egui::Margin::symmetric(6, 2))
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(wtype.to_string())
-                            .size(11.0)
-                            .color(Color32::WHITE),
-                    );
-                });
-        });
-
-        // Tags
-        if !tags.is_empty() {
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("Tags: ").color(TEXT_MUTED).size(12.0));
-                for tag in tags.iter().take(8) {
-                    egui::Frame::default()
-                        .fill(Color32::from_gray(40))
-                        .corner_radius(CornerRadius::same(3))
-                        .inner_margin(egui::Margin::symmetric(5, 2))
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new(tag).size(11.0).color(TEXT_MUTED));
-                        });
-                }
-            });
-        }
-
-        // Workshop ID + file
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(format!("ID: {workshop_id}"))
-                .size(11.0)
-                .color(TEXT_MUTED),
-        );
-
-        match &wtype {
-            // Scene wallpapers are rendered via the built-in scene engine
-            WallpaperType::Scene => {
-                ui.label(
-                    egui::RichText::new("Scene wallpaper — rendered via built-in engine")
-                        .size(11.0)
-                        .color(TEXT_MUTED),
-                );
-            }
-            // For renderable types, show whether the file exists
-            _ if !file_name.is_empty() => {
-                let file_color = if file_exists {
-                    TEXT_MUTED
-                } else {
-                    Color32::from_rgb(243, 139, 168)
-                };
-                ui.label(
-                    egui::RichText::new(format!(
-                        "File: {file_name}{}",
-                        if file_exists { "" } else { " (missing)" }
-                    ))
-                    .size(11.0)
-                    .color(file_color),
-                );
-            }
-            _ => {}
-        }
-
-        ui.add_space(12.0);
-        ui.separator();
-
         // Audio-reactive wallpapers can be driven from any capture device;
         // only offer the choice where it actually changes something.
         let audio_dir = self.wallpapers[idx].path.clone();
         let uses_audio = crate::platform::audio::wallpaper_uses_audio(&audio_dir);
 
-        // Apply button + settings panel — pinned to bottom
-        ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-            ui.add_space(6.0);
+        egui::TopBottomPanel::bottom("detail_actions")
+            .frame(egui::Frame::NONE)
+            .show_inside(ui, |ui| {
+                // Apply button + settings panel — pinned to bottom
+                ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+                    ui.add_space(6.0);
 
-            if uses_audio {
-                let devices = self
-                    .audio_devices
-                    .get_or_insert_with(crate::platform::audio::list_audio_outputs);
-                let current = devices
-                    .get(self.audio_choice)
-                    .map(|d| d.label.clone())
-                    .unwrap_or_else(|| "Automatic".to_string());
-                ui.add_space(4.0);
-                let mut changed = None;
-                egui::ComboBox::from_id_salt("audio_device")
-                    .selected_text(current)
-                    .width(260.0)
-                    .show_ui(ui, |ui| {
-                        for (i, d) in devices.iter().enumerate() {
-                            if ui
-                                .selectable_label(self.audio_choice == i, &d.label)
-                                .clicked()
-                            {
-                                changed = Some((i, d.device.clone()));
+                    if uses_audio {
+                        let devices = self
+                            .audio_devices
+                            .get_or_insert_with(crate::platform::audio::list_audio_outputs);
+                        let current = devices
+                            .get(self.audio_choice)
+                            .map(|d| d.label.clone())
+                            .unwrap_or_else(|| "Automatic".to_string());
+                        ui.add_space(4.0);
+                        let mut changed = None;
+                        egui::ComboBox::from_id_salt("audio_device")
+                            .selected_text(current)
+                            .width(260.0)
+                            .show_ui(ui, |ui| {
+                                for (i, d) in devices.iter().enumerate() {
+                                    if ui
+                                        .selectable_label(self.audio_choice == i, &d.label)
+                                        .clicked()
+                                    {
+                                        changed = Some((i, d.device.clone()));
+                                    }
+                                }
+                            });
+                        if let Some((i, device)) = changed {
+                            self.audio_choice = i;
+                            crate::platform::audio::set_preferred_device(device);
+                            self.status = StatusMsg::ok(
+                                "Audio source set — re-apply the wallpaper to use it",
+                            );
+                        }
+                        ui.label(
+                            egui::RichText::new("🔊  React to sound from")
+                                .size(11.0)
+                                .weak(),
+                        );
+                        ui.add_space(2.0);
+                    }
+
+                    if can_apply {
+                        let btn = egui::Button::new(
+                            egui::RichText::new("▶  Apply Wallpaper")
+                                .size(14.0)
+                                .color(Color32::WHITE),
+                        )
+                        .fill(Color32::from_rgb(38, 130, 65))
+                        .min_size(vec2(ui.available_width(), 38.0))
+                        .corner_radius(CornerRadius::same(6));
+
+                        if ui.add(btn).clicked() {
+                            self.apply_selected();
+                        }
+                    } else {
+                        let reason = match wtype {
+                            WallpaperType::Web => "Web wallpapers need a build with --features web",
+                            WallpaperType::Application => "Windows-only",
+                            _ => "File missing",
+                        };
+                        ui.add_enabled(
+                            false,
+                            egui::Button::new(
+                                egui::RichText::new(format!("✖  {reason}")).size(13.0),
+                            )
+                            .min_size(vec2(ui.available_width(), 38.0))
+                            .corner_radius(CornerRadius::same(6)),
+                        );
+                    }
+
+                    // ── Render Settings ───────────────────────────────────────────────
+                    ui.separator();
+                    {
+                        let mut s = self.settings.lock().unwrap();
+                        let volume_changed = ui
+                            .add(
+                                egui::Slider::new(&mut s.volume, 0.0..=1.0)
+                                    .text("Volume")
+                                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                            )
+                            .changed();
+                        let mut quality_changed = false;
+                        egui::ComboBox::from_label("Quality")
+                            .selected_text(s.quality.label())
+                            .show_ui(ui, |ui| {
+                                for q in RenderQuality::ALL {
+                                    quality_changed |=
+                                        ui.selectable_value(&mut s.quality, q, q.label()).changed();
+                                }
+                            });
+                        #[cfg(target_os = "linux")]
+                        {
+                            use crate::daemon::Request;
+                            if volume_changed {
+                                self.daemon.send(Request::SetVolume { volume: s.volume });
+                            }
+                            if quality_changed {
+                                self.daemon.send(Request::SetQuality {
+                                    quality: s.quality.label().to_string(),
+                                });
                             }
                         }
-                    });
-                if let Some((i, device)) = changed {
-                    self.audio_choice = i;
-                    crate::platform::audio::set_preferred_device(device);
-                    self.status =
-                        StatusMsg::ok("Audio source set — re-apply the wallpaper to use it");
-                }
-                ui.label(
-                    egui::RichText::new("🔊  React to sound from")
-                        .size(11.0)
-                        .weak(),
-                );
-                ui.add_space(2.0);
-            }
+                        let _ = (volume_changed, quality_changed);
+                    }
+                    ui.label(
+                        egui::RichText::new("Render Settings")
+                            .color(TEXT_MUTED)
+                            .size(12.0),
+                    );
+                    ui.separator();
+                });
+            });
 
-            if can_apply {
-                let btn = egui::Button::new(
-                    egui::RichText::new("▶  Apply Wallpaper")
-                        .size(14.0)
-                        .color(Color32::WHITE),
-                )
-                .fill(Color32::from_rgb(38, 130, 65))
-                .min_size(vec2(ui.available_width(), 38.0))
-                .corner_radius(CornerRadius::same(6));
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // ── Render ────────────────────────────────────────────────────────────
 
-                if ui.add(btn).clicked() {
-                    self.apply_selected();
-                }
-            } else {
-                let reason = match wtype {
-                    WallpaperType::Web => "Web wallpapers need a build with --features web",
-                    WallpaperType::Application => "Windows-only",
-                    _ => "File missing",
-                };
-                ui.add_enabled(
-                    false,
-                    egui::Button::new(egui::RichText::new(format!("✖  {reason}")).size(13.0))
-                        .min_size(vec2(ui.available_width(), 38.0))
-                        .corner_radius(CornerRadius::same(6)),
-                );
-            }
-
-            // ── Render Settings ───────────────────────────────────────────────
-            ui.separator();
+            // Preview (full width, 16:9)
+            let pw = ui.available_width();
+            let ph = pw * 9.0 / 16.0;
+            let (preview_rect, _) = ui.allocate_exact_size(vec2(pw, ph), Sense::hover());
             {
-                let mut s = self.settings.lock().unwrap();
-                let volume_changed = ui
-                    .add(
-                        egui::Slider::new(&mut s.volume, 0.0..=1.0)
-                            .text("Volume")
-                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                    )
-                    .changed();
-                let mut quality_changed = false;
-                egui::ComboBox::from_label("Quality")
-                    .selected_text(s.quality.label())
-                    .show_ui(ui, |ui| {
-                        for q in RenderQuality::ALL {
-                            quality_changed |=
-                                ui.selectable_value(&mut s.quality, q, q.label()).changed();
-                        }
-                    });
-                #[cfg(target_os = "linux")]
-                {
-                    use crate::daemon::Request;
-                    if volume_changed {
-                        self.daemon.send(Request::SetVolume { volume: s.volume });
-                    }
-                    if quality_changed {
-                        self.daemon.send(Request::SetQuality {
-                            quality: s.quality.label().to_string(),
-                        });
-                    }
+                let p = ui.painter_at(preview_rect);
+                p.rect_filled(preview_rect, CornerRadius::same(6), Color32::from_gray(16));
+                if let Some(tex) = &thumb {
+                    p.image(
+                        tex.id(),
+                        preview_rect,
+                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                } else {
+                    p.text(
+                        preview_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "No Preview",
+                        FontId::proportional(12.0),
+                        TEXT_MUTED,
+                    );
                 }
-                let _ = (volume_changed, quality_changed);
             }
+
+            ui.add_space(10.0);
+
+            // Title
             ui.label(
-                egui::RichText::new("Render Settings")
-                    .color(TEXT_MUTED)
-                    .size(12.0),
+                egui::RichText::new(&title)
+                    .size(15.0)
+                    .color(TEXT_PRIMARY)
+                    .strong(),
             );
+            ui.add_space(4.0);
+
+            // Type badge
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Type ").color(TEXT_MUTED).size(12.0));
+                egui::Frame::default()
+                    .fill(type_badge_color(&wtype))
+                    .corner_radius(CornerRadius::same(3))
+                    .inner_margin(egui::Margin::symmetric(6, 2))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(wtype.to_string())
+                                .size(11.0)
+                                .color(Color32::WHITE),
+                        );
+                    });
+            });
+
+            // Tags
+            if !tags.is_empty() {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Tags: ").color(TEXT_MUTED).size(12.0));
+                    for tag in tags.iter().take(8) {
+                        egui::Frame::default()
+                            .fill(Color32::from_gray(40))
+                            .corner_radius(CornerRadius::same(3))
+                            .inner_margin(egui::Margin::symmetric(5, 2))
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(tag).size(11.0).color(TEXT_MUTED));
+                            });
+                    }
+                });
+            }
+
+            // Workshop ID + file
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!("ID: {workshop_id}"))
+                    .size(11.0)
+                    .color(TEXT_MUTED),
+            );
+
+            match &wtype {
+                // Scene wallpapers are rendered via the built-in scene engine
+                WallpaperType::Scene => {
+                    ui.label(
+                        egui::RichText::new("Scene wallpaper — rendered via built-in engine")
+                            .size(11.0)
+                            .color(TEXT_MUTED),
+                    );
+                }
+                // For renderable types, show whether the file exists
+                _ if !file_name.is_empty() => {
+                    let file_color = if file_exists {
+                        TEXT_MUTED
+                    } else {
+                        Color32::from_rgb(243, 139, 168)
+                    };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "File: {file_name}{}",
+                            if file_exists { "" } else { " (missing)" }
+                        ))
+                        .size(11.0)
+                        .color(file_color),
+                    );
+                }
+                _ => {}
+            }
+
+            ui.add_space(6.0);
+            self.render_library_actions(ui, idx);
+            ui.add_space(4.0);
+            self.render_properties(ui, idx);
             ui.separator();
         });
     }

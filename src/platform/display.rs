@@ -51,6 +51,24 @@ pub trait DisplayPlatform {
     ) -> Result<WallpaperHandle>;
 }
 
+/// Names of the connected outputs (`DP-1`, `HDMI-A-1`…), the keys
+/// `config set-screen` takes. Empty when they can't be listed.
+pub fn output_names() -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let wayland = std::env::var_os("WP_ENGINE_FORCE_X11").is_none()
+            && (std::env::var_os("WAYLAND_DISPLAY").is_some()
+                || std::env::var_os("WAYLAND_SOCKET").is_some());
+        if wayland {
+            return super::wayland::output_names();
+        }
+        if std::env::var_os("DISPLAY").is_some() {
+            return super::x11::output_names();
+        }
+    }
+    Vec::new()
+}
+
 // ── Runtime detection ─────────────────────────────────────────────────────────
 
 /// Detect the current display platform at runtime and return a boxed implementation.

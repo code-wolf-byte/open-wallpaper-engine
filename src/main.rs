@@ -166,6 +166,11 @@ enum Command {
         #[command(subcommand)]
         action: PlaylistAction,
     },
+    /// Start `wp-engine run` at login: on, off, or show the current state
+    Autostart {
+        #[arg(value_parser = ["on", "off", "status"], default_value = "status")]
+        state: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -309,6 +314,7 @@ fn main() {
         Some(Command::Status) => cmd_status(),
         Some(Command::Stop) => cmd_stop(),
         Some(Command::Playlist { action }) => cmd_playlist(action),
+        Some(Command::Autostart { state }) => cmd_autostart(&state),
     };
 
     if let Err(e) = result {
@@ -490,8 +496,7 @@ fn apply_saved_settings(
 
 fn cmd_list_properties(id: &str) -> Result<()> {
     let w = workshop::find_by_id(id).ok_or_else(|| anyhow!("workshop item '{id}' not found"))?;
-    let base = wp_engine::render::WallpaperContent::preset_base_dir(&w.path)?;
-    let all_props = engine::properties::list_properties(&base)?;
+    let all_props = engine::properties::list_properties(&w.path)?;
     if all_props.is_empty() {
         println!(
             "\"{}\" declares no user-configurable properties.",
@@ -715,6 +720,19 @@ fn resolve_id_or_path(id_or_path: &str) -> Result<PathBuf> {
 
 /// [`resolve_id_or_path`] for the scene tools: a preset item resolves to the
 /// item it builds on, with the preset's values registered as overrides.
+fn cmd_autostart(state: &str) -> Result<()> {
+    if state != "status" {
+        wp_engine::settings::set_autostart(state == "on")?;
+    }
+    if wp_engine::settings::autostart_enabled() {
+        let path = wp_engine::settings::autostart_path();
+        println!("Autostart on ({})", path.display());
+    } else {
+        println!("Autostart off");
+    }
+    Ok(())
+}
+
 fn resolve_scene_dir(id_or_path: &str) -> Result<PathBuf> {
     let dir = resolve_id_or_path(id_or_path)?;
     wp_engine::render::WallpaperContent::preset_base_dir(&dir)
@@ -935,6 +953,13 @@ fn cmd_probe() -> Result<()> {
         );
     }
     println!("\n{} adapter(s) found\n", adapters.len());
+    let outputs = platform::display::output_names();
+    if !outputs.is_empty() {
+        println!(
+            "Screens (for `config set-screen`): {}\n",
+            outputs.join(", ")
+        );
+    }
 
     // ── 2. Open the best device to confirm driver access works ───────────────
     print!("Opening best device... ");

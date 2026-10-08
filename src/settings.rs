@@ -33,15 +33,14 @@ pub struct WpSettings {
     #[serde(default)]
     pub properties: BTreeMap<String, BTreeMap<String, String>>,
     /// Named screen → wallpaper assignment (e.g. `"DP-1"` → workshop ID or
-    /// path). See the module doc: persisted, not yet renderer-driven.
+    /// path), used by `wp-engine run`.
     #[serde(default)]
     pub screens: BTreeMap<String, String>,
     /// The wallpaper `wp-engine run` falls back to when no screen-specific
     /// assignment applies.
     #[serde(default)]
     pub default_background: Option<String>,
-    /// Named playlists. See the module doc: persisted, not yet
-    /// renderer-driven (no rotation timer exists yet).
+    /// Named playlists, played by the daemon (see `schedule`).
     #[serde(default)]
     pub playlists: BTreeMap<String, Playlist>,
     /// Per-wallpaper render-quality override, keyed by [`normalize_key`] —
@@ -71,10 +70,7 @@ pub struct Playlist {
     pub items: Vec<String>,
     #[serde(default = "default_delay_minutes")]
     pub delay_minutes: u32,
-    /// `"timer"` (advance every `delay_minutes`) — the only mode with
-    /// anywhere to plug into yet; mirrors the real client's/linux-
-    /// wallpaperengine's `mode`/`order` fields structurally so a playback
-    /// scheduler has a ready-made schema to consume later.
+    /// `timer`, `daytime`, `dayofweek` or `login` — see `schedule`.
     #[serde(default = "default_mode")]
     pub mode: String,
     #[serde(default = "default_order")]
@@ -119,6 +115,43 @@ pub fn normalize_key(id_or_path: &str) -> String {
     std::fs::canonicalize(id_or_path)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| id_or_path.to_string())
+}
+
+/// XDG autostart entry that runs `wp-engine run` at login.
+pub fn autostart_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("autostart")
+        .join("wp-engine.desktop")
+}
+
+pub fn autostart_enabled() -> bool {
+    autostart_path().exists()
+}
+
+/// Write or remove the autostart entry. It points at this executable, so
+/// it follows wherever the binary was installed.
+pub fn set_autostart(enabled: bool) -> anyhow::Result<()> {
+    let path = autostart_path();
+    if !enabled {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        };
+    }
+    let exe = std::env::current_exe()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(
+        &path,
+        format!(
+            "[Desktop Entry]\nType=Application\nName=wp-engine\nComment=Animated wallpapers\n\
+             Exec=\"{}\" run\nX-GNOME-Autostart-enabled=true\n",
+            exe.display()
+        ),
+    )?;
+    Ok(())
 }
 
 impl WpSettings {

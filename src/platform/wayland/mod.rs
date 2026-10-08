@@ -1106,6 +1106,61 @@ impl ProvidesRegistryState for WallpaperState {
     registry_handlers!(OutputState, SeatState);
 }
 
+/// Names of the outputs the compositor reports, for picking a screen to
+/// assign.
+pub fn output_names() -> Vec<String> {
+    struct Outputs {
+        registry: RegistryState,
+        outputs: OutputState,
+    }
+    impl OutputHandler for Outputs {
+        fn output_state(&mut self) -> &mut OutputState {
+            &mut self.outputs
+        }
+        fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+        fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        }
+        fn output_destroyed(
+            &mut self,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+            _: wl_output::WlOutput,
+        ) {
+        }
+    }
+    impl ProvidesRegistryState for Outputs {
+        fn registry(&mut self) -> &mut RegistryState {
+            &mut self.registry
+        }
+        registry_handlers!(OutputState);
+    }
+    delegate_output!(Outputs);
+    delegate_registry!(Outputs);
+
+    let Ok(conn) = Connection::connect_to_env() else {
+        return Vec::new();
+    };
+    let Ok((globals, mut queue)) = registry_queue_init::<Outputs>(&conn) else {
+        return Vec::new();
+    };
+    let qh = queue.handle();
+    let mut state = Outputs {
+        registry: RegistryState::new(&globals),
+        outputs: OutputState::new(&globals, &qh),
+    };
+    // Two round trips: one to bind the outputs, one for their info events.
+    for _ in 0..2 {
+        if queue.roundtrip(&mut state).is_err() {
+            return Vec::new();
+        }
+    }
+    state
+        .outputs
+        .outputs()
+        .filter_map(|o| state.outputs.info(&o)?.name)
+        .collect()
+}
+
 delegate_compositor!(WallpaperState);
 delegate_output!(WallpaperState);
 delegate_shm!(WallpaperState);
