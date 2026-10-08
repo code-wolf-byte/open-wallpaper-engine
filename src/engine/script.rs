@@ -461,7 +461,7 @@ impl ScriptHost {
             }
         }
         self.run(&format!(
-            "(function(g) {{ for (var k in g) {{ if (!(k in thisScene)) {{ thisScene[k] = g[k]; }} }} }})({});",
+            "(function(g) {{ for (var k in g) {{ if (typeof thisScene[k] !== 'function') {{ thisScene[k] = __wp_raw_value(g[k]); }} }} }})({});",
             Value::Object(flat)
         ));
     }
@@ -585,6 +585,9 @@ impl ScriptHost {
         };
         for line in v["logs"].as_array().into_iter().flatten() {
             if let Some(line) = line.as_str() {
+                if cfg!(test) && std::env::var_os("WP_SCRIPT_SCENE").is_some() {
+                    eprintln!("{line}");
+                }
                 if line.starts_with("error") {
                     tracing::warn!(target: "script", "{line}");
                 } else {
@@ -710,6 +713,27 @@ fn parse_command(cmd: &Value) -> Option<ScriptCommand> {
         "shortcut" => ScriptCommand::Shortcut(s(2)?),
         _ => return None,
     })
+}
+
+/// The scripting kind of a scene.json value: `"number"`, `"bool"`,
+/// `"vec2"`/`"vec3"`/`"vec4"` (numeric strings like `"1 0 0"`), or `"string"`.
+pub fn value_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(s) => {
+            let parts: Vec<&str> = s.split_whitespace().collect();
+            let numeric = parts.iter().all(|p| p.parse::<f64>().is_ok());
+            match (numeric, parts.len()) {
+                (true, 1) => "number",
+                (true, 2) => "vec2",
+                (true, 3) => "vec3",
+                (true, 4) => "vec4",
+                _ => "string",
+            }
+        }
+        _ => "number",
+    }
 }
 
 /// The `(property, script, scriptproperties)` triples of a scene.json value
@@ -1054,6 +1078,68 @@ mod tests {
         );
         h.frame(0.0, 0.0, 0.016);
         assert_eq!(change(&mut h).text.as_deref(), Some("true 2.5 function"));
+    }
+
+    fn host_with_effects() -> ScriptHost {
+        let mut h = ScriptHost::new();
+        h.register_object(
+            0,
+            &ObjectInit {
+                name: Some("dots".into()),
+                visible: true,
+                raw: Some(serde_json::json!({
+                    "instanceoverride": {"rate": 0.5},
+                    "effects": [
+                        {"file": "effects/pulse/effect.json", "passes": [{"constantshadervalues": {"speed": 1.0}}]},
+                        {"file": "effects/scroll/effect.json", "name": "scroll", "passes": [{"constantshadervalues": {"tint": "1 0 0"}}]}
+                    ]
+                })),
+                ..Default::default()
+            },
+        );
+        h
+    }
+
+    #[test]
+    fn effect_materials_and_instance_are_scriptable() {
+        let mut h = host_with_effects();
+        h.attach(
+            0,
+            Some("visible"),
+            "export function update(v) {\n\
+               let m = thisLayer.getEffect(1).getMaterial(0);\n\
+               let t = m.tint; t.y = 0.5; m.tint = t;\n\
+               thisLayer.getEffect('pulse').getMaterial(0).speed = m.tint.y * 4;\n\
+               thisLayer.getEffect(0).visible = false;\n\
+               thisLayer.instance.rate = thisLayer.instance.rate * 2;\n\
+               return v; }",
+            None,
+        );
+        h.frame(0.0, 0.0, 0.016);
+        let c = change(&mut h);
+        assert_eq!(c.extra["effects.1.0.tint"], serde_json::json!([1, 0.5, 0]));
+        assert_eq!(c.extra["effects.0.0.speed"], serde_json::json!(2));
+        assert_eq!(c.extra["effects.0.visible"], serde_json::json!(false));
+        assert_eq!(c.extra["instance.rate"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn declared_extra_properties_drive_update_scripts() {
+        let mut h = host_with_effects();
+        h.declare_property(0, "instance.rate", "number", &serde_json::json!(0.5));
+        h.attach(
+            0,
+            Some("instance.rate"),
+            "export function update(v) { return v + 1; }",
+            None,
+        );
+        h.frame(0.0, 0.0, 0.016);
+        assert_eq!(
+            change(&mut h).extra["instance.rate"],
+            serde_json::json!(1.5)
+        );
+        assert_eq!(value_kind(&serde_json::json!("1 0 0")), "vec3");
+        assert_eq!(value_kind(&serde_json::json!("0.5")), "number");
     }
 
     #[test]

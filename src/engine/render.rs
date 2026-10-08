@@ -126,10 +126,6 @@ pub struct ResolvedChildParticle {
 /// the ratio of the new bitmap size to the old, so no projection is re-derived.
 #[derive(Clone)]
 pub struct TextDynamic {
-    pub script: String,
-    /// The scene's authored `text.scriptproperties` object (per-instance
-    /// editor values, merged over the script's builder defaults).
-    pub script_properties: Option<serde_json::Value>,
     pub font_data: Vec<u8>,
     pub point_size: f32,
     /// Text currently rasterized into the layer image (the `value` WE feeds
@@ -857,6 +853,67 @@ fn select_spritesheet_frame(obj: &SceneObject, loaded: &mut LoadedImage) {
     loaded.image = loaded.sprite_frames[frame as usize].clone();
 }
 
+/// Build the layer for one object outside the scene load — SceneScript's
+/// `thisScene.createLayer`. Covers image, solid and text objects; particle
+/// and model objects return `None`. `pkg` is the scene's package, if any.
+pub fn runtime_layer(dir: &Path, pkg: Option<&Package>, obj: &SceneObject) -> Option<Layer> {
+    if obj.text.is_some() {
+        return text_layer_from_object(obj, Some(dir), pkg);
+    }
+    let path = obj.image.as_deref()?;
+    if is_special_layer(path) {
+        return None;
+    }
+    let resolved_path = resolve_workshop_asset(dir, pkg, path);
+    let path = resolved_path.as_str();
+    let loaded = if is_solid_layer_path(path) {
+        LoadedImage::single(white_pixel())
+    } else {
+        let from_pkg = pkg.map(|p| load_texture_from_pkg(p, path));
+        match from_pkg {
+            Some(Ok(l)) => l,
+            _ => load_texture_from_dir(dir, path)
+                .inspect_err(
+                    |e| tracing::warn!(target: "scene", "createLayer: texture '{path}': {e:#}"),
+                )
+                .ok()?,
+        }
+    };
+    Some(layer_from_object(obj, loaded, None))
+}
+
+/// Scripts copied from a Workshop asset pack name assets relative to that
+/// pack (`models/bar.json`), which ships at `models/workshop/<id>/bar.json`.
+/// Returns `path` itself when it exists or no such copy is found.
+fn resolve_workshop_asset(dir: &Path, pkg: Option<&Package>, path: &str) -> String {
+    let exists = |p: &str| pkg.is_some_and(|k| k.contains(p)) || dir.join(p).is_file();
+    if exists(path) {
+        return path.to_string();
+    }
+    let Some((first, rest)) = path.split_once('/') else {
+        return path.to_string();
+    };
+    let prefix = format!("{first}/workshop/");
+    let suffix = format!("/{rest}");
+    let matches = |p: &str| {
+        p.strip_prefix(&prefix)
+            .and_then(|r| r.strip_suffix(&suffix))
+            .is_some_and(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+    };
+    if let Some(found) = pkg.and_then(|k| k.paths().find(|p| matches(p)).map(str::to_string)) {
+        return found;
+    }
+    if let Ok(entries) = std::fs::read_dir(dir.join(first).join("workshop")) {
+        for e in entries.flatten() {
+            let candidate = format!("{prefix}{}{suffix}", e.file_name().to_string_lossy());
+            if matches(&candidate) && dir.join(&candidate).is_file() {
+                return candidate;
+            }
+        }
+    }
+    path.to_string()
+}
+
 fn layer_from_object(
     obj: &SceneObject,
     mut loaded: LoadedImage,
@@ -1446,15 +1503,13 @@ fn text_layer_from_object(
         // Text + bg colors are baked into the bitmap; don't tint it again.
         layer.color = [1.0, 1.0, 1.0];
     }
-    if let Some(script) = script {
-        layer.text_dynamic = Some(TextDynamic {
-            script,
-            script_properties,
-            font_data,
-            point_size: raster_px,
-            last_text: text_str,
-        });
-    }
+    // Any text layer can be re-rasterized: its own script, or another
+    // object's script, may set its text.
+    layer.text_dynamic = Some(TextDynamic {
+        font_data,
+        point_size: raster_px,
+        last_text: text_str,
+    });
     Some(layer)
 }
 
@@ -2176,7 +2231,7 @@ fn rotate_euler_f64(v: [f64; 3], a: [f64; 3]) -> [f64; 3] {
 /// This object's own local transform, read from the raw scene fields (the same
 /// sources `layer_from_object` uses, minus alignment which is a per-layer draw
 /// concern).
-fn obj_local_xform(obj: &SceneObject) -> Xform {
+pub fn obj_local_xform(obj: &SceneObject) -> Xform {
     let t = obj.parsed_origin();
     let r = obj
         .angles
