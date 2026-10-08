@@ -417,7 +417,8 @@ fn apply_saved_settings(
 
 fn cmd_list_properties(id: &str) -> Result<()> {
     let w = workshop::find_by_id(id).ok_or_else(|| anyhow!("workshop item '{id}' not found"))?;
-    let all_props = engine::properties::list_properties(&w.path)?;
+    let base = wp_engine::render::WallpaperContent::preset_base_dir(&w.path)?;
+    let all_props = engine::properties::list_properties(&base)?;
     if all_props.is_empty() {
         println!(
             "\"{}\" declares no user-configurable properties.",
@@ -578,6 +579,13 @@ fn resolve_id_or_path(id_or_path: &str) -> Result<PathBuf> {
             "not a directory and workshop item '{id_or_path}' not found"
         ))
     }
+}
+
+/// [`resolve_id_or_path`] for the scene tools: a preset item resolves to the
+/// item it builds on, with the preset's values registered as overrides.
+fn resolve_scene_dir(id_or_path: &str) -> Result<PathBuf> {
+    let dir = resolve_id_or_path(id_or_path)?;
+    wp_engine::render::WallpaperContent::preset_base_dir(&dir)
 }
 
 /// Runs using persisted settings (`wp-engine config` to set them up first):
@@ -872,14 +880,7 @@ fn cmd_render_scene(
         .collect();
     engine::properties::set_global_overrides(overrides);
 
-    let dir = std::path::PathBuf::from(id_or_path);
-    let dir = if dir.exists() {
-        dir
-    } else {
-        workshop::find_by_id(id_or_path)
-            .map(|w| w.path)
-            .ok_or_else(|| anyhow!("not a directory and workshop item '{id_or_path}' not found"))?
-    };
+    let dir = resolve_scene_dir(id_or_path)?;
     println!("Loading scene from {}...", dir.display());
     let graph = engine::SceneGraph::from_directory(&dir)?;
     println!("Scene graph: {}", graph.stats().summary());
@@ -918,14 +919,7 @@ fn cmd_render_scene(
 fn cmd_test_scene(id_or_path: &str, num_frames: usize) -> Result<()> {
     use std::sync::{mpsc::sync_channel, Arc};
 
-    let dir = std::path::PathBuf::from(id_or_path);
-    let dir = if dir.exists() {
-        dir
-    } else {
-        workshop::find_by_id(id_or_path)
-            .map(|w| w.path)
-            .ok_or_else(|| anyhow!("not a directory and workshop item '{id_or_path}' not found"))?
-    };
+    let dir = resolve_scene_dir(id_or_path)?;
 
     println!(
         "GPU scene animation test: collecting {num_frames} frames from {}",
@@ -1031,14 +1025,7 @@ fn cmd_preview_scene(id_or_path: &str, width: u32, height: u32) -> Result<()> {
     use minifb::{Key, Window, WindowOptions};
     use std::sync::{mpsc::sync_channel, Arc};
 
-    let dir = std::path::PathBuf::from(id_or_path);
-    let dir = if dir.exists() {
-        dir
-    } else {
-        workshop::find_by_id(id_or_path)
-            .map(|w| w.path)
-            .ok_or_else(|| anyhow!("not a directory and workshop item '{id_or_path}' not found"))?
-    };
+    let dir = resolve_scene_dir(id_or_path)?;
 
     println!("Loading scene from {}...", dir.display());
     let (tx, rx) = sync_channel::<Arc<image::RgbaImage>>(2);

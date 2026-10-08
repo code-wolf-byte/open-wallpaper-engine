@@ -37,6 +37,7 @@ impl WallpaperContent {
     /// image-loading failure.
     pub fn from_wallpaper(w: &Wallpaper) -> Result<Self> {
         match w.wallpaper_type() {
+            WallpaperType::Preset => Self::from_preset_dir(&w.path),
             WallpaperType::Scene => {
                 let dir = w.path.clone();
                 if dir.join("scene.json").exists() || dir.join("scene.pkg").exists() {
@@ -77,6 +78,9 @@ impl WallpaperContent {
     /// (scene.json / scene.pkg / project.json) or a plain image/video file.
     #[tracing::instrument(target = "content", level = "debug", fields(path = %path.display()))]
     pub fn from_any_path(path: &Path) -> Result<Self> {
+        if path.is_dir() && Self::is_preset_dir(path) {
+            return Self::from_preset_dir(path);
+        }
         if path.is_dir() {
             if path.join("scene.json").exists() || path.join("scene.pkg").exists() {
                 tracing::debug!(target: "content", "resolved as scene wallpaper");
@@ -100,6 +104,42 @@ impl WallpaperContent {
             ));
         }
         Self::from_path(path)
+    }
+
+    fn is_preset_dir(dir: &Path) -> bool {
+        crate::workshop::load_project(dir)
+            .map(|p| p.wallpaper_type.is_none() && p.dependency.is_some() && p.preset.is_some())
+            .unwrap_or(false)
+    }
+
+    /// `dir` itself, or — for a preset item — the directory of the item it
+    /// builds on, after registering the preset's values as its overrides.
+    pub fn preset_base_dir(dir: &Path) -> Result<PathBuf> {
+        if !dir.is_dir() || !Self::is_preset_dir(dir) {
+            return Ok(dir.to_path_buf());
+        }
+        let project = crate::workshop::load_project(dir)?;
+        let dep = project
+            .dependency
+            .as_deref()
+            .ok_or_else(|| anyhow!("preset {} has no dependency", dir.display()))?;
+        let parent = crate::workshop::find_item_dir(dep, Some(dir)).ok_or_else(|| {
+            anyhow!(
+                "preset {} needs workshop item {dep}, which is not installed — subscribe to it first",
+                dir.display()
+            )
+        })?;
+        if let Some(preset) = &project.preset {
+            crate::engine::properties::register_preset(&parent, dir, preset);
+        }
+        tracing::info!(target: "content", "preset {} → base item {}", dir.display(), parent.display());
+        Ok(parent)
+    }
+
+    /// A preset item: the content of the item it builds on, with the
+    /// preset's values registered as that item's property overrides.
+    fn from_preset_dir(dir: &Path) -> Result<Self> {
+        Self::from_any_path(&Self::preset_base_dir(dir)?)
     }
 
     /// Detect content type from a raw file path, guessing by extension.

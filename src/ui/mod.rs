@@ -115,15 +115,17 @@ enum TypeFilter {
     Video,
     Scene,
     Web,
+    Preset,
     Application,
 }
 
 impl TypeFilter {
-    const ALL: [TypeFilter; 5] = [
+    const ALL: [TypeFilter; 6] = [
         TypeFilter::All,
         TypeFilter::Video,
         TypeFilter::Scene,
         TypeFilter::Web,
+        TypeFilter::Preset,
         TypeFilter::Application,
     ];
 
@@ -133,6 +135,7 @@ impl TypeFilter {
             TypeFilter::Video => "Video",
             TypeFilter::Scene => "Scene",
             TypeFilter::Web => "Web",
+            TypeFilter::Preset => "Preset",
             TypeFilter::Application => "Application",
         }
     }
@@ -143,6 +146,7 @@ impl TypeFilter {
             TypeFilter::Video => matches!(w.wallpaper_type(), WallpaperType::Video),
             TypeFilter::Scene => matches!(w.wallpaper_type(), WallpaperType::Scene),
             TypeFilter::Web => matches!(w.wallpaper_type(), WallpaperType::Web),
+            TypeFilter::Preset => matches!(w.wallpaper_type(), WallpaperType::Preset),
             TypeFilter::Application => matches!(w.wallpaper_type(), WallpaperType::Application),
         }
     }
@@ -1030,6 +1034,7 @@ fn type_badge_color(t: &WallpaperType) -> Color32 {
         WallpaperType::Scene => Color32::from_rgb(130, 65, 200),
         WallpaperType::Web => Color32::from_rgb(50, 160, 80),
         WallpaperType::Application => Color32::from_rgb(180, 95, 50),
+        WallpaperType::Preset => Color32::from_rgb(190, 150, 40),
         WallpaperType::Unknown => Color32::from_gray(75),
     }
 }
@@ -1040,6 +1045,7 @@ fn type_badge_label(t: &WallpaperType) -> &'static str {
         WallpaperType::Scene => "SCENE",
         WallpaperType::Web => "WEB",
         WallpaperType::Application => "APP",
+        WallpaperType::Preset => "PRESET",
         WallpaperType::Unknown => "?",
     }
 }
