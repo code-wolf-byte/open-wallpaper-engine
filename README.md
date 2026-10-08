@@ -3,8 +3,8 @@
 <p>
   <a href="LICENSE"><img alt="License: GPL-3.0-only" src="https://img.shields.io/badge/license-GPL--3.0--only-blue?style=flat-square"></a>
   <img alt="Written in Rust, 2021 edition" src="https://img.shields.io/badge/Rust-2021_edition-CE422B?style=flat-square&logo=rust&logoColor=white">
-  <img alt="Top language" src="https://img.shields.io/github/languages/top/code-wolf-byte/wp-engine?style=flat-square">
-  <img alt="Last commit" src="https://img.shields.io/github/last-commit/code-wolf-byte/wp-engine?style=flat-square">
+  <img alt="Top language" src="https://img.shields.io/github/languages/top/code-wolf-byte/open-wallpaper-engine?style=flat-square">
+  <img alt="Last commit" src="https://img.shields.io/github/last-commit/code-wolf-byte/open-wallpaper-engine?style=flat-square">
 </p>
 
 **Renders**&nbsp;
@@ -112,8 +112,8 @@ brew install shaderc ffmpeg
 Then build:
 
 ```bash
-git clone https://github.com/code-wolf-byte/wp-engine
-cd wp-engine
+git clone https://github.com/code-wolf-byte/open-wallpaper-engine
+cd open-wallpaper-engine
 cargo build --release
 ```
 
