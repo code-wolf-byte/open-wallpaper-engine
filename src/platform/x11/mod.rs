@@ -508,6 +508,8 @@ fn wallpaper_loop(
             };
         }
         let paused = crate::engine::playback_gate::should_pause(&pause_conditions, &playback_state);
+        crate::engine::audio::set_muted(paused);
+        crate::engine::audio::set_master_volume(settings.default.lock().unwrap().volume);
 
         if !paused {
             for output in &mut outputs {

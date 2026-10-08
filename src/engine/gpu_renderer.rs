@@ -1747,6 +1747,14 @@ struct ParticleGpuAssets {
     children: Vec<ParticleGpuTex>,
 }
 
+/// A scene `sound` object's playback stream, kept with its owner's identity
+/// so SceneScript can find it by layer name or id.
+pub(crate) struct SceneSound {
+    pub name: Option<String>,
+    pub id: Option<i64>,
+    pub playback: crate::engine::audio::SoundPlayback,
+}
+
 pub struct GpuSceneInstance {
     renderer: GpuSceneRenderer,
     layers: Vec<SceneLayerGpu>,
@@ -1809,7 +1817,7 @@ pub struct GpuSceneInstance {
     audio_capture: Option<crate::engine::audio::AudioCapture>,
     /// Live playback streams for `sound` objects; kept alive for the scene's
     /// lifetime (dropping stops the audio).
-    _sounds: Vec<crate::engine::audio::SoundPlayback>,
+    sounds: Vec<SceneSound>,
     /// MPRIS "what's playing" watcher (`engine::media`) — Linux-only (see
     /// its own module doc). Started unconditionally rather than gated on
     /// whether any script actually reads `media.*` (matching
@@ -2468,23 +2476,21 @@ impl GpuSceneInstance {
             None
         };
 
-        // Sound objects: decode + play each file (looped unless startsilent).
+        // Sound objects: decode each file and play it looped; `startsilent`
+        // ones are held ready but silent so a script can `play()` them.
         let mut sounds = Vec::new();
         for obj in &resolved.scene.objects {
             let Some(sound) = obj.sound.as_ref() else {
                 continue;
             };
-            if obj
+            let start_silent = obj
                 .startsilent
                 .as_ref()
                 .and_then(|v| {
                     v.as_bool()
                         .or_else(|| v.get("value").and_then(|i| i.as_bool()))
                 })
-                .unwrap_or(false)
-            {
-                continue;
-            }
+                .unwrap_or(false);
             let volume = obj
                 .volume
                 .as_ref()
@@ -2502,10 +2508,17 @@ impl GpuSceneInstance {
                 _ => Vec::new(),
             };
             for f in files {
-                if let Some(p) =
-                    crate::engine::audio::SoundPlayback::start(&dir.join(&f), volume, looping)
-                {
-                    sounds.push(p);
+                if let Some(p) = crate::engine::audio::SoundPlayback::start(
+                    &dir.join(&f),
+                    volume,
+                    looping,
+                    !start_silent,
+                ) {
+                    sounds.push(SceneSound {
+                        name: obj.name.clone(),
+                        id: obj.id,
+                        playback: p,
+                    });
                     break;
                 }
             }
@@ -2895,7 +2908,7 @@ impl GpuSceneInstance {
             mouse_norm: [0.5, 0.5],
             script_ctx: crate::engine::script::ScriptContext::new(),
             audio_capture,
-            _sounds: sounds,
+            sounds,
             #[cfg(target_os = "linux")]
             media: crate::engine::media::MediaWatcher::start(),
             perspective: camera3d.is_some(),
