@@ -1,9 +1,9 @@
 use crate::platform::RenderQuality;
 use crate::platform::WallpaperHandle;
 use crate::render::RenderSettings;
+use crate::workshop::{self, Wallpaper, WallpaperType};
 #[cfg(not(target_os = "linux"))]
 use crate::{platform::display::detect_platform, render::WallpaperContent};
-use crate::workshop::{self, Wallpaper, WallpaperType};
 use egui::{pos2, vec2, Align, Color32, CornerRadius, FontId, Layout, Rect, Sense};
 use std::collections::HashMap;
 use std::path::PathBuf;

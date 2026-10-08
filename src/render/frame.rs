@@ -73,7 +73,11 @@ impl FrameSource {
                     .recv()
                     .map_err(|_| anyhow!("scene renderer exited before producing any frames"))?;
 
-                Ok(FrameSource::Video { current: first, rx, web_input: None })
+                Ok(FrameSource::Video {
+                    current: first,
+                    rx,
+                    web_input: None,
+                })
             }
             // Web wallpapers reuse the `Video` variant rather than adding one:
             // it already means "a stream of frames plus the latest", which is
@@ -102,7 +106,11 @@ impl FrameSource {
                     .recv()
                     .map_err(|_| anyhow!("video decoder exited before producing any frames"))?;
 
-                Ok(FrameSource::Video { current: first, rx, web_input: None })
+                Ok(FrameSource::Video {
+                    current: first,
+                    rx,
+                    web_input: None,
+                })
             }
         }
     }

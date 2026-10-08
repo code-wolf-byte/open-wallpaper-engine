@@ -854,9 +854,19 @@ export function update(value) {
     #[test]
     fn look_at_faces_the_target_straight_ahead() {
         let mut ctx = ScriptContext::new();
-        ctx.set_current_object(Some("obj"), Some(1), [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.0, 0.0]);
-        let script = "export function update(value) { return thisLayer.lookAt(new Vec3(0, 0, 5)); }";
-        let angles = ctx.eval_update_vec3(script, [0.0, 0.0, 0.0]).expect("should evaluate");
+        ctx.set_current_object(
+            Some("obj"),
+            Some(1),
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0],
+        );
+        let script =
+            "export function update(value) { return thisLayer.lookAt(new Vec3(0, 0, 5)); }";
+        let angles = ctx
+            .eval_update_vec3(script, [0.0, 0.0, 0.0])
+            .expect("should evaluate");
         // Target is straight down local +Z: both pitch and yaw are 0.
         assert!(angles[0].abs() < 1e-4, "pitch: {angles:?}");
         assert!(angles[1].abs() < 1e-4, "yaw: {angles:?}");
@@ -865,13 +875,29 @@ export function update(value) {
     #[test]
     fn look_at_yaw_touches_only_the_y_axis() {
         let mut ctx = ScriptContext::new();
-        ctx.set_current_object(None, None, [0.0, 0.0, 0.0], [0.3, 0.0, 0.7], [1.0, 1.0, 1.0], [0.0, 0.0]);
+        ctx.set_current_object(
+            None,
+            None,
+            [0.0, 0.0, 0.0],
+            [0.3, 0.0, 0.7],
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0],
+        );
         // Target far to +X, high up: yaw should swing toward +X (atan2(5,0) = pi/2)
         // while the authored pitch/roll pass through untouched.
-        let script = "export function update(value) { return thisLayer.lookAtYaw(new Vec3(5, 100, 0)); }";
-        let angles = ctx.eval_update_vec3(script, [0.3, 0.0, 0.7]).expect("should evaluate");
-        assert!((angles[0] - 0.3).abs() < 1e-4, "pitch must stay unchanged: {angles:?}");
-        assert!((angles[2] - 0.7).abs() < 1e-4, "roll must stay unchanged: {angles:?}");
+        let script =
+            "export function update(value) { return thisLayer.lookAtYaw(new Vec3(5, 100, 0)); }";
+        let angles = ctx
+            .eval_update_vec3(script, [0.3, 0.0, 0.7])
+            .expect("should evaluate");
+        assert!(
+            (angles[0] - 0.3).abs() < 1e-4,
+            "pitch must stay unchanged: {angles:?}"
+        );
+        assert!(
+            (angles[2] - 0.7).abs() < 1e-4,
+            "roll must stay unchanged: {angles:?}"
+        );
         assert!(
             (angles[1] - std::f32::consts::FRAC_PI_2).abs() < 1e-3,
             "yaw should point toward +X: {angles:?}"
@@ -882,8 +908,11 @@ export function update(value) {
     fn rotate_object_space_is_additive() {
         let mut ctx = ScriptContext::new();
         ctx.set_current_object(None, None, [0.0; 3], [0.1, 0.2, 0.3], [1.0; 3], [0.0, 0.0]);
-        let script = "export function update(value) { return thisLayer.rotateObjectSpace(0.5, -0.1, 0.2); }";
-        let angles = ctx.eval_update_vec3(script, [0.1, 0.2, 0.3]).expect("should evaluate");
+        let script =
+            "export function update(value) { return thisLayer.rotateObjectSpace(0.5, -0.1, 0.2); }";
+        let angles = ctx
+            .eval_update_vec3(script, [0.1, 0.2, 0.3])
+            .expect("should evaluate");
         assert!((angles[0] - 0.6).abs() < 1e-5, "{angles:?}");
         assert!((angles[1] - 0.1).abs() < 1e-5, "{angles:?}");
         assert!((angles[2] - 0.5).abs() < 1e-5, "{angles:?}");
@@ -896,7 +925,9 @@ export function update(value) {
         let script = "export function update(value) { \
             var m = thisLayer.getTransformMatrix(); \
             return new Vec3(m[12], m[13], m[14]); }";
-        let t = ctx.eval_update_vec3(script, [0.0; 3]).expect("should evaluate");
+        let t = ctx
+            .eval_update_vec3(script, [0.0; 3])
+            .expect("should evaluate");
         assert_eq!(t, [3.0, 4.0, 5.0]);
     }
 
@@ -910,10 +941,19 @@ export function update(value) {
             angles: [0.0, 0.0, 0.0],
             scale: [2.0, 2.0, 2.0],
         }]);
-        ctx.set_current_object(Some("Child"), Some(1), [1.0, 0.0, 0.0], [0.0; 3], [1.0; 3], [0.0, 0.0]);
+        ctx.set_current_object(
+            Some("Child"),
+            Some(1),
+            [1.0, 0.0, 0.0],
+            [0.0; 3],
+            [1.0; 3],
+            [0.0, 0.0],
+        );
         let script = "export function update(value) { \
             return thisLayer.setParent(thisScene.getLayer('Anchor')).origin; }";
-        let origin = ctx.eval_update_vec3(script, [1.0, 0.0, 0.0]).expect("should evaluate");
+        let origin = ctx
+            .eval_update_vec3(script, [1.0, 0.0, 0.0])
+            .expect("should evaluate");
         // local (1,0,0) * parent scale (2,2,2) = (2,0,0), unrotated, + parent origin (10,0,0)
         assert_eq!(origin, [12.0, 0.0, 0.0]);
     }
@@ -924,7 +964,9 @@ export function update(value) {
         ctx.set_layers(&[]);
         let script = "export function update(value) { \
             return thisScene.getLayer('Nope') === null ? new Vec3(1,1,1) : new Vec3(0,0,0); }";
-        let v = ctx.eval_update_vec3(script, [0.0; 3]).expect("should evaluate");
+        let v = ctx
+            .eval_update_vec3(script, [0.0; 3])
+            .expect("should evaluate");
         assert_eq!(v, [1.0, 1.0, 1.0]);
     }
 
@@ -939,7 +981,9 @@ export function update(value) {
             var idx = thisLayer.getAttachmentIndex('hand'); \
             var o = thisLayer.getAttachmentOrigin(idx); \
             return new Vec3(idx, o.x, o.z); }";
-        let out = ctx.eval_update_vec3(script, [0.0; 3]).expect("should evaluate");
+        let out = ctx
+            .eval_update_vec3(script, [0.0; 3])
+            .expect("should evaluate");
         assert_eq!(out, [-1.0, 7.0, 9.0]);
     }
 
@@ -949,7 +993,8 @@ export function update(value) {
         ctx.set_current_object(None, None, [0.0; 3], [0.0; 3], [1.0; 3], [0.0, 0.0]);
         assert!(!ctx.take_propagation_disabled());
 
-        let script = "export function update(value) { thisLayer.disablepropagation(); return value; }";
+        let script =
+            "export function update(value) { thisLayer.disablepropagation(); return value; }";
         ctx.eval_update_vec3(script, [0.0; 3]);
         assert!(ctx.take_propagation_disabled());
 
@@ -970,7 +1015,16 @@ export function update(value) {
     #[test]
     fn set_media_updates_the_global_a_script_can_read() {
         let mut ctx = ScriptContext::new();
-        ctx.set_media(true, 1, "Song Title", "The Artist", "An Album", 30_000_000, 180_000_000, None);
+        ctx.set_media(
+            true,
+            1,
+            "Song Title",
+            "The Artist",
+            "An Album",
+            30_000_000,
+            180_000_000,
+            None,
+        );
 
         let script = "export function update(value) { return media.available ? 1 : 0; }";
         assert_eq!(ctx.eval_update(script, 0.0), Some(1.0));
@@ -990,7 +1044,16 @@ export function update(value) {
         let mut ctx = ScriptContext::new();
         // A title containing a quote and a backslash must not break out of
         // the JS string literal `set_media` builds.
-        ctx.set_media(true, 0, "Quote\" \\ Test", "", "", 0, 0, Some("http://example.com/art.jpg"));
+        ctx.set_media(
+            true,
+            0,
+            "Quote\" \\ Test",
+            "",
+            "",
+            0,
+            0,
+            Some("http://example.com/art.jpg"),
+        );
 
         let script = "export function update(value) { return media.title; }";
         assert_eq!(

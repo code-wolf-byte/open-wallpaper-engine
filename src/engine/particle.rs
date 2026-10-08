@@ -805,10 +805,16 @@ struct VortexParams {
 /// three collapse to the same axis-aligned-rectangle test.
 #[derive(Clone, Copy)]
 enum CollisionShape {
-    Sphere { radius: f32 },
-    Box { half_extent: [f32; 2] },
+    Sphere {
+        radius: f32,
+    },
+    Box {
+        half_extent: [f32; 2],
+    },
     /// `normal` points away from the solid side (into free space).
-    Plane { normal: [f32; 2] },
+    Plane {
+        normal: [f32; 2],
+    },
 }
 
 /// `collisionbehavior`: what happens to a particle that penetrates a
@@ -1137,12 +1143,23 @@ impl RemapParams {
     /// axis, exactly the original x/y-decorrelation this operator always
     /// used); field mode ignores it, which is what gives a scalar field's
     /// single value its "broadcast to every output axis" behavior.
-    fn sample01(&self, axis_seed: f64, p: &Particle, time: f32, lifetime_pos: f32, max_life: f32) -> f32 {
+    fn sample01(
+        &self,
+        axis_seed: f64,
+        p: &Particle,
+        time: f32,
+        lifetime_pos: f32,
+        max_life: f32,
+    ) -> f32 {
         if self.input == RemapField::None || self.transform.is_noise() {
             use crate::engine::noise::fbm_noise;
             let s = self.input_scale;
             let (x, y, t) = ((p.x * s) as f64, (p.y * s) as f64, time as f64);
-            let octaves = if self.transform == RemapTransform::Fbm { 4 } else { 1 };
+            let octaves = if self.transform == RemapTransform::Fbm {
+                4
+            } else {
+                1
+            };
             let n = fbm_noise(x + axis_seed, y, t, octaves);
             ((n * 0.5 + 0.5) as f32).clamp(0.0, 1.0) // [-1,1] → [0,1]
         } else {
@@ -1160,7 +1177,14 @@ impl RemapParams {
     /// original x/y-decorrelated noise sampling exactly; field-mode inputs
     /// naturally broadcast the same value to every written axis instead
     /// (`sample01` ignores the seed outside noise mode).
-    fn apply_vector(&self, p: &Particle, time: f32, lifetime_pos: f32, current: [f32; 3], axes: usize) -> [f32; 3] {
+    fn apply_vector(
+        &self,
+        p: &Particle,
+        time: f32,
+        lifetime_pos: f32,
+        current: [f32; 3],
+        axes: usize,
+    ) -> [f32; 3] {
         let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
         let seeds = [0.0f64, 13.7, 27.4];
         let mut out = current;
@@ -1756,9 +1780,7 @@ impl ParticleSystem {
                             .map(|a| a[2])
                             .unwrap_or(0.0);
                         let (s, c) = az.sin_cos();
-                        CollisionShape::Plane {
-                            normal: [-s, c],
-                        }
+                        CollisionShape::Plane { normal: [-s, c] }
                     }
                     // collisionbox/collisionbounds/collisionquad
                     _ => {
@@ -2272,7 +2294,8 @@ impl ParticleSystem {
                         ];
                     }
                     RemapOutput::Position => {
-                        let [x, y, _] = r.apply_vector(p, self.time, lifetime_pos, [p.x, p.y, 0.0], 2);
+                        let [x, y, _] =
+                            r.apply_vector(p, self.time, lifetime_pos, [p.x, p.y, 0.0], 2);
                         p.x = x;
                         p.y = y;
                     }
@@ -4650,8 +4673,16 @@ mod tests {
         sys.particles.push(p);
         sys.step(0.1);
         let p = &sys.particles[0];
-        assert!((p.x - 50.0).abs() < 1e-3, "expected pushed to surface, x={}", p.x);
-        assert!(p.vx > 0.0, "expected reflected outward velocity, vx={}", p.vx);
+        assert!(
+            (p.x - 50.0).abs() < 1e-3,
+            "expected pushed to surface, x={}",
+            p.x
+        );
+        assert!(
+            p.vx > 0.0,
+            "expected reflected outward velocity, vx={}",
+            p.vx
+        );
     }
 
     /// `collisionbox` with `slide`: the into-wall velocity component is
@@ -4672,8 +4703,16 @@ mod tests {
         sys.particles.push(p);
         sys.step(0.15);
         let p = &sys.particles[0];
-        assert!((p.x - 50.0).abs() < 1e-3, "expected pushed to wall, x={}", p.x);
-        assert!(p.vx.abs() < 1e-3, "expected into-wall velocity zeroed, vx={}", p.vx);
+        assert!(
+            (p.x - 50.0).abs() < 1e-3,
+            "expected pushed to wall, x={}",
+            p.x
+        );
+        assert!(
+            p.vx.abs() < 1e-3,
+            "expected into-wall velocity zeroed, vx={}",
+            p.vx
+        );
     }
 
     /// `collisionplane` with `delete`: a particle on the solid side of the
@@ -4691,7 +4730,10 @@ mod tests {
         let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
         sys.particles.push(make_particle(0.0, -10.0, 5.0, 0.0));
         sys.step(0.1);
-        assert!(sys.particles.is_empty(), "particle should be deleted on contact");
+        assert!(
+            sys.particles.is_empty(),
+            "particle should be deleted on contact"
+        );
     }
 
     /// `boids` cohesion pulls two distant particles toward each other.
@@ -4708,8 +4750,16 @@ mod tests {
         sys.particles.push(make_particle(-100.0, 0.0, 5.0, 0.0));
         sys.particles.push(make_particle(100.0, 0.0, 5.0, 0.0));
         sys.step(0.1);
-        assert!(sys.particles[0].vx > 1.0, "left particle should move right, vx={}", sys.particles[0].vx);
-        assert!(sys.particles[1].vx < -1.0, "right particle should move left, vx={}", sys.particles[1].vx);
+        assert!(
+            sys.particles[0].vx > 1.0,
+            "left particle should move right, vx={}",
+            sys.particles[0].vx
+        );
+        assert!(
+            sys.particles[1].vx < -1.0,
+            "right particle should move left, vx={}",
+            sys.particles[1].vx
+        );
     }
 
     /// `boids` separation pushes two nearby particles apart.
@@ -4726,8 +4776,16 @@ mod tests {
         sys.particles.push(make_particle(-2.0, 0.0, 5.0, 0.0));
         sys.particles.push(make_particle(2.0, 0.0, 5.0, 0.0));
         sys.step(0.1);
-        assert!(sys.particles[0].vx < 0.0, "left particle should move further left, vx={}", sys.particles[0].vx);
-        assert!(sys.particles[1].vx > 0.0, "right particle should move further right, vx={}", sys.particles[1].vx);
+        assert!(
+            sys.particles[0].vx < 0.0,
+            "left particle should move further left, vx={}",
+            sys.particles[0].vx
+        );
+        assert!(
+            sys.particles[1].vx > 0.0,
+            "right particle should move further right, vx={}",
+            sys.particles[1].vx
+        );
     }
 
     /// `movement.drag` decays velocity by `1 - drag*dt` per step, clamped

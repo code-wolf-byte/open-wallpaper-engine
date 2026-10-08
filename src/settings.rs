@@ -146,7 +146,10 @@ impl WpSettings {
     }
 
     /// Saved property overrides for one wallpaper, empty when it has none.
-    pub fn property_overrides(&self, id_or_path: &str) -> std::collections::HashMap<String, String> {
+    pub fn property_overrides(
+        &self,
+        id_or_path: &str,
+    ) -> std::collections::HashMap<String, String> {
         self.properties
             .get(&normalize_key(id_or_path))
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -177,7 +180,8 @@ impl WpSettings {
     }
 
     pub fn set_screen(&mut self, screen: &str, id_or_path: &str) {
-        self.screens.insert(screen.to_string(), id_or_path.to_string());
+        self.screens
+            .insert(screen.to_string(), id_or_path.to_string());
     }
 
     /// Returns whether a screen assignment actually existed to remove.
@@ -251,7 +255,10 @@ mod tests {
         settings.set_property("no-such-wallpaper-id", "color", "1 0 0");
         settings.set_screen("DP-1", "no-such-wallpaper-id");
         settings.set_default_background("no-such-wallpaper-id");
-        settings.set_quality("no-such-wallpaper-id", crate::platform::RenderQuality::Medium);
+        settings.set_quality(
+            "no-such-wallpaper-id",
+            crate::platform::RenderQuality::Medium,
+        );
         settings.playlists.insert(
             "morning".to_string(),
             Playlist {
@@ -318,7 +325,10 @@ mod tests {
         settings.set_quality("w", RenderQuality::Low);
         assert_eq!(settings.quality_override("w"), Some(RenderQuality::Low));
         // Stored as the label string, not some opaque encoding — inspect it directly.
-        assert_eq!(settings.quality.get(&normalize_key("w")), Some(&"Low".to_string()));
+        assert_eq!(
+            settings.quality.get(&normalize_key("w")),
+            Some(&"Low".to_string())
+        );
 
         settings.set_quality("w", RenderQuality::Ultra);
         assert_eq!(settings.quality_override("w"), Some(RenderQuality::Ultra));

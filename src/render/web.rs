@@ -36,7 +36,11 @@ pub const WEB_HEIGHT: u32 = 1080;
 /// callers never present a blank surface.
 pub fn start_web_stream(
     html: &Path,
-) -> Result<(RgbaImage, Receiver<Arc<RgbaImage>>, SyncSender<WebInputEvent>)> {
+) -> Result<(
+    RgbaImage,
+    Receiver<Arc<RgbaImage>>,
+    SyncSender<WebInputEvent>,
+)> {
     imp::start_web_stream(html)
 }
 
@@ -55,8 +59,16 @@ pub fn is_supported() -> bool {
 /// tracking) so callers never need to know CEF's fixed pixel canvas size.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WebInputEvent {
-    MouseMove { x_norm: f32, y_norm: f32 },
-    MouseButton { x_norm: f32, y_norm: f32, button: WebMouseButton, pressed: bool },
+    MouseMove {
+        x_norm: f32,
+        y_norm: f32,
+    },
+    MouseButton {
+        x_norm: f32,
+        y_norm: f32,
+        button: WebMouseButton,
+        pressed: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +101,11 @@ mod imp {
 
     pub fn start_web_stream(
         html: &Path,
-    ) -> Result<(RgbaImage, Receiver<Arc<RgbaImage>>, SyncSender<WebInputEvent>)> {
+    ) -> Result<(
+        RgbaImage,
+        Receiver<Arc<RgbaImage>>,
+        SyncSender<WebInputEvent>,
+    )> {
         Err(anyhow!(
             "cannot render web wallpaper {}: this build has no web support.\n\
              Rebuild with `cargo build --features web` (downloads the CEF/Chromium \
@@ -519,7 +535,12 @@ mod imp {
             WebInputEvent::MouseMove { x_norm, y_norm } => {
                 host.send_mouse_move_event(Some(&to_px(x_norm, y_norm)), 0);
             }
-            WebInputEvent::MouseButton { x_norm, y_norm, button, pressed } => {
+            WebInputEvent::MouseButton {
+                x_norm,
+                y_norm,
+                button,
+                pressed,
+            } => {
                 let type_ = match button {
                     WebMouseButton::Left => MouseButtonType::LEFT,
                     WebMouseButton::Right => MouseButtonType::RIGHT,
@@ -856,7 +877,11 @@ mod imp {
 
     pub fn start_web_stream(
         html: &Path,
-    ) -> Result<(RgbaImage, Receiver<Arc<RgbaImage>>, SyncSender<WebInputEvent>)> {
+    ) -> Result<(
+        RgbaImage,
+        Receiver<Arc<RgbaImage>>,
+        SyncSender<WebInputEvent>,
+    )> {
         let html = html
             .canonicalize()
             .with_context(|| format!("resolving web wallpaper path {}", html.display()))?;
@@ -978,11 +1003,18 @@ mod imp {
             let files = parsed["customrandomdirectory"]["__files"]
                 .as_array()
                 .expect("__files should be a bundled array");
-            assert_eq!(files.len(), 2, "should list exactly the 2 real files, not the subdirectory");
+            assert_eq!(
+                files.len(),
+                2,
+                "should list exactly the 2 real files, not the subdirectory"
+            );
             for f in files {
                 let s = f.as_str().unwrap();
                 assert!(s.starts_with('/'), "{s} should be a bare absolute path");
-                assert!(!s.starts_with("file://"), "{s} should not be pre-prefixed with file://");
+                assert!(
+                    !s.starts_with("file://"),
+                    "{s} should not be pre-prefixed with file://"
+                );
                 assert!(s.ends_with(".jpg"));
             }
         }

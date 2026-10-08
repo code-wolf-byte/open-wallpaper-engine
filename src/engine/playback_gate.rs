@@ -196,10 +196,19 @@ mod tests {
         std::env::remove_var("WP_ENGINE_PAUSE_ON_MAXIMIZED");
 
         let cond = PauseConditions::from_env();
-        assert!(cond.on_battery, "explicit 1 should override the false default");
-        assert!(!cond.on_lock_or_sleep, "explicit 0 should override the true default");
+        assert!(
+            cond.on_battery,
+            "explicit 1 should override the false default"
+        );
+        assert!(
+            !cond.on_lock_or_sleep,
+            "explicit 0 should override the true default"
+        );
         assert!(cond.on_fullscreen_app, "unset should keep the true default");
-        assert!(!cond.on_maximized_app, "unset should keep the false default");
+        assert!(
+            !cond.on_maximized_app,
+            "unset should keep the false default"
+        );
 
         unsafe {
             std::env::remove_var("WP_ENGINE_PAUSE_ON_BATTERY");

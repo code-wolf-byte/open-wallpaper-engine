@@ -83,12 +83,13 @@ pub fn run_daemon() -> Result<()> {
     // that died without cleaning up.
     let socket = super::socket_path();
     let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)
-        .with_context(|| format!("binding {}", socket.display()))?;
+    let listener =
+        UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
     listener.set_nonblocking(true)?;
 
     STOP_REQUESTED.store(false, Ordering::SeqCst);
-    let handler = handle_stop_signal as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t;
+    let handler =
+        handle_stop_signal as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t;
     unsafe {
         libc::signal(libc::SIGINT, handler);
         libc::signal(libc::SIGTERM, handler);
@@ -127,9 +128,13 @@ fn handle_client(stream: UnixStream, state: &Mutex<State>) {
 
     let mut line = String::new();
     let response = match BufReader::new(&stream).read_line(&mut line) {
-        Err(e) => Response::Error { message: format!("reading request: {e}") },
+        Err(e) => Response::Error {
+            message: format!("reading request: {e}"),
+        },
         Ok(_) => match serde_json::from_str::<Request>(line.trim()) {
-            Err(e) => Response::Error { message: format!("malformed request: {e}") },
+            Err(e) => Response::Error {
+                message: format!("malformed request: {e}"),
+            },
             Ok(req) => {
                 tracing::debug!(target: "app", ?req, "daemon request");
                 handle_request(req, state)
@@ -163,13 +168,17 @@ fn handle_request(req: Request, state: &Mutex<State>) -> Response {
                     state.title = title;
                     Response::Ok
                 }
-                Err(e) => Response::Error { message: format!("{e:#}") },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
             }
         }
         Request::SetQuality { quality } => {
             let Some(q) = RenderQuality::parse(&quality) else {
                 return Response::Error {
-                    message: format!("invalid quality '{quality}' (expected Ultra, High, Medium, or Low)"),
+                    message: format!(
+                        "invalid quality '{quality}' (expected Ultra, High, Medium, or Low)"
+                    ),
                 };
             };
             // No screen named: the whole wallpaper, every output included.
@@ -229,8 +238,13 @@ mod tests {
         let path = dir.join("daemon.lock");
 
         let first = InstanceLock::acquire(&path).unwrap();
-        let err = InstanceLock::acquire(&path).err().expect("second lock must fail");
-        assert!(err.to_string().contains(&std::process::id().to_string()), "{err}");
+        let err = InstanceLock::acquire(&path)
+            .err()
+            .expect("second lock must fail");
+        assert!(
+            err.to_string().contains(&std::process::id().to_string()),
+            "{err}"
+        );
 
         drop(first);
         InstanceLock::acquire(&path).expect("lock is free again once dropped");

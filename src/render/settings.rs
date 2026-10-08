@@ -67,7 +67,10 @@ mod tests {
         let settings = Arc::new(Mutex::new(RenderSettings::default()));
         let screen_settings = ScreenSettings::single(Arc::clone(&settings));
         assert!(Arc::ptr_eq(&screen_settings.resolve(None), &settings));
-        assert!(Arc::ptr_eq(&screen_settings.resolve(Some("DP-1")), &settings));
+        assert!(Arc::ptr_eq(
+            &screen_settings.resolve(Some("DP-1")),
+            &settings
+        ));
     }
 
     #[test]

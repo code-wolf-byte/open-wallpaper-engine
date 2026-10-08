@@ -41,7 +41,11 @@ use crate::render::{ScreenContent, ScreenSettings, WallpaperContent};
 pub struct MacOSPlatform;
 
 impl DisplayPlatform for MacOSPlatform {
-    fn spawn_wallpaper(&self, content: ScreenContent, _settings: ScreenSettings) -> Result<WallpaperHandle> {
+    fn spawn_wallpaper(
+        &self,
+        content: ScreenContent,
+        _settings: ScreenSettings,
+    ) -> Result<WallpaperHandle> {
         // AppKit/winit demand the event loop on the process main thread, and the
         // GUI (eframe) already owns this process's main thread — two winit event
         // loops can't share it. So we can't run the wallpaper in-process here.
@@ -65,7 +69,9 @@ impl DisplayPlatform for MacOSPlatform {
             .arg(&dir)
             .spawn()
             .map_err(|e| anyhow!("failed to launch wallpaper process: {e}"))?;
-        Ok(WallpaperHandle::new(Box::new(ChildWallpaperHandle { child })))
+        Ok(WallpaperHandle::new(Box::new(ChildWallpaperHandle {
+            child,
+        })))
     }
 }
 

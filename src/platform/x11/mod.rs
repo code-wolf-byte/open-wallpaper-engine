@@ -47,7 +47,11 @@ const PAUSE_CHECK_INTERVAL: Duration = Duration::from_millis(750);
 pub(super) struct X11Platform;
 
 impl DisplayPlatform for X11Platform {
-    fn spawn_wallpaper(&self, content: ScreenContent, settings: ScreenSettings) -> Result<WallpaperHandle> {
+    fn spawn_wallpaper(
+        &self,
+        content: ScreenContent,
+        settings: ScreenSettings,
+    ) -> Result<WallpaperHandle> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
 
@@ -102,7 +106,12 @@ pub(crate) struct NamedOutput {
 /// Enumerate connected+active RandR outputs (name + rectangle), falling back
 /// to the whole root window when RandR is missing or reports nothing usable
 /// (headless X, Xvfb, old servers).
-fn discover_outputs(conn: &RustConnection, root: Window, root_w: u16, root_h: u16) -> Vec<NamedOutput> {
+fn discover_outputs(
+    conn: &RustConnection,
+    root: Window,
+    root_w: u16,
+    root_h: u16,
+) -> Vec<NamedOutput> {
     let whole = vec![NamedOutput {
         name: None,
         rect: OutputRect {
@@ -285,7 +294,8 @@ struct EwmhAtoms {
 
 impl EwmhAtoms {
     fn intern(conn: &impl Connection) -> Result<Self> {
-        let atom = |name: &[u8]| -> Result<Atom> { Ok(conn.intern_atom(false, name)?.reply()?.atom) };
+        let atom =
+            |name: &[u8]| -> Result<Atom> { Ok(conn.intern_atom(false, name)?.reply()?.atom) };
         Ok(Self {
             active_window: atom(b"_NET_ACTIVE_WINDOW")?,
             wm_state: atom(b"_NET_WM_STATE")?,
@@ -311,7 +321,8 @@ impl EwmhAtoms {
             return (false, false);
         };
         let fullscreen = states.contains(&self.fullscreen);
-        let maximized = states.contains(&self.maximized_vert) && states.contains(&self.maximized_horz);
+        let maximized =
+            states.contains(&self.maximized_vert) && states.contains(&self.maximized_horz);
         (fullscreen, maximized)
     }
 }
@@ -345,7 +356,11 @@ fn read_atoms32(conn: &impl Connection, window: Window, property: Atom) -> Optio
 /// the Wayland backend's `build_content_renderer`. Split out so each output
 /// gets its own independent `GpuSceneInstance`/`FrameSource` instead of one
 /// shared across the whole root pixmap.
-fn build_content_renderer(content: WallpaperContent, device: wgpu::Device, queue: wgpu::Queue) -> Result<ContentRenderer> {
+fn build_content_renderer(
+    content: WallpaperContent,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+) -> Result<ContentRenderer> {
     Ok(match content {
         WallpaperContent::Scene { dir } => {
             match GpuSceneInstance::with_device(device, queue, &dir) {
@@ -378,7 +393,11 @@ struct OutputInstance {
     right_down: bool,
 }
 
-fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, stop: Arc<AtomicBool>) -> Result<()> {
+fn wallpaper_loop(
+    content: ScreenContent,
+    settings: ScreenSettings,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
     let (conn, screen_num) =
         x11rb::connect(None).map_err(|e| anyhow!("cannot connect to X display: {e}"))?;
     let screen = &conn.setup().roots[screen_num];
@@ -603,7 +622,11 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, stop: Arc<At
 
         // Paused: no point looping at frame rate just to re-check the same
         // throttled conditions — sleep for that same interval instead.
-        let budget = if paused { PAUSE_CHECK_INTERVAL } else { frame_budget };
+        let budget = if paused {
+            PAUSE_CHECK_INTERVAL
+        } else {
+            frame_budget
+        };
         if let Some(rest) = budget.checked_sub(started.elapsed()) {
             thread::sleep(rest);
         }
