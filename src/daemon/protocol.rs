@@ -116,14 +116,31 @@ pub enum Request {
     /// Replace whatever is showing with this wallpaper.
     Apply(ApplySpec),
     /// Live-adjust the active wallpaper's default render quality.
-    SetQuality { quality: String },
+    SetQuality {
+        quality: String,
+    },
     /// Live-adjust the active wallpaper's volume (0.0–1.0).
-    SetVolume { volume: f32 },
+    SetVolume {
+        volume: f32,
+    },
     /// Live-adjust the frame-rate cap (1–240).
-    SetFps { fps: u32 },
+    SetFps {
+        fps: u32,
+    },
     /// Audio capture device for audio-reactive wallpapers; `None` =
     /// automatic. Takes effect on the next apply.
-    SetAudioDevice { device: Option<String> },
+    SetAudioDevice {
+        device: Option<String>,
+    },
+    /// Play a saved playlist (its items rotate per its mode).
+    PlayPlaylist {
+        name: String,
+    },
+    /// Skip the playing playlist to its next / previous item.
+    NextItem,
+    PreviousItem,
+    /// Stop rotating; the current wallpaper stays.
+    StopPlaylist,
     /// Remove the wallpaper but keep the daemon running.
     Clear,
     /// Remove the wallpaper and exit the daemon.
@@ -141,6 +158,9 @@ pub struct ActiveWallpaper {
 pub struct DaemonStatus {
     pub pid: u32,
     pub active: Option<ActiveWallpaper>,
+    /// `(playlist name, item index, item count)` while a playlist plays.
+    #[serde(default)]
+    pub playlist: Option<(String, usize, usize)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -19,13 +19,9 @@
 //! drives different content *and* independent render quality per output now
 //! (see `render::ScreenContent`/`render::ScreenSettings`) — different
 //! outputs can show different wallpapers at different quality levels.
-//! `playlists` is still data-only: fully persisted and listable via
-//! `wp-engine config`, but there's no playback-rotation timer anywhere in
-//! the codebase yet, so only each playlist's first item is ever reachable
-//! through `run` today. `volume` has no per-wallpaper override here at all
-//! — `RenderSettings::volume` itself is documented as "not yet applied" (no
-//! audio-mixing code reads it), so persisting a per-wallpaper value for a
-//! setting that doesn't do anything yet would be silently misleading.
+//! `playlists` are played by the daemon (`crate::schedule`): `wp-engine
+//! playlist play NAME`, or `run` when `active_playlist` is set. `volume` is
+//! a single master level (`RenderSettings::volume`), not per wallpaper.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -62,6 +58,9 @@ pub struct WpSettings {
     /// Frame-rate cap for animated wallpapers; `None` = the default (30).
     #[serde(default)]
     pub fps: Option<u32>,
+    /// The playlist `wp-engine run` plays, if any.
+    #[serde(default)]
+    pub active_playlist: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,6 +76,9 @@ pub struct Playlist {
     pub mode: String,
     #[serde(default = "default_order")]
     pub order: String,
+    /// `daytime` mode: when each item starts, `"HH:MM"`, parallel to `items`.
+    #[serde(default)]
+    pub times: Vec<String>,
 }
 
 fn default_delay_minutes() -> u32 {
@@ -269,6 +271,7 @@ mod tests {
         settings.playlists.insert(
             "morning".to_string(),
             Playlist {
+                times: Vec::new(),
                 items: vec!["a".to_string(), "b".to_string()],
                 delay_minutes: 30,
                 mode: "timer".to_string(),
