@@ -55,6 +55,13 @@ pub struct WpSettings {
     /// the level names ever change.
     #[serde(default)]
     pub quality: BTreeMap<String, String>,
+    /// What happens while another application is focused, maximized,
+    /// fullscreen or playing audio, on battery, or while locked.
+    #[serde(default)]
+    pub playback: crate::engine::playback_gate::PlaybackPolicy,
+    /// Frame-rate cap for animated wallpapers; `None` = the default (30).
+    #[serde(default)]
+    pub fps: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

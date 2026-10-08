@@ -191,6 +191,17 @@ fn handle_request(req: Request, state: &Mutex<State>) -> Response {
             }
             Response::Ok
         }
+        Request::SetFps { fps } => {
+            if let Some(app) = &state.app {
+                let context = app.context();
+                let fps = fps.clamp(1, 240);
+                context.settings.lock().unwrap().fps = fps;
+                for s in context.screen_settings.values() {
+                    s.lock().unwrap().fps = fps;
+                }
+            }
+            Response::Ok
+        }
         Request::SetVolume { volume } => {
             if let Some(app) = &state.app {
                 app.context().settings.lock().unwrap().volume = volume.clamp(0.0, 1.0);

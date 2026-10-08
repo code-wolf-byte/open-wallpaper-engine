@@ -42,6 +42,7 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
 };
 
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
+use crate::engine::playback_gate::PlaybackAction;
 use crate::{
     engine::gpu_renderer::GpuSceneInstance,
     platform,
@@ -187,6 +188,12 @@ struct WallpaperSurface {
     /// `ScreenSettings` the same way `renderer` is, so a heavy scene on one
     /// monitor can't force every other monitor's quality down with it.
     settings: Arc<Mutex<RenderSettings>>,
+    /// The output's name, to rebuild `renderer` after a playback stop.
+    output_name: Option<String>,
+    /// When this surface last rendered, for the frame-rate cap, and whether
+    /// a capped draw is already scheduled.
+    last_draw: Option<Instant>,
+    draw_scheduled: bool,
 }
 
 struct WallpaperState {
@@ -235,7 +242,15 @@ struct WallpaperState {
     /// Per-toplevel state from `zwlr_foreign_toplevel_handle_v1` events,
     /// keyed by the handle's own object id.
     foreign_toplevels: HashMap<ObjectId, ForeignToplevelState>,
-    pause_conditions: crate::engine::playback_gate::PauseConditions,
+    policy: crate::engine::playback_gate::PlaybackPolicy,
+    /// MPRIS watcher for the "another application is playing audio"
+    /// condition; only started when the policy acts on it.
+    media: Option<crate::engine::media::MediaWatcher>,
+    media_playing: bool,
+    /// Renderers were released by a playback stop.
+    stopped: bool,
+    /// For scheduling frame-rate-capped draws.
+    loop_handle: Option<calloop::LoopHandle<'static, WallpaperState>>,
     lock_watcher: Option<platform::power::LockWatcher>,
     playback_state: crate::engine::playback_gate::PlaybackState,
     last_pause_check: Instant,
@@ -356,28 +371,48 @@ impl WallpaperState {
     }
 
     fn draw_at(&mut self, idx: usize) {
-        eprintln!(
-            "DIAG draw_at idx={idx} w={} h={}",
-            self.surfaces[idx].width, self.surfaces[idx].height
-        );
         if self.surfaces[idx].width == 0 || self.surfaces[idx].height == 0 {
             return;
         }
-        // Playback-pause (`engine::playback_gate`): skip rendering entirely
-        // and — just as importantly — don't request another `wl_surface`
-        // frame callback either, so the surface simply holds its last
-        // presented frame and the compositor stops nudging us every vblank.
-        // `tick_pause_watchdog` is what notices the pause has cleared and
-        // kicks this back into motion (nothing else will, once the
-        // callback chain has stalled like this).
-        if self.should_pause(Instant::now()) {
+        // Playback policy (`engine::playback_gate`): when it halts
+        // rendering, skip the draw and — just as importantly — don't
+        // request another frame callback, so the surface holds its last
+        // frame and the compositor stops nudging us every vblank.
+        // `tick_pause_watchdog` notices the condition clearing and restarts
+        // the callback chain.
+        let action = self.playback_action(Instant::now());
+        crate::engine::audio::set_muted(action >= PlaybackAction::Mute);
+        if action.halts() {
             self.paused = true;
-            crate::engine::audio::set_muted(true);
             return;
         }
         self.paused = false;
-        crate::engine::audio::set_muted(false);
         crate::engine::audio::set_master_volume(self.settings.default.lock().unwrap().volume);
+
+        // Frame-rate cap: a callback that arrives early waits on a timer.
+        let interval = self.surfaces[idx].settings.lock().unwrap().frame_interval();
+        if let Some(last) = self.surfaces[idx].last_draw {
+            let since = last.elapsed();
+            if since < interval {
+                if !self.surfaces[idx].draw_scheduled {
+                    if let Some(handle) = &self.loop_handle {
+                        self.surfaces[idx].draw_scheduled = true;
+                        let _ = handle.insert_source(
+                            calloop::timer::Timer::from_duration(interval - since),
+                            move |_, (), state: &mut WallpaperState| {
+                                if let Some(s) = state.surfaces.get_mut(idx) {
+                                    s.draw_scheduled = false;
+                                    state.draw_at(idx);
+                                }
+                                calloop::timer::TimeoutAction::Drop
+                            },
+                        );
+                    }
+                }
+                return;
+            }
+        }
+        self.surfaces[idx].last_draw = Some(Instant::now());
         self.ensure_gpu_surface(idx);
         if self.surfaces[idx].gpu.is_some() {
             self.draw_gpu(idx);
@@ -609,6 +644,7 @@ fn wallpaper_loop(
         .bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 1..=3, ())
         .ok();
 
+    let policy = crate::engine::playback_gate::PlaybackPolicy::load();
     let mut state = WallpaperState {
         registry_state,
         output_state,
@@ -630,7 +666,15 @@ fn wallpaper_loop(
         allow_gpu_surface,
         foreign_toplevel_manager,
         foreign_toplevels: HashMap::new(),
-        pause_conditions: crate::engine::playback_gate::PauseConditions::from_env(),
+        policy,
+        media: if policy.watches_audio() {
+            crate::engine::media::MediaWatcher::start()
+        } else {
+            None
+        },
+        media_playing: false,
+        stopped: false,
+        loop_handle: None,
         lock_watcher: platform::power::LockWatcher::start(),
         playback_state: crate::engine::playback_gate::PlaybackState::default(),
         last_pause_check: Instant::now() - PAUSE_CHECK_INTERVAL,
@@ -648,9 +692,10 @@ fn wallpaper_loop(
         .map_err(|e| anyhow!("second Wayland roundtrip failed: {e}"))?;
 
     // Hand the queue to calloop.
-    let mut event_loop: calloop::EventLoop<WallpaperState> =
+    let mut event_loop: calloop::EventLoop<'static, WallpaperState> =
         calloop::EventLoop::try_new().map_err(|e| anyhow!("calloop init failed: {e}"))?;
 
+    state.loop_handle = Some(event_loop.handle());
     WaylandSource::new(conn, event_queue)
         .insert(event_loop.handle())
         .map_err(|e| anyhow!("WaylandSource insert failed: {e}"))?;
@@ -799,6 +844,9 @@ impl OutputHandler for WallpaperState {
             pool: None,
             renderer,
             settings,
+            output_name,
+            last_draw: None,
+            draw_scheduled: false,
         });
     }
 
@@ -1090,12 +1138,17 @@ impl WallpaperState {
         (fullscreen, maximized)
     }
 
-    /// Re-checks all playback-pause conditions when `PAUSE_CHECK_INTERVAL`
-    /// has elapsed, then returns whether rendering should pause right now.
-    fn should_pause(&mut self, now: Instant) -> bool {
+    /// Re-checks the playback conditions when `PAUSE_CHECK_INTERVAL` has
+    /// elapsed and returns the action the policy calls for, releasing or
+    /// rebuilding the renderers on a stop edge.
+    fn playback_action(&mut self, now: Instant) -> PlaybackAction {
         if now.duration_since(self.last_pause_check) >= PAUSE_CHECK_INTERVAL {
             self.last_pause_check = now;
             let (fullscreen_app, maximized_app) = self.foreign_toplevel_pause_state();
+            while let Some(info) = self.media.as_ref().and_then(|m| m.try_recv()) {
+                self.media_playing =
+                    info.playback_state == crate::engine::media::PlaybackState::Playing;
+            }
             self.playback_state = crate::engine::playback_gate::PlaybackState {
                 on_battery: platform::power::is_on_battery(),
                 locked_or_sleeping: self
@@ -1105,29 +1158,64 @@ impl WallpaperState {
                     .unwrap_or(false),
                 fullscreen_app,
                 maximized_app,
+                focused_app: self.foreign_toplevels.values().any(|t| t.activated),
+                other_audio: self.media_playing,
             };
         }
-        crate::engine::playback_gate::should_pause(&self.pause_conditions, &self.playback_state)
+        let action = crate::engine::playback_gate::decide(&self.policy, &self.playback_state);
+        if action == PlaybackAction::Stop && !self.stopped {
+            self.stopped = true;
+            for s in &mut self.surfaces {
+                let still = match &s.renderer {
+                    ContentRenderer::Frames(fs) => Arc::clone(fs.current_frame()),
+                    ContentRenderer::Scene(_) => Arc::new(image::RgbaImage::new(1, 1)),
+                };
+                s.gpu = None;
+                s.renderer = ContentRenderer::Frames(FrameSource::Static(still));
+            }
+            tracing::info!(target: "wallpaper", "playback stopped; renderers released");
+        } else if action != PlaybackAction::Stop && self.stopped {
+            self.stopped = false;
+            for i in 0..self.surfaces.len() {
+                let resolved = self
+                    .content
+                    .resolve(self.surfaces[i].output_name.as_deref());
+                match build_content_renderer(
+                    resolved,
+                    self.device.clone(),
+                    self.queue.clone(),
+                    self.allow_gpu_surface,
+                ) {
+                    Ok(r) => {
+                        self.surfaces[i].renderer = r;
+                        self.surfaces[i].gpu_failed = false;
+                    }
+                    Err(e) => tracing::error!(target: "wallpaper", "resuming output {i}: {e}"),
+                }
+            }
+            tracing::info!(target: "wallpaper", "playback resumed");
+        }
+        action
     }
 
     /// Runs on its own `PAUSE_CHECK_INTERVAL` timer (inserted once at
     /// startup, independent of any surface's frame callbacks) — the only
-    /// thing that can notice a pause has cleared once `draw_at` has
-    /// stopped requesting new callbacks (see its own doc comment), since
-    /// nothing else would call back into this state to check again.
+    /// thing that can notice a halt has cleared once `draw_at` has stopped
+    /// requesting new callbacks.
     fn tick_pause_watchdog(&mut self) {
         let was_paused = self.paused;
-        let now_paused = self.should_pause(Instant::now());
-        if was_paused && !now_paused {
+        let action = self.playback_action(Instant::now());
+        crate::engine::audio::set_muted(action >= PlaybackAction::Mute);
+        if was_paused && !action.halts() {
+            self.paused = false;
             for idx in 0..self.surfaces.len() {
                 if self.surfaces[idx].renderer.is_animated() {
                     self.draw_at(idx);
                 }
             }
         } else {
-            self.paused = now_paused;
+            self.paused = action.halts();
         }
-        crate::engine::audio::set_muted(self.paused);
     }
 }
 
@@ -1157,6 +1245,7 @@ mod tests {
     /// rather than a guessed-at mapping.
     #[test]
     fn web_mouse_button_maps_left_and_right_only() {
+        use crate::engine::playback_gate::PlaybackAction;
         use crate::render::web::WebMouseButton;
         assert_eq!(web_mouse_button(BTN_LEFT), Some(WebMouseButton::Left));
         assert_eq!(web_mouse_button(BTN_RIGHT), Some(WebMouseButton::Right));
