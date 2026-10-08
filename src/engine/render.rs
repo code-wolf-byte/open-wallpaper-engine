@@ -161,9 +161,6 @@ pub struct Layer {
     pub angles: [f32; 3],
     pub blend_mode: u32,
     pub alpha: f32,
-    /// Inline SceneScript source driving `alpha` per frame, if the property
-    /// was authored as `{"value": …, "script": "…"}`. `None` = static alpha.
-    pub alpha_script: Option<String>,
     pub color: [f32; 3],
     pub brightness: f32,
     /// True for WE "copybackground" layers — source is the rendered canvas so far.
@@ -188,26 +185,12 @@ pub struct Layer {
     /// rendered output as `_rt_imageLayerComposite_<id>_a`, so the live path
     /// needs to know which layer each id belongs to.
     pub object_id: Option<i64>,
-    /// Inline SceneScripts driving `visible`/`scale`/`origin`/`angles`, if any.
-    /// Evaluated per frame by the live GPU path (see `GpuSceneInstance::render`).
-    pub transform_scripts: TransformScripts,
     /// The object's AUTHORED `visible` value — the starting visibility and the
     /// `value` fed to a `visible` script. Critical: scripts that only define
     /// cursor handlers (invisible click hitboxes, `"value": false`) have no
     /// `update()`, so the script returns `value` unchanged — feeding `true`
     /// here would render those hitboxes as opaque boxes.
     pub visible_base: bool,
-}
-
-/// The per-frame SceneScripts a layer's transform can carry. Each `update`
-/// receives the property's base value (a `Vec3` for scale/origin/angles, a
-/// bool for visible) and returns the value for this frame.
-#[derive(Clone, Default)]
-pub struct TransformScripts {
-    pub visible: Option<String>,
-    pub scale: Option<String>,
-    pub origin: Option<String>,
-    pub angles: Option<String>,
 }
 
 /// A loaded texture plus any additional animation frames (e.g. from a `.tex`
@@ -860,7 +843,15 @@ fn select_spritesheet_frame(obj: &SceneObject, loaded: &mut LoadedImage) {
         .as_ref()
         .and_then(|v| v.get("script"))
         .and_then(|s| s.as_str())
-        .and_then(|script| crate::engine::script::ScriptContext::new().eval_frame(script))
+        .and_then(|script| {
+            let init = crate::engine::script::ObjectInit {
+                visible: true,
+                alpha: 1.0,
+                frame_count: loaded.sprite_frames.len() as u32,
+                ..Default::default()
+            };
+            crate::engine::script::evaluate_once("visible", script, &init, None).frame
+        })
         .unwrap_or(0)
         .min(loaded.sprite_frames.len() as u32 - 1);
     loaded.image = loaded.sprite_frames[frame as usize].clone();
@@ -951,21 +942,6 @@ fn layer_from_object(
         .and_then(|v| v.as_vec3())
         .map(|s| [s[0] as f64, s[1] as f64, s[2] as f64])
         .unwrap_or([1.0, 1.0, 1.0]);
-    let origin_animated = obj
-        .origin
-        .as_ref()
-        .map(crate::engine::model::json_to_animated);
-
-    // Per-frame transform scripts (evaluated by the live GPU path). origin/
-    // scale/angles carry their script on the animated value; visible carries
-    // it on the raw `visible` object.
-    let transform_scripts = TransformScripts {
-        visible: obj.visible_script(),
-        scale: scale_animated.as_ref().and_then(|v| v.script.clone()),
-        origin: origin_animated.as_ref().and_then(|v| v.script.clone()),
-        angles: angles_animated.as_ref().and_then(|v| v.script.clone()),
-    };
-
     let alpha_animated = obj
         .alpha
         .as_ref()
@@ -974,9 +950,6 @@ fn layer_from_object(
         .as_ref()
         .and_then(|v| v.as_float())
         .unwrap_or(1.0);
-    // Inline SceneScript source driving `alpha`, if any — evaluated per frame
-    // by the render loop's ScriptContext (see GpuSceneInstance::render).
-    let alpha_script = alpha_animated.as_ref().and_then(|v| v.script.clone());
     let color = obj
         .color
         .as_ref()
@@ -1048,7 +1021,6 @@ fn layer_from_object(
         angles: angles3,
         blend_mode: obj.color_blend_mode,
         alpha,
-        alpha_script,
         color,
         brightness,
         copybackground: obj.copybackground,
@@ -1068,7 +1040,6 @@ fn layer_from_object(
         text_dynamic: None,
         order_index: 0,
         object_id: obj.id,
-        transform_scripts,
         visible_base: obj.is_visible(),
     }
 }
@@ -1302,8 +1273,16 @@ fn text_layer_from_object(
         (Some(script), _) => {
             // One-shot load-time evaluation so the layer rasterizes real
             // content (and sizes itself correctly) from frame 0.
-            let mut ctx = crate::engine::script::ScriptContext::new();
-            ctx.eval_update_string(script, &static_str, script_properties.as_ref())
+            let init = crate::engine::script::ObjectInit {
+                name: obj.name.clone(),
+                id: obj.id,
+                visible: true,
+                alpha: 1.0,
+                text: Some(static_str.clone()),
+                ..Default::default()
+            };
+            crate::engine::script::evaluate_once("text", script, &init, script_properties.as_ref())
+                .text
                 .filter(|t| !t.is_empty())
                 .unwrap_or(static_str)
         }
@@ -2284,26 +2263,13 @@ pub struct TransformGraph {
     pub parent: Vec<Option<usize>>,
     /// Authored local transform per object — the base a script updates from.
     pub local: Vec<Xform>,
-    /// `(origin, angles, scale)` SceneScript sources per object.
-    pub scripts: Vec<[Option<String>; 3]>,
-    /// Object name/id, indexed the same as every other field here — feeds
-    /// `ScriptContext::set_current_object`/`set_layers` so an
-    /// object-attachment script (`thisLayer`, `thisScene.getLayer(...)`) can
-    /// identify itself and look up other objects. See the Ghidra report's
-    /// object-attachment follow-up.
+    /// Object name/id, indexed the same as every other field here — lets the
+    /// live path find an object's sounds and layers by identity.
     pub name: Vec<Option<String>>,
     pub id: Vec<Option<i64>>,
 }
 
 impl TransformGraph {
-    /// True when at least one object's transform is script-driven AND at least
-    /// one object is parented — the only case the per-frame pass is needed for.
-    /// 189 of 197 real scenes answer `false` and skip the whole thing.
-    pub fn needs_per_frame(&self) -> bool {
-        self.parent.iter().any(Option::is_some)
-            && self.scripts.iter().any(|s| s.iter().any(Option::is_some))
-    }
-
     /// World transform per object, composing `locals` up each parent chain.
     /// `disabled[i]` (this frame's live `thisLayer.disablepropagation()`
     /// call — see the object-attachment API) makes object `i` stop
@@ -2358,26 +2324,12 @@ fn build_transform_graph(scene: &Scene) -> TransformGraph {
         .enumerate()
         .filter_map(|(i, o)| o.name.as_deref().map(|n| (n, i)))
         .collect();
-    let script_of = |v: Option<&serde_json::Value>| {
-        v.map(crate::engine::model::json_to_animated)
-            .and_then(|a| a.script)
-    };
     TransformGraph {
         parent: objects
             .iter()
             .map(|o| parent_index(o, &id_to_idx, &name_to_idx))
             .collect(),
         local: objects.iter().map(obj_local_xform).collect(),
-        scripts: objects
-            .iter()
-            .map(|o| {
-                [
-                    script_of(o.origin.as_ref()),
-                    script_of(o.angles.as_ref()),
-                    script_of(o.scale.as_ref()),
-                ]
-            })
-            .collect(),
         name: objects.iter().map(|o| o.name.clone()).collect(),
         id: objects.iter().map(|o| o.id).collect(),
     }
@@ -2621,7 +2573,6 @@ mod tests {
         let graph = TransformGraph {
             parent: vec![None, Some(0), Some(1)],
             local: vec![Xform::IDENTITY; 3],
-            scripts: vec![[None, None, None], [None, None, None], [None, None, None]],
             name: vec![None, None, None],
             id: vec![None, None, None],
         };
@@ -2765,7 +2716,6 @@ mod tests {
             angles: [0.0, 0.0, 0.0],
             blend_mode: 0,
             alpha: 1.0,
-            alpha_script: None,
             color: [1.0, 1.0, 1.0],
             brightness: 1.0,
             copybackground: false,
@@ -2776,7 +2726,6 @@ mod tests {
             text_dynamic: None,
             order_index: 1,
             object_id: None,
-            transform_scripts: TransformScripts::default(),
             visible_base: true,
         }];
 

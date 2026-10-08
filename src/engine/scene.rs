@@ -771,6 +771,32 @@ pub enum LightType {
 }
 
 impl SceneObject {
+    /// Every SceneScript source attached to this object's properties.
+    pub fn scripts(&self) -> Vec<&str> {
+        fn of(v: Option<&serde_json::Value>) -> Option<&str> {
+            v?.as_object()?.get("script")?.as_str()
+        }
+        let mut out: Vec<&str> = [
+            &self.visible,
+            &self.origin,
+            &self.angles,
+            &self.scale,
+            &self.alpha,
+            &self.color,
+            &self.brightness,
+            &self.text,
+            &self.pointsize,
+            &self.size,
+        ]
+        .into_iter()
+        .filter_map(|v| of(v.as_ref()))
+        .collect();
+        if let Some(serde_json::Value::Object(m)) = &self.instanceoverride {
+            out.extend(m.values().filter_map(|v| of(Some(v))));
+        }
+        out
+    }
+
     pub fn parsed_origin(&self) -> [f64; 3] {
         self.origin
             .as_ref()
@@ -909,6 +935,28 @@ impl Scene {
         Self::from_json(text)
     }
 
+    /// Names of objects some SceneScript refers to as a quoted string
+    /// (`thisScene.getLayer('Radio Text')`). Such an object may be shown by
+    /// script at runtime, so it must be built even if authored hidden.
+    pub fn script_referenced_names(&self) -> std::collections::HashSet<&str> {
+        let scripts: Vec<&str> = self.objects.iter().flat_map(|o| o.scripts()).collect();
+        if scripts.is_empty() {
+            return Default::default();
+        }
+        self.objects
+            .iter()
+            .filter_map(|o| o.name.as_deref())
+            .filter(|n| !n.is_empty())
+            .filter(|n| {
+                scripts.iter().any(|s| {
+                    s.contains(&format!("'{n}'"))
+                        || s.contains(&format!("\"{n}\""))
+                        || s.contains(&format!("`{n}`"))
+                })
+            })
+            .collect()
+    }
+
     pub fn visible_objects(&self) -> impl Iterator<Item = &SceneObject> {
         self.objects.iter().filter(|o| o.is_visible())
     }
@@ -948,6 +996,7 @@ impl Scene {
             }
             None
         };
+        let referenced = self.script_referenced_names();
         (0..self.objects.len())
             .map(|i| {
                 let mut cur = i;
@@ -960,6 +1009,10 @@ impl Scene {
                     // hierarchical walk).
                     if !self.objects[cur].is_visible()
                         && self.objects[cur].visible_script().is_none()
+                        && !self.objects[cur]
+                            .name
+                            .as_deref()
+                            .is_some_and(|n| referenced.contains(n))
                     {
                         return false;
                     }
