@@ -130,7 +130,7 @@ fn parse_library_folders(vdf: &str) -> Vec<PathBuf> {
 /// library its `steamapps/libraryfolders.vdf` lists.
 fn find_steam_library_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
-    let mut push = |p: PathBuf, roots: &mut Vec<PathBuf>| {
+    let push = |p: PathBuf, roots: &mut Vec<PathBuf>| {
         if !p.exists() {
             return;
         }

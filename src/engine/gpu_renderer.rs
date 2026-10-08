@@ -1646,14 +1646,8 @@ struct SceneLayerGpu {
     /// draining to the latest frame drops rather than lags).
     video: Option<std::sync::Arc<std::sync::Mutex<crate::engine::render::VideoLayerStream>>>,
     blend_mode: u32,
-    /// Live alpha for the current frame. When `alpha_script` is present this is
-    /// recomputed each frame from `alpha_base`; otherwise it stays constant.
+    /// Live alpha; SceneScript may change it per frame.
     alpha: f32,
-    /// Authored alpha, passed as the `value` argument to `alpha_script` each
-    /// frame (WE feeds the property's base value, not the previous output).
-    alpha_base: f32,
-    /// Inline SceneScript source driving `alpha`, or `None` for static alpha.
-    alpha_script: Option<String>,
     /// Script-driven text: re-evaluated each tick; when the output string
     /// changes, `frames[0]` is re-rasterized and `rect` re-derived (clocks
     /// tick, dates roll over — 42 of the corpus's 58 script wallpapers).
@@ -1679,31 +1673,19 @@ struct SceneLayerGpu {
     /// approximation, a narrow and rare combination not worth a second
     /// pipeline variant per blend mode.
     quad_corners: Option<[[f32; 2]; 4]>,
-    /// Live visibility for this frame. Starts `true`; only a `visible` script
-    /// can flip it off. `render()` skips the layer entirely when `false`.
+    /// The object's own visibility (authored, then as scripts set it). The
+    /// layer draws only when it and every ancestor are visible — see
+    /// `GpuSceneInstance::object_visible`.
     visible: bool,
-    /// The authored `visible` value — fed to the `visible` script as `value`
-    /// (a script with no `update()`, e.g. a cursor-handler-only hitbox, returns
-    /// it unchanged, so this must not be hardcoded `true`).
-    visible_base: bool,
-    /// Per-frame transform scripts (visible/scale/origin/angles). When
-    /// scale/origin are present, `rect` is recomputed each frame from the
-    /// base values below; angles rebuilds `angle`. Only honored in the 2D
-    /// (orthographic) path — perspective layers keep their projected rect.
-    transform_scripts: crate::engine::render::TransformScripts,
-    /// Base values fed to the transform scripts as `value` and used to rebuild
-    /// `rect`: object size in px (pre-scale), authored origin (scene coords,
-    /// alignment folded in), scale multiplier, and full angles (radians).
+    /// Object size in px before scale — rebuilds `rect` when a script
+    /// changes scale.
     effective_size: [f64; 2],
-    origin_base: [f64; 3],
-    scale_base: [f32; 3],
-    angles_base: [f32; 3],
-    /// Pre-parent transform, for the per-frame parent recompose (see
-    /// `update_parent_transforms`). Distinct from `*_base`, which are the
-    /// post-parent values a per-object script updates from.
-    local_origin: [f64; 3],
-    local_scale: [f64; 3],
-    local_angles: [f32; 3],
+    /// Spritesheet frame a script picked (`getTextureAnimation().setFrame`),
+    /// overriding the timed animation.
+    script_frame: Option<usize>,
+    /// `alignment`'s shift of the quad centre from the authored origin, kept
+    /// so a scripted origin moves the quad the same way.
+    align_offset: [f64; 3],
     no_interpolation: bool,
     clamp_uvs: bool,
     /// Unscaled object size in pixels — matches the reference's `CImage::m_size`
@@ -1807,10 +1789,21 @@ pub struct GpuSceneInstance {
     start: Instant,
     last_time: f32,
     mouse_norm: [f32; 2],
-    /// Persistent JS runtime for SceneScript-driven properties, ticked once per
-    /// frame. Lives here (on the render thread) because boa's `Context` is
-    /// `!Send`; created and used entirely within this instance.
-    script_ctx: crate::engine::script::ScriptContext,
+    /// The scene's SceneScript runtime, ticked once per frame. Lives here (on
+    /// the render thread) because boa's `Context` is `!Send`.
+    scripts: crate::engine::script::ScriptHost,
+    /// Per-object visibility as scripts leave it, indexed like `scene.objects`
+    /// (authored visibility at load). A layer draws only when its object and
+    /// every ancestor are visible.
+    object_visible: Vec<bool>,
+    /// Live `disablepropagation()` state per object.
+    propagation_disabled: Vec<bool>,
+    /// Whether a script registered audio buffers (feeds them each frame).
+    scripts_want_audio: bool,
+    /// Last cursor position in scene pixels, and button state — for
+    /// `input.*` and cursor events.
+    cursor_scene: [f32; 2],
+    cursor_left_down: bool,
     /// Desktop-audio capture, started only when an effect reads
     /// `g_AudioSpectrum*` (else `None` and the spectrum stays silent). Polled
     /// once per frame into the renderer's `audio_buf`.
@@ -1858,8 +1851,7 @@ pub struct GpuSceneInstance {
     /// Retained for the per-frame parent recompose, which has to rebuild each
     /// mesh's MVP and each layer's projected rect.
     camera3d: Option<crate::engine::camera3d::PerspectiveCamera>,
-    /// Parent chain + transform scripts. Only consulted when
-    /// `TransformGraph::needs_per_frame()` — 189 of 197 scenes skip it.
+    /// Parent chain per object, for recomposing transforms scripts change.
     transform_graph: crate::engine::render::TransformGraph,
     /// `general.zoom`, retained because the per-frame parent recompose rebuilds
     /// orthographic rects and has to apply the same scene-wide scale the build
@@ -2426,8 +2418,6 @@ impl GpuSceneInstance {
                     video: l.video.clone(),
                     blend_mode: l.blend_mode,
                     alpha: l.alpha,
-                    alpha_base: l.alpha,
-                    alpha_script: l.alpha_script.clone(),
                     text_dynamic: l.text_dynamic.clone(),
                     color: l.color,
                     brightness: l.brightness,
@@ -2443,15 +2433,17 @@ impl GpuSceneInstance {
                     order_index: l.order_index,
                     object_id: l.object_id,
                     visible: l.visible_base,
-                    visible_base: l.visible_base,
-                    transform_scripts: l.transform_scripts.clone(),
                     effective_size,
-                    origin_base: l.origin,
-                    scale_base: [l.scale[0] as f32, l.scale[1] as f32, l.scale[2] as f32],
-                    angles_base: l.angles,
-                    local_origin: l.local_origin,
-                    local_scale: l.local_scale,
-                    local_angles: l.local_angles,
+                    align_offset: {
+                        let authored = resolved
+                            .transform_graph
+                            .local
+                            .get(l.order_index)
+                            .map(|x| x.t)
+                            .unwrap_or(l.local_origin);
+                        std::array::from_fn(|i| l.local_origin[i] - authored[i])
+                    },
+                    script_frame: None,
                 }
             })
             .collect();
@@ -2884,7 +2876,7 @@ impl GpuSceneInstance {
                 .create_view(&Default::default())
         });
 
-        Ok(Self {
+        let mut instance = Self {
             renderer,
             layers,
             scene_effects,
@@ -2906,7 +2898,17 @@ impl GpuSceneInstance {
             start: Instant::now(),
             last_time: 0.0,
             mouse_norm: [0.5, 0.5],
-            script_ctx: crate::engine::script::ScriptContext::new(),
+            scripts: build_script_host(dir, &resolved.scene, &resolved.transform_graph, [w, h]),
+            object_visible: resolved
+                .scene
+                .objects
+                .iter()
+                .map(|o| o.is_visible())
+                .collect(),
+            propagation_disabled: vec![false; resolved.scene.objects.len()],
+            scripts_want_audio: false,
+            cursor_scene: [w as f32 * 0.5, h as f32 * 0.5],
+            cursor_left_down: false,
             audio_capture,
             sounds,
             #[cfg(target_os = "linux")]
@@ -2920,7 +2922,11 @@ impl GpuSceneInstance {
             current_locals: resolved.transform_graph.local.clone(),
             transform_graph: resolved.transform_graph,
             zoom,
-        })
+        };
+        // Hidden ancestors hide their subtree; script-referenced hidden
+        // objects are built but start hidden.
+        instance.refresh_layer_visibility();
+        Ok(instance)
     }
 
     /// Build the volumetric-light-shaft ray march's static per-scene bind
@@ -3383,69 +3389,251 @@ impl GpuSceneInstance {
         }
     }
 
-    /// Recompose parent chains for this frame.
-    ///
-    /// `apply_parent_transforms` bakes the chain at load, which is correct only
-    /// while the chain is static. A scripted parent moves every frame, and
-    /// those parent nodes are usually image-less — they have no `Layer`, so the
-    /// per-layer script loop never touches them. This evaluates every object's
-    /// transform scripts (parents included), recomposes each chain, and pushes
-    /// the result into whatever the object actually draws as.
-    ///
-    /// Skipped entirely unless the scene both parents something and scripts a
-    /// transform — true for 8 of 197 real scenes.
-    fn update_parent_transforms(&mut self) {
-        if !self.transform_graph.needs_per_frame() {
+    /// Run this frame's SceneScripts and apply what they changed.
+    fn tick_scripts(&mut self, time: f32, delta: f32) {
+        if !self.scripts.has_scripts() {
             return;
         }
-        use crate::engine::render::Xform;
-
-        // Evaluate in declaration order: these scripts talk to each other
-        // through the shared `shared` object (one writes `shared.gjz`, another
-        // reads it), and declaration order is the only ordering WE implies.
-        let mut locals = self.current_locals.clone();
-        let mut disabled = vec![false; self.transform_graph.parent.len()];
-        for (i, scripts) in self.transform_graph.scripts.iter().enumerate() {
-            // Previous frame's value, not the authored one — see `current_locals`.
-            let base = self.current_locals[i];
-            // `thisLayer`/`disablepropagation()` — the object-attachment
-            // scripting API (see `engine::script::OBJECT_ATTACHMENT_API_JS`)
-            // — needs to know which object is about to run, and this is the
-            // one place every object (including image-less parent nodes)
-            // gets its scripts evaluated.
-            self.script_ctx.set_current_object(
-                self.transform_graph.name[i].as_deref(),
-                self.transform_graph.id[i],
-                [base.t[0] as f32, base.t[1] as f32, base.t[2] as f32],
-                [base.r[0] as f32, base.r[1] as f32, base.r[2] as f32],
-                [base.s[0] as f32, base.s[1] as f32, base.s[2] as f32],
-                [0.0, 0.0],
+        #[cfg(target_os = "linux")]
+        if let Some(info) = self.media.as_ref().and_then(|w| w.try_recv()) {
+            use crate::engine::media::PlaybackState;
+            self.scripts.set_media(
+                info.available,
+                match info.playback_state {
+                    PlaybackState::Stopped => 0,
+                    PlaybackState::Playing => 1,
+                    PlaybackState::Paused => 2,
+                },
+                &info.title,
+                &info.artist,
+                &info.album,
+                info.position_us,
+                info.duration_us,
+                info.art_url.as_deref(),
             );
-            let eval = |ctx: &mut crate::engine::script::ScriptContext,
-                        src: &Option<String>,
-                        b: [f64; 3]| match src {
-                Some(src) => ctx
-                    .eval_update_vec3(src, [b[0] as f32, b[1] as f32, b[2] as f32])
-                    .map(|v| [v[0] as f64, v[1] as f64, v[2] as f64])
-                    .unwrap_or(b),
-                None => b,
-            };
-            locals[i] = Xform {
-                t: eval(&mut self.script_ctx, &scripts[0], base.t),
-                r: eval(&mut self.script_ctx, &scripts[1], base.r),
-                s: eval(&mut self.script_ctx, &scripts[2], base.s),
-            };
-            disabled[i] = self.script_ctx.take_propagation_disabled();
         }
-        self.current_locals.clone_from(&locals);
-        let worlds = self.transform_graph.world(&locals, &disabled);
+        if self.scripts_want_audio {
+            if let Some(cap) = &self.audio_capture {
+                let sp = cap.spectrum();
+                self.scripts.set_audio([
+                    &sp.s16_left,
+                    &sp.s16_right,
+                    &sp.s32_left,
+                    &sp.s32_right,
+                    &sp.s64_left,
+                    &sp.s64_right,
+                ]);
+            }
+        }
+        self.scripts.set_cursor(
+            self.cursor_scene,
+            self.cursor_screen(),
+            self.cursor_left_down,
+        );
+        self.scripts
+            .frame(time, crate::engine::script::local_time_of_day(), delta);
+        let changes = self.scripts.collect();
+        self.apply_script_changes(changes);
+
+        // `registerAudioBuffers` usually runs at module load, so this is
+        // known after the first frame; start capture then if nothing else did.
+        if !self.scripts_want_audio && self.scripts.wants_audio() {
+            self.scripts_want_audio = true;
+            if self.audio_capture.is_none() {
+                self.audio_capture = crate::engine::audio::AudioCapture::start();
+            }
+        }
+    }
+
+    /// The cursor in output pixels, top-left origin (`input.cursorScreenPosition`).
+    fn cursor_screen(&self) -> [f32; 2] {
+        [
+            self.mouse_norm[0] * self.width as f32,
+            self.mouse_norm[1] * self.height as f32,
+        ]
+    }
+
+    /// Apply a frame's script changes: transforms recompose through the
+    /// parent graph, everything else lands on the object's layers and sounds.
+    fn apply_script_changes(&mut self, changes: crate::engine::script::ScriptChanges) {
+        use crate::engine::script::ScriptCommand;
+        let n = self.current_locals.len();
+        let mut moved = vec![false; n];
+        let mut visibility_changed = false;
+        for (i, c) in &changes.objects {
+            let i = *i;
+            if i >= n {
+                continue;
+            }
+            let x = &mut self.current_locals[i];
+            if let Some(o) = c.origin {
+                x.t = o.map(|v| v as f64);
+                moved[i] = true;
+            }
+            if let Some(a) = c.angles {
+                x.r = a.map(|v| v as f64);
+                moved[i] = true;
+            }
+            if let Some(sc) = c.scale {
+                x.s = sc.map(|v| v as f64);
+                moved[i] = true;
+            }
+            if let Some(d) = c.propagation_disabled {
+                self.propagation_disabled[i] = d;
+                moved[i] = true;
+            }
+            if let Some(v) = c.visible {
+                self.object_visible[i] = v;
+                visibility_changed = true;
+            }
+            if let Some(v) = c.volume {
+                for snd in self.sounds_of(i) {
+                    snd.set_volume(v);
+                }
+            }
+            for li in 0..self.layers.len() {
+                if self.layers[li].order_index != i {
+                    continue;
+                }
+                let layer = &mut self.layers[li];
+                if let Some(v) = c.visible {
+                    layer.visible = v;
+                }
+                if let Some(a) = c.alpha {
+                    layer.alpha = a;
+                }
+                if let Some(col) = c.color {
+                    layer.color = col;
+                }
+                if let Some(b) = c.brightness {
+                    layer.brightness = b;
+                }
+                if let Some(f) = c.frame {
+                    layer.script_frame = Some(f as usize);
+                }
+                if let Some(ps) = c.pointsize {
+                    if let Some(td) = &mut layer.text_dynamic {
+                        td.point_size = ps.max(1.0);
+                        td.last_text.clear();
+                    }
+                }
+                if c.text.is_some() || c.pointsize.is_some() {
+                    self.rerasterize_text(li, c.text.as_deref());
+                }
+            }
+        }
+        for cmd in changes.commands {
+            match cmd {
+                ScriptCommand::Sound { index, op } => {
+                    for snd in self.sounds_of(index) {
+                        match op.as_str() {
+                            "play" => snd.play(),
+                            "pause" => snd.pause(),
+                            "stop" => snd.stop(),
+                            _ => {}
+                        }
+                    }
+                }
+                other => {
+                    tracing::debug!(target: "script", "unhandled script command {other:?}");
+                }
+            }
+        }
+        if visibility_changed {
+            self.refresh_layer_visibility();
+        }
+        if moved.iter().any(|m| *m) {
+            self.apply_object_transforms(&moved);
+        }
+    }
+
+    /// Sound controls belonging to scene object `index`.
+    fn sounds_of(&self, index: usize) -> Vec<std::sync::Arc<crate::engine::audio::SoundControl>> {
+        let name = self.transform_graph.name.get(index).cloned().flatten();
+        let id = self.transform_graph.id.get(index).copied().flatten();
+        self.sounds
+            .iter()
+            .filter(|s| {
+                (id.is_some() && s.id == id) || (id.is_none() && name.is_some() && s.name == name)
+            })
+            .map(|s| s.playback.control())
+            .collect()
+    }
+
+    /// Re-rasterize a text layer for new content (or a new point size when
+    /// `text` is `None`).
+    fn rerasterize_text(&mut self, li: usize, text: Option<&str>) {
+        let layer = &mut self.layers[li];
+        let Some(td) = &mut layer.text_dynamic else {
+            return;
+        };
+        let new_text = text
+            .map(str::to_string)
+            .unwrap_or_else(|| td.last_text.clone());
+        if new_text.is_empty() || (new_text == td.last_text && text.is_some()) {
+            return;
+        }
+        if let Some(img) = crate::engine::text::rasterize(&td.font_data, &new_text, td.point_size) {
+            // The quad keeps its authored box; only the texture changes.
+            layer.frames[0] = self.renderer.upload_texture(&img);
+            td.last_text = new_text;
+        }
+    }
+
+    /// A layer draws only when its own object and every ancestor are visible.
+    fn refresh_layer_visibility(&mut self) {
+        let parent = &self.transform_graph.parent;
+        let visible = &self.object_visible;
+        let effective = |mut i: usize| -> bool {
+            for _ in 0..64 {
+                if !visible.get(i).copied().unwrap_or(true) {
+                    return false;
+                }
+                match parent.get(i).copied().flatten() {
+                    Some(p) if p != i => i = p,
+                    _ => return true,
+                }
+            }
+            true
+        };
+        for layer in &mut self.layers {
+            layer.visible = effective(layer.order_index);
+        }
+    }
+
+    /// Recompose world transforms from `current_locals` and push them into
+    /// the layers and meshes they move: those whose own object or any
+    /// ancestor `moved`.
+    fn apply_object_transforms(&mut self, moved: &[bool]) {
+        use crate::engine::render::Xform;
+        let n = self.current_locals.len();
+        let parent = self.transform_graph.parent.clone();
+        // affected[i]: object i or an ancestor moved.
+        let mut affected = vec![false; n];
+        for i in 0..n {
+            let mut cur = i;
+            for _ in 0..64 {
+                if moved.get(cur).copied().unwrap_or(false) {
+                    affected[i] = true;
+                    break;
+                }
+                match parent.get(cur).copied().flatten() {
+                    Some(p) if p != cur => cur = p,
+                    _ => break,
+                }
+            }
+        }
+        let locals = self.current_locals.clone();
+        let worlds = self
+            .transform_graph
+            .world(&locals, &self.propagation_disabled);
         // The PARENT's world transform, not the object's own — `worlds[i]`
-        // already folds in object i's local transform, and the layer/mesh
-        // values we apply it to are pre-parent locals. Applying the full world
-        // would compose i's own transform twice. This mirrors exactly what
-        // `apply_parent_transforms` does at load.
-        let parent_world = |i: usize| -> crate::engine::render::Xform {
-            match self.transform_graph.parent.get(i).copied().flatten() {
+        // already folds in object i's local transform.
+        let parent_world = |i: usize| -> Xform {
+            if self.propagation_disabled.get(i).copied().unwrap_or(false) {
+                return Xform::IDENTITY;
+            }
+            match parent.get(i).copied().flatten() {
                 Some(p) if p != i => worlds[p],
                 _ => Xform::IDENTITY,
             }
@@ -3453,24 +3641,35 @@ impl GpuSceneInstance {
 
         // 3D meshes: rebuild the MVP from the recomposed world transform.
         // Computed up front so the write-back can borrow `self.mesh3d` mutably.
-        let mesh_updates: Vec<(Vec<u8>, f32)> = match &self.camera3d {
+        let mesh_updates: Vec<(usize, Vec<u8>, f32)> = match &self.camera3d {
             Some(cam) => self
                 .mesh3d
                 .iter()
+                .filter(|m| affected.get(m.order_index).copied().unwrap_or(false))
                 .map(|m| {
                     let w = parent_world(m.order_index);
-                    let (lo, la, ls) = m.local;
+                    let (lo, la, ls) = match locals.get(m.order_index) {
+                        Some(x) => (
+                            [x.t[0] as f32, x.t[1] as f32, x.t[2] as f32],
+                            [x.r[0] as f32, x.r[1] as f32, x.r[2] as f32],
+                            [x.s[0] as f32, x.s[1] as f32, x.s[2] as f32],
+                        ),
+                        None => m.local,
+                    };
                     let o = w.apply_point([lo[0] as f64, lo[1] as f64, lo[2] as f64]);
                     let centre = [o[0] as f32, o[1] as f32, o[2] as f32];
                     let angles: [f32; 3] = std::array::from_fn(|i| la[i] + w.r[i] as f32);
                     let scale: [f32; 3] = std::array::from_fn(|i| ls[i] * w.s[i] as f32);
                     let bytes = mesh3d_transform_bytes(cam, centre, angles, scale);
-                    (bytes, cam.view_depth(centre))
+                    (m.order_index, bytes, cam.view_depth(centre))
                 })
                 .collect(),
             None => Vec::new(),
         };
-        for (m, (bytes, depth)) in self.mesh3d.iter_mut().zip(mesh_updates) {
+        for (idx, bytes, depth) in mesh_updates {
+            let Some(m) = self.mesh3d.iter_mut().find(|m| m.order_index == idx) else {
+                continue;
+            };
             self.renderer.queue.write_buffer(&m.ubo, 0, &bytes);
             m.depth = depth;
         }
@@ -3480,19 +3679,21 @@ impl GpuSceneInstance {
         // both start from the same recomposed world transform.
         let (w_px, h_px) = (self.width as f64, self.height as f64);
         for layer in &mut self.layers {
-            let w = parent_world(layer.order_index);
-            if w.is_identity() {
+            let i = layer.order_index;
+            if !affected.get(i).copied().unwrap_or(false) {
                 continue;
             }
-            let o = w.apply_point(layer.local_origin);
+            let w = parent_world(i);
+            let local = locals[i];
+            let o = w.apply_point(std::array::from_fn(|k| local.t[k] + layer.align_offset[k]));
             let size_px = [
-                layer.effective_size[0] * layer.local_scale[0] * w.s[0],
-                layer.effective_size[1] * layer.local_scale[1] * w.s[1],
+                layer.effective_size[0] * local.s[0] * w.s[0],
+                layer.effective_size[1] * local.s[1] * w.s[1],
             ];
+            let local_angles: [f32; 3] = std::array::from_fn(|k| local.r[k] as f32);
             match &self.camera3d {
                 Some(cam) => {
-                    let angles: [f32; 3] =
-                        std::array::from_fn(|i| layer.local_angles[i] + w.r[i] as f32);
+                    let angles: [f32; 3] = std::array::from_fn(|k| local_angles[k] + w.r[k] as f32);
                     let centre = [o[0] as f32, o[1] as f32, o[2] as f32];
                     let (rect, depth) = project_quad_ndc(cam, centre, angles, size_px);
                     layer.rect = rect;
@@ -3510,7 +3711,7 @@ impl GpuSceneInstance {
                         (size_px[0] / w_px) as f32 * z,
                         (size_px[1] / h_px) as f32 * z,
                     ];
-                    layer.angle = -(layer.local_angles[2] + w.r[2] as f32);
+                    layer.angle = -(local_angles[2] + w.r[2] as f32);
                 }
             }
         }
@@ -3590,6 +3791,11 @@ impl GpuSceneInstance {
     /// Feed pointer position in [0,1]² (drives camera parallax).
     pub fn set_mouse(&mut self, norm: [f32; 2]) {
         self.mouse_norm = norm;
+        // Scene space is Y-up with the origin bottom-left.
+        self.cursor_scene = [
+            norm[0] * self.width as f32,
+            (1.0 - norm[1]) * self.height as f32,
+        ];
     }
 
     /// Render the next frame into the internal scene target.
@@ -3599,179 +3805,7 @@ impl GpuSceneInstance {
         self.last_time = time;
         let dynamics = self.dynamics.update(time, delta, self.mouse_norm);
 
-        // Tick SceneScript-driven properties for this frame. `engine.timeOfDay`
-        // is fractional hours in [0,24); we derive it from the wall clock (UTC
-        // for now — local-time zoning is a follow-up).
-        {
-            let secs_into_day = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() % 86_400)
-                .unwrap_or(0);
-            let time_of_day = secs_into_day as f32 / 3600.0;
-            let (w, h, persp) = (self.width, self.height, self.perspective);
-            // Every scene object's current name/id/transform, for
-            // `thisScene.getLayer(...)` (the object-attachment API — see
-            // `engine::script::OBJECT_ATTACHMENT_API_JS`) to search. Built
-            // from last frame's resolved locals (`update_parent_transforms`,
-            // which refreshes them, runs later this same frame) — one frame
-            // of staleness here, same as every other cross-script read in
-            // this codebase (e.g. the `shared` object's declaration-order
-            // dependency, documented below).
-            let layer_snapshots: Vec<crate::engine::script::LayerSnapshot> = self
-                .transform_graph
-                .name
-                .iter()
-                .zip(self.transform_graph.id.iter())
-                .zip(self.current_locals.iter())
-                .map(|((name, id), xform)| crate::engine::script::LayerSnapshot {
-                    name: name.as_deref(),
-                    id: *id,
-                    origin: [xform.t[0] as f32, xform.t[1] as f32, xform.t[2] as f32],
-                    angles: [xform.r[0] as f32, xform.r[1] as f32, xform.r[2] as f32],
-                    scale: [xform.s[0] as f32, xform.s[1] as f32, xform.s[2] as f32],
-                })
-                .collect();
-            #[cfg(target_os = "linux")]
-            let media_update = self.media.as_ref().and_then(|w| w.try_recv());
-            let ctx = &mut self.script_ctx;
-            // `delta`, not `time - self.last_time`: last_time was already
-            // advanced to `time` above, so that expression is always exactly 0
-            // and every `engine.frametime` script silently multiplied by zero.
-            ctx.set_time(time, time_of_day, delta);
-            ctx.set_layers(&layer_snapshots);
-            #[cfg(target_os = "linux")]
-            if let Some(info) = media_update {
-                use crate::engine::media::PlaybackState;
-                ctx.set_media(
-                    info.available,
-                    match info.playback_state {
-                        PlaybackState::Stopped => 0,
-                        PlaybackState::Playing => 1,
-                        PlaybackState::Paused => 2,
-                    },
-                    &info.title,
-                    &info.artist,
-                    &info.album,
-                    info.position_us,
-                    info.duration_us,
-                    info.art_url.as_deref(),
-                );
-            }
-            for layer in &mut self.layers {
-                // Refreshes `thisLayer` so this object's own scripts can use
-                // the object-attachment API (`lookAt`, `setParent`,
-                // `getTransformMatrix`, etc.) against real data.
-                ctx.set_current_object(
-                    self.transform_graph
-                        .name
-                        .get(layer.order_index)
-                        .and_then(|n| n.as_deref()),
-                    layer.object_id,
-                    [
-                        layer.origin_base[0] as f32,
-                        layer.origin_base[1] as f32,
-                        layer.origin_base[2] as f32,
-                    ],
-                    layer.angles_base,
-                    layer.scale_base,
-                    layer.parallax_depth,
-                );
-                if let Some(script) = &layer.alpha_script {
-                    layer.alpha = ctx
-                        .eval_update(script, layer.alpha_base)
-                        .unwrap_or(layer.alpha_base);
-                }
-                // Transform scripts. `visible` gates the draw; scale/origin
-                // rebuild `rect`; angles rebuilds `angle`. The rect rebuild is
-                // 2D-only (perspective layers keep their camera-projected rect).
-                // Each script borrow is scoped to its eval so the `rect`/`angle`
-                // writes below don't overlap it.
-                if let Some(v) = layer
-                    .transform_scripts
-                    .visible
-                    .as_ref()
-                    .and_then(|s| ctx.eval_update_bool(s, layer.visible_base))
-                {
-                    layer.visible = v;
-                }
-                if !persp
-                    && (layer.transform_scripts.scale.is_some()
-                        || layer.transform_scripts.origin.is_some())
-                {
-                    let scale = match &layer.transform_scripts.scale {
-                        Some(s) => ctx
-                            .eval_update_vec3(s, layer.scale_base)
-                            .unwrap_or(layer.scale_base),
-                        None => layer.scale_base,
-                    };
-                    let origin_base = [
-                        layer.origin_base[0] as f32,
-                        layer.origin_base[1] as f32,
-                        layer.origin_base[2] as f32,
-                    ];
-                    let origin = match &layer.transform_scripts.origin {
-                        Some(s) => ctx.eval_update_vec3(s, origin_base).unwrap_or(origin_base),
-                        None => origin_base,
-                    };
-                    let size_px = [
-                        layer.effective_size[0] * scale[0] as f64,
-                        layer.effective_size[1] * scale[1] as f64,
-                    ];
-                    layer.rect = [
-                        (2.0 * origin[0] as f64 / w as f64 - 1.0) as f32,
-                        (2.0 * origin[1] as f64 / h as f64 - 1.0) as f32,
-                        (size_px[0] / w as f64) as f32,
-                        (size_px[1] / h as f64) as f32,
-                    ];
-                }
-                if !persp {
-                    if let Some(a) = layer
-                        .transform_scripts
-                        .angles
-                        .as_ref()
-                        .and_then(|s| ctx.eval_update_vec3(s, layer.angles_base))
-                    {
-                        layer.angle = -a[2];
-                    }
-                }
-                // Script-driven text: re-evaluate; only a CHANGED string pays
-                // for rasterization + upload (a clock re-rasterizes once per
-                // displayed unit — second or minute — not per frame).
-                if let Some(td) = &mut layer.text_dynamic {
-                    if let Some(new_text) = ctx.eval_update_string(
-                        &td.script,
-                        &td.last_text,
-                        td.script_properties.as_ref(),
-                    ) {
-                        if new_text != td.last_text && !new_text.is_empty() {
-                            if let Some(img) = crate::engine::text::rasterize(
-                                &td.font_data,
-                                &new_text,
-                                td.point_size,
-                            ) {
-                                // The quad's rect was sized at build to the
-                                // object's authored `size` box and projected
-                                // through the camera/parent transform; the text
-                                // bitmap is stretched to fill it. A content
-                                // change only swaps that texture — the quad
-                                // stays put, so leave `rect` untouched (the old
-                                // per-change ortho recompute is what moved the
-                                // clock off-screen / shrank it).
-                                // ponytail: fixed authored-size quad — right for
-                                // the clock/date (constant-width). Text that
-                                // must grow to fit would need its box re-fit.
-                                layer.frames[0] = self.renderer.upload_texture(&img);
-                                td.last_text = new_text;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Recompose parent chains now that this frame's scripts have run —
-        // a scripted parent moves its whole subtree.
-        self.update_parent_transforms();
+        self.tick_scripts(time, delta);
 
         // Refresh the g_AudioSpectrum* UBO from the latest captured window, and
         // drive audio-reactive particle emitters from the overall loudness.
@@ -3959,7 +3993,9 @@ impl GpuSceneInstance {
     ) {
         {
             let layer = &self.layers[layer_idx];
-            let frame_idx = if layer.frames.len() > 1 && layer.frame_duration_ms > 0 {
+            let frame_idx = if let Some(f) = layer.script_frame {
+                f.min(layer.frames.len() - 1)
+            } else if layer.frames.len() > 1 && layer.frame_duration_ms > 0 {
                 ((time * 1000.0 / layer.frame_duration_ms as f32) as usize) % layer.frames.len()
             } else {
                 0
@@ -4924,12 +4960,9 @@ fn named_fbo_key(instance_idx: usize, fbo_name: &str) -> String {
 }
 
 /// Fraction of the local day in [0,1) (the reference's g_Daytime).
+/// `g_Daytime`: fraction of the local day elapsed.
 fn daytime_fraction() -> f32 {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    ((secs % 86_400) as f32) / 86_400.0
+    crate::engine::script::local_time_of_day()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5891,6 +5924,121 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
         ]),
         _ => vec![0u8; 32],
     }
+}
+
+/// Build the scene's SceneScript runtime: one layer proxy per scene object
+/// (indexed like `scene.objects`, the same index `order_index` and the
+/// transform graph use), then one instance per scripted property.
+fn build_script_host(
+    dir: &Path,
+    scene: &crate::engine::scene::Scene,
+    graph: &crate::engine::render::TransformGraph,
+    canvas: [u32; 2],
+) -> crate::engine::script::ScriptHost {
+    use crate::engine::scene::{parse_value_f32, parse_value_vec3};
+    use crate::engine::script::{ObjectInit, ScriptHost};
+
+    let mut host = ScriptHost::new();
+    if scene.objects.iter().all(|o| o.scripts().is_empty()) {
+        return host;
+    }
+    if let Some(path) = ScriptHost::storage_path_for(dir) {
+        host = host.with_storage(path);
+    }
+    // The raw scene.json entries back `thisScene.getInitialLayerConfig`.
+    let raw_objects: Vec<serde_json::Value> =
+        crate::engine::assets::AssetStore::from_directory(dir)
+            .ok()
+            .and_then(|a| a.scene_json().ok())
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.get("objects").and_then(|o| o.as_array()).cloned())
+            .unwrap_or_default();
+
+    let user_props: serde_json::Map<String, serde_json::Value> =
+        crate::engine::properties::SceneProperties::from_project_dir(dir)
+            .iter()
+            .map(|p| (p.name.clone(), p.value.clone()))
+            .collect();
+    host.set_scene_info(
+        [canvas[0] as f32, canvas[1] as f32],
+        canvas,
+        &serde_json::Value::Object(user_props),
+    );
+
+    let f32v = |v: [f64; 3]| [v[0] as f32, v[1] as f32, v[2] as f32];
+    for (i, obj) in scene.objects.iter().enumerate() {
+        let local = graph
+            .local
+            .get(i)
+            .copied()
+            .unwrap_or(crate::engine::render::Xform::IDENTITY);
+        let text = obj.text.as_ref().and_then(|t| match t {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(m) => {
+                m.get("value").and_then(|v| v.as_str()).map(str::to_string)
+            }
+            _ => None,
+        });
+        let init = ObjectInit {
+            name: obj.name.clone(),
+            id: obj.id,
+            origin: f32v(local.t),
+            angles: f32v(local.r),
+            scale: f32v(local.s),
+            size: f32v(obj.parsed_size()),
+            color: obj
+                .color
+                .as_ref()
+                .and_then(parse_value_vec3)
+                .map(f32v)
+                .unwrap_or([1.0; 3]),
+            visible: obj.is_visible(),
+            alpha: obj.alpha.as_ref().and_then(parse_value_f32).unwrap_or(1.0),
+            brightness: obj
+                .brightness
+                .as_ref()
+                .and_then(parse_value_f32)
+                .unwrap_or(1.0),
+            text,
+            pointsize: obj
+                .pointsize
+                .as_ref()
+                .and_then(parse_value_f32)
+                .unwrap_or(32.0),
+            volume: obj.volume.as_ref().and_then(parse_value_f32).unwrap_or(1.0),
+            parallax_depth: obj
+                .parallax_depth
+                .as_ref()
+                .and_then(parse_value_vec3)
+                .map(|v| [v[0] as f32, v[1] as f32])
+                .unwrap_or([0.0; 2]),
+            parent_index: graph.parent.get(i).copied().flatten(),
+            frame_count: 1,
+            raw: raw_objects.get(i).cloned(),
+        };
+        host.register_object(i, &init);
+    }
+
+    for (i, obj) in scene.objects.iter().enumerate() {
+        let props: [(&str, Option<&serde_json::Value>); 10] = [
+            ("visible", obj.visible.as_ref()),
+            ("origin", obj.origin.as_ref()),
+            ("angles", obj.angles.as_ref()),
+            ("scale", obj.scale.as_ref()),
+            ("alpha", obj.alpha.as_ref()),
+            ("color", obj.color.as_ref()),
+            ("brightness", obj.brightness.as_ref()),
+            ("text", obj.text.as_ref()),
+            ("pointsize", obj.pointsize.as_ref()),
+            ("volume", obj.volume.as_ref()),
+        ];
+        for (prop, value) in props {
+            if let Some((script, authored)) = crate::engine::script::scripted(value) {
+                host.attach(i, Some(prop), script, authored);
+            }
+        }
+    }
+    host
 }
 
 #[cfg(test)]
