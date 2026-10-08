@@ -2626,13 +2626,29 @@ mod tests {
             id: vec![None, None, None],
         };
         let locals = vec![
-            Xform { t: [10.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3] },
-            Xform { t: [1.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3] },
-            Xform { t: [1.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3] },
+            Xform {
+                t: [10.0, 0.0, 0.0],
+                r: [0.0; 3],
+                s: [1.0; 3],
+            },
+            Xform {
+                t: [1.0, 0.0, 0.0],
+                r: [0.0; 3],
+                s: [1.0; 3],
+            },
+            Xform {
+                t: [1.0, 0.0, 0.0],
+                r: [0.0; 3],
+                s: [1.0; 3],
+            },
         ];
 
         let worlds = graph.world(&locals, &[false, false, false]);
-        assert_eq!(worlds[2].t, [12.0, 0.0, 0.0], "baseline: full chain composes");
+        assert_eq!(
+            worlds[2].t,
+            [12.0, 0.0, 0.0],
+            "baseline: full chain composes"
+        );
 
         // Sever object 1's own inheritance from object 0.
         let worlds = graph.world(&locals, &[false, true, false]);

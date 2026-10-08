@@ -201,12 +201,20 @@ fn main() {
         // No subcommand → open GUI
         None => run_ui(),
         Some(Command::List { r#type }) => cmd_list(r#type),
-        Some(Command::Set { id, properties, quality, save, foreground }) => {
-            cmd_set(&id, properties, quality, save, foreground)
-        }
-        Some(Command::SetFile { path, properties, quality, save, foreground }) => {
-            cmd_set_file(&path, properties, quality, save, foreground)
-        }
+        Some(Command::Set {
+            id,
+            properties,
+            quality,
+            save,
+            foreground,
+        }) => cmd_set(&id, properties, quality, save, foreground),
+        Some(Command::SetFile {
+            path,
+            properties,
+            quality,
+            save,
+            foreground,
+        }) => cmd_set_file(&path, properties, quality, save, foreground),
         Some(Command::ListProperties { id }) => cmd_list_properties(&id),
         Some(Command::Info { id }) => cmd_info(&id),
         Some(Command::Probe) => cmd_probe(),
@@ -370,8 +378,9 @@ fn apply_saved_settings(
     let saved_quality = settings.quality_override(id_or_path);
     let cli_quality_parsed = cli_quality
         .map(|s| {
-            wp_engine::platform::RenderQuality::parse(s)
-                .ok_or_else(|| anyhow!("invalid --quality '{s}' (expected Ultra, High, Medium, or Low)"))
+            wp_engine::platform::RenderQuality::parse(s).ok_or_else(|| {
+                anyhow!("invalid --quality '{s}' (expected Ultra, High, Medium, or Low)")
+            })
         })
         .transpose()?;
     if let Some(q) = cli_quality_parsed.or(saved_quality) {
@@ -389,7 +398,10 @@ fn apply_saved_settings(
             saved_anything = true;
         }
         if !cli_properties.is_empty() {
-            println!("Saved {} property override(s) for next time", cli_properties.len());
+            println!(
+                "Saved {} property override(s) for next time",
+                cli_properties.len()
+            );
         }
         if let Some(q) = cli_quality_parsed {
             settings.set_quality(id_or_path, q);
@@ -590,7 +602,13 @@ fn cmd_run(foreground: bool) -> Result<()> {
         .values()
         .next()
         .or(settings.default_background.as_ref())
-        .or_else(|| settings.playlists.values().next().and_then(|p| p.items.first()))
+        .or_else(|| {
+            settings
+                .playlists
+                .values()
+                .next()
+                .and_then(|p| p.items.first())
+        })
         .ok_or_else(|| {
             anyhow!(
                 "no saved wallpaper — use `wp-engine config set-screen`/`set-default`/\

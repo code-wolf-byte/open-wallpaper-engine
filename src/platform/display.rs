@@ -44,7 +44,11 @@ pub trait DisplayPlatform {
     /// The platform decides how to render: scene wallpapers draw directly
     /// into GPU surfaces when the compositor allows it; other content (and
     /// fallback paths) go through CPU frames + SHM buffers.
-    fn spawn_wallpaper(&self, content: ScreenContent, settings: ScreenSettings) -> Result<WallpaperHandle>;
+    fn spawn_wallpaper(
+        &self,
+        content: ScreenContent,
+        settings: ScreenSettings,
+    ) -> Result<WallpaperHandle>;
 }
 
 // ── Runtime detection ─────────────────────────────────────────────────────────

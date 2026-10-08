@@ -49,7 +49,9 @@ pub fn request_or_spawn(req: &Request) -> Result<Response> {
 fn send(mut stream: UnixStream, req: &Request) -> Result<Response> {
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
-    stream.write_all(line.as_bytes()).context("sending request to daemon")?;
+    stream
+        .write_all(line.as_bytes())
+        .context("sending request to daemon")?;
 
     // No read timeout: an apply loads the whole scene before answering.
     let mut reply = String::new();
@@ -71,8 +73,7 @@ fn spawn_daemon() -> Result<UnixStream> {
     let exe = std::env::current_exe().context("locating the wp-engine binary")?;
     let log_path = super::log_path();
     if let Some(dir) = log_path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let log = std::fs::File::create(&log_path)
         .with_context(|| format!("opening daemon log {}", log_path.display()))?;

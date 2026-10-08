@@ -2578,8 +2578,16 @@ mod tests {
         let resolver = super::super::resolver::AssetResolver::new(Some(wallpaper_dir), None);
 
         let cases: &[(&str, &str, &[(&str, i32)])] = &[
-            ("effects/godrays_downsample2", "effects/godrays_downsample2", &[]),
-            ("effects/godrays_cast", "effects/godrays_cast", &[("CASTER", 0), ("SAMPLES", 0)]),
+            (
+                "effects/godrays_downsample2",
+                "effects/godrays_downsample2",
+                &[],
+            ),
+            (
+                "effects/godrays_cast",
+                "effects/godrays_cast",
+                &[("CASTER", 0), ("SAMPLES", 0)],
+            ),
             (
                 "effects/godrays_gaussian_x",
                 "effects/godrays_gaussian",
@@ -2590,23 +2598,26 @@ mod tests {
                 "effects/godrays_gaussian",
                 &[("KERNEL", 1), ("VERTICAL", 1)],
             ),
-            ("effects/godrays_combine", "effects/godrays_combine", &[("BLENDMODE", 9)]),
+            (
+                "effects/godrays_combine",
+                "effects/godrays_combine",
+                &[("BLENDMODE", 9)],
+            ),
         ];
 
         let mut failures = Vec::new();
         for (label, shader_name, combo_pairs) in cases {
-            let (frag_glsl, vert_glsl) =
-                match super::super::loader::load_glsl_shader_with_resolver(
-                    &resolver,
-                    shader_name,
-                    None,
-                ) {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        failures.push(format!("{label}: load failed: {e:#}"));
-                        continue;
-                    }
-                };
+            let (frag_glsl, vert_glsl) = match super::super::loader::load_glsl_shader_with_resolver(
+                &resolver,
+                shader_name,
+                None,
+            ) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    failures.push(format!("{label}: load failed: {e:#}"));
+                    continue;
+                }
+            };
             let combos: std::collections::HashMap<String, i32> = combo_pairs
                 .iter()
                 .map(|(k, v)| (k.to_string(), *v))
@@ -2621,7 +2632,11 @@ mod tests {
                 failures.push(format!("{label}: {e:#}"));
             }
         }
-        assert!(failures.is_empty(), "godrays passes failed to transpile:\n{}", failures.join("\n"));
+        assert!(
+            failures.is_empty(),
+            "godrays passes failed to transpile:\n{}",
+            failures.join("\n")
+        );
     }
 
     #[test]

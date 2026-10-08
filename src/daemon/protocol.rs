@@ -46,14 +46,23 @@ impl ApplySpec {
         };
         Self {
             background: absolute(&context.background),
-            screens: context.screens.iter().map(|(k, p)| (k.clone(), absolute(p))).collect(),
+            screens: context
+                .screens
+                .iter()
+                .map(|(k, p)| (k.clone(), absolute(p)))
+                .collect(),
             properties: context.properties.clone(),
             quality: Some(quality.label().to_string()),
             volume: Some(volume),
             screen_quality: context
                 .screen_settings
                 .iter()
-                .map(|(screen, s)| (screen.clone(), s.lock().unwrap().quality.label().to_string()))
+                .map(|(screen, s)| {
+                    (
+                        screen.clone(),
+                        s.lock().unwrap().quality.label().to_string(),
+                    )
+                })
                 .collect(),
             title,
         }

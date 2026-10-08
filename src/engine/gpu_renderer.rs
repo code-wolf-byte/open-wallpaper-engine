@@ -630,39 +630,40 @@ impl GpuSceneRenderer {
             bind_group_layouts: &[&shadow_pass_bgl],
             push_constant_ranges: &[],
         });
-        let mesh3d_shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mesh3d_shadow"),
-            layout: Some(&shadow_pass_layout),
-            vertex: wgpu::VertexState {
-                module: &shader_module,
-                entry_point: Some("vs_shadow_depth"),
-                // Same buffer the main mesh3d pipeline uses (stride 32,
-                // pos+uv+normal) — only position is declared/read here, but
-                // the stride must still match the real per-vertex layout.
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 32,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
-                }],
-                compilation_options: Default::default(),
-            },
-            fragment: None,
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: MESH3D_DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview: None,
-            cache: None,
-        });
+        let mesh3d_shadow_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("mesh3d_shadow"),
+                layout: Some(&shadow_pass_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader_module,
+                    entry_point: Some("vs_shadow_depth"),
+                    // Same buffer the main mesh3d pipeline uses (stride 32,
+                    // pos+uv+normal) — only position is declared/read here, but
+                    // the stride must still match the real per-vertex layout.
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: 32,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                    }],
+                    compilation_options: Default::default(),
+                },
+                fragment: None,
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: MESH3D_DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            });
         let shadow_comparison_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shadow_comparison_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -2079,8 +2080,18 @@ fn mesh3d_lighting_bytes(
     push4([ambient[0], ambient[1], ambient[2], 0.0]);
     match &fog {
         Some(f) => {
-            push4([f.distance_color[0], f.distance_color[1], f.distance_color[2], f.distance_density]);
-            push4([f.height_color[0], f.height_color[1], f.height_color[2], f.height_density]);
+            push4([
+                f.distance_color[0],
+                f.distance_color[1],
+                f.distance_color[2],
+                f.distance_density,
+            ]);
+            push4([
+                f.height_color[0],
+                f.height_color[1],
+                f.height_color[2],
+                f.height_density,
+            ]);
             push4([f.height_exponent, f.height_offset, 0.0, 0.0]);
         }
         None => {
@@ -2108,7 +2119,12 @@ fn mesh3d_lighting_bytes(
                 .unwrap_or(0.0)
         };
         match light {
-            crate::engine::lighting::Light::Point { origin, color, intensity, .. } => {
+            crate::engine::lighting::Light::Point {
+                origin,
+                color,
+                intensity,
+                ..
+            } => {
                 let vp = cam.to_view_space(*origin);
                 *pos_slot = [vp[0], vp[1], vp[2], shadow_w()];
                 *color_slot = [color[0], color[1], color[2], *intensity];
@@ -2206,7 +2222,10 @@ fn mesh3d_lighting_bytes(
         }
     }
     for slot in 0..MESH3D_MAX_SHADOW_LIGHTS {
-        let uv_rect = shadow_slot_data.get(slot).map(|(_, r)| *r).unwrap_or([0.0; 4]);
+        let uv_rect = shadow_slot_data
+            .get(slot)
+            .map(|(_, r)| *r)
+            .unwrap_or([0.0; 4]);
         push4(uv_rect);
     }
     let cookie_view_proj = cookie
@@ -2705,12 +2724,17 @@ impl GpuSceneInstance {
             (
                 renderer.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("shadow_atlas_dummy"),
-                    size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: MESH3D_DEPTH_FORMAT,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 }),
                 vec![None; lights.len()],
@@ -2732,28 +2756,39 @@ impl GpuSceneInstance {
         let cookie_data = {
             use crate::engine::lighting::Light;
             let (center, radius) = crate::engine::shadow::scene_bounds(&resolved.mesh3d_layers);
-            lights.iter().enumerate().find_map(|(i, (light, _, _, cookie_path))| {
-                let path = cookie_path.as_ref()?;
-                let Light::Spot { origin, direction, outer_cone_degrees, .. } = light else {
-                    return None;
-                };
-                let image = super::render::resolve_static_texture(Some(dir), None, path)?;
-                let vp = crate::engine::shadow::spot_light_view_proj(
-                    *origin,
-                    *direction,
-                    *outer_cone_degrees,
-                    center,
-                    radius,
-                );
-                Some((i, vp, image))
-            })
+            lights
+                .iter()
+                .enumerate()
+                .find_map(|(i, (light, _, _, cookie_path))| {
+                    let path = cookie_path.as_ref()?;
+                    let Light::Spot {
+                        origin,
+                        direction,
+                        outer_cone_degrees,
+                        ..
+                    } = light
+                    else {
+                        return None;
+                    };
+                    let image = super::render::resolve_static_texture(Some(dir), None, path)?;
+                    let vp = crate::engine::shadow::spot_light_view_proj(
+                        *origin,
+                        *direction,
+                        *outer_cone_degrees,
+                        center,
+                        radius,
+                    );
+                    Some((i, vp, image))
+                })
         };
         let cookie_view = renderer
             .upload_texture(
                 &cookie_data
                     .as_ref()
                     .map(|(_, _, img)| img.clone())
-                    .unwrap_or_else(|| RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]))),
+                    .unwrap_or_else(|| {
+                        RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]))
+                    }),
             )
             .create_view(&Default::default());
         // Volumetric-light-shaft ray march's static per-scene bind group —
@@ -2907,18 +2942,34 @@ impl GpuSceneInstance {
     ) -> Option<wgpu::BindGroup> {
         use crate::engine::lighting::Light;
 
-        let (idx, origin, color_intensity, density, exponent) =
-            lights.iter().enumerate().find_map(|(i, (light, _, volumetrics, _))| {
+        let (idx, origin, color_intensity, density, exponent) = lights
+            .iter()
+            .enumerate()
+            .find_map(|(i, (light, _, volumetrics, _))| {
                 let (density, exponent) = (*volumetrics)?;
                 let (origin, color, intensity) = match light {
                     // Directional has no position to march a shaft from;
                     // Tube isn't constructed by `Scene::lights()` yet (see
                     // `LightType::Tube`'s doc comment) — neither reaches here.
-                    Light::Point { origin, color, intensity, .. }
-                    | Light::Spot { origin, color, intensity, .. } => (*origin, *color, *intensity),
+                    Light::Point {
+                        origin,
+                        color,
+                        intensity,
+                        ..
+                    }
+                    | Light::Spot {
+                        origin,
+                        color,
+                        intensity,
+                        ..
+                    } => (*origin, *color, *intensity),
                     _ => return None,
                 };
-                let ci = [color[0] * intensity, color[1] * intensity, color[2] * intensity];
+                let ci = [
+                    color[0] * intensity,
+                    color[1] * intensity,
+                    color[2] * intensity,
+                ];
                 Some((i, origin, ci, density, exponent))
             })?;
 
@@ -2961,29 +3012,40 @@ impl GpuSceneInstance {
         };
         push4([eye[0], eye[1], eye[2], 0.0]);
         push4([origin[0], origin[1], origin[2], density]);
-        push4([color_intensity[0], color_intensity[1], color_intensity[2], exponent]);
+        push4([
+            color_intensity[0],
+            color_intensity[1],
+            color_intensity[2],
+            exponent,
+        ]);
         push4(shadow_uv_rect);
         push4([has_shadow, MAX_RANGE, 0.0, 0.0]);
 
         let ubo = renderer.make_uniform_buffer(&bytes, bytes.len() as u64);
-        Some(renderer.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("volumetrics_bg"),
-            layout: &renderer.volumetrics_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: ubo.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(shadow_atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&renderer.shadow_comparison_sampler),
-                },
-            ],
-        }))
+        Some(
+            renderer
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("volumetrics_bg"),
+                    layout: &renderer.volumetrics_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: ubo.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(shadow_atlas_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(
+                                &renderer.shadow_comparison_sampler,
+                            ),
+                        },
+                    ],
+                }),
+        )
     }
 
     /// Render the shadow atlas once at scene setup (shadow-casting lights
@@ -3073,7 +3135,8 @@ impl GpuSceneInstance {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: MESH3D_DEPTH_FORMAT,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
                 view_formats: &[],
             });
             return (dummy, shadow_slots, Vec::new());
@@ -3117,7 +3180,9 @@ impl GpuSceneInstance {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("shadow_atlas_pass"),
             });
-        for (slot, ((light_idx, view_proj), tile)) in shadow_casters.iter().zip(tiles.iter()).enumerate() {
+        for (slot, ((light_idx, view_proj), tile)) in
+            shadow_casters.iter().zip(tiles.iter()).enumerate()
+        {
             let view_proj = *view_proj;
             let uv_rect = shadow::tile_uv_rect(*tile, atlas_w, atlas_h);
             shadow_slots[*light_idx] = Some(slot);
@@ -3146,11 +3211,19 @@ impl GpuSceneInstance {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_viewport(tile.x as f32, tile.y as f32, tile.w as f32, tile.h as f32, 0.0, 1.0);
+            pass.set_viewport(
+                tile.x as f32,
+                tile.y as f32,
+                tile.w as f32,
+                tile.h as f32,
+                0.0,
+                1.0,
+            );
             pass.set_scissor_rect(tile.x, tile.y, tile.w, tile.h);
             pass.set_pipeline(&renderer.mesh3d_shadow_pipeline);
             for (layer, (vbuf, ibuf, index_count)) in mesh3d_layers.iter().zip(geometry.iter()) {
-                let model = crate::engine::camera3d::model_matrix(layer.origin, layer.angles, layer.scale);
+                let model =
+                    crate::engine::camera3d::model_matrix(layer.origin, layer.angles, layer.scale);
                 let light_mvp = crate::engine::camera3d::mat4_mul(&view_proj, &model);
                 let mut mvp_bytes = Vec::with_capacity(64);
                 for col in light_mvp.iter() {
@@ -3159,14 +3232,16 @@ impl GpuSceneInstance {
                     }
                 }
                 let mvp_buf = renderer.make_uniform_buffer(&mvp_bytes, 64);
-                let bg = renderer.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("shadow_pass_bg"),
-                    layout: &renderer.shadow_pass_bgl,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: mvp_buf.as_entire_binding(),
-                    }],
-                });
+                let bg = renderer
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("shadow_pass_bg"),
+                        layout: &renderer.shadow_pass_bgl,
+                        entries: &[wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: mvp_buf.as_entire_binding(),
+                        }],
+                    });
                 pass.set_bind_group(0, &bg, &[]);
                 pass.set_vertex_buffer(0, vbuf.slice(..));
                 pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
@@ -4180,24 +4255,27 @@ impl GpuSceneInstance {
                     params.extend_from_slice(&f.to_le_bytes());
                 }
                 let quad3d_buf = self.renderer.make_uniform_buffer(&params, 80);
-                let quad3d_bg = self.renderer.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("quad3d_bg"),
-                    layout: &self.renderer.quad3d_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: quad3d_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&src_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(layer_sampler),
-                        },
-                    ],
-                });
+                let quad3d_bg =
+                    self.renderer
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("quad3d_bg"),
+                            layout: &self.renderer.quad3d_bgl,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: quad3d_buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::TextureView(&src_view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::Sampler(layer_sampler),
+                                },
+                            ],
+                        });
                 (&self.renderer.quad3d_pipeline, quad3d_bg)
             } else {
                 let composite_buf = self.renderer.make_uniform_buffer(
@@ -4545,7 +4623,11 @@ impl GpuSceneInstance {
     /// and the Ghidra report's `_rt_volumetrics*` follow-up. A no-op unless
     /// `self.volumetrics_bind_group` is `Some` (a `castvolumetrics` light
     /// exists) — checked by the one caller, `render()`.
-    fn record_volumetrics(&self, encoder: &mut wgpu::CommandEncoder, target_view: &wgpu::TextureView) {
+    fn record_volumetrics(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+    ) {
         let Some(vol_bg) = &self.volumetrics_bind_group else {
             return;
         };
@@ -5881,7 +5963,9 @@ mod tests {
     fn project_quad_corners_none_when_behind_camera() {
         let cam = quad3d_test_camera();
         // Eye is at z=10 looking toward the origin; z=20 is behind it.
-        assert!(project_quad_corners(&cam, [0.0, 0.0, 20.0], [0.0, 0.0, 0.0], [4.0, 2.0]).is_none());
+        assert!(
+            project_quad_corners(&cam, [0.0, 0.0, 20.0], [0.0, 0.0, 0.0], [4.0, 2.0]).is_none()
+        );
     }
 
     /// Same rule as `hardcoded_effect_params_are_uniform_sized` below, for the
@@ -5906,10 +5990,7 @@ mod tests {
         // since the shadow arrays are fixed-size regardless of how many
         // slots are actually in use.
         let shadow_slots = vec![Some(0)];
-        let shadow_slot_data = vec![(
-            crate::engine::camera3d::identity(),
-            [0.0, 0.0, 1.0, 1.0],
-        )];
+        let shadow_slot_data = vec![(crate::engine::camera3d::identity(), [0.0, 0.0, 1.0, 1.0])];
         let bytes = mesh3d_lighting_bytes(&scene, &cam, &shadow_slots, &shadow_slot_data, None);
         assert_eq!(bytes.len(), MESH3D_LIGHTING_BYTES_LEN);
     }
@@ -5943,7 +6024,11 @@ mod tests {
             )
         };
         // Column 3, row 0 (the value we perturbed) is float index 12.
-        assert_eq!(read_f32(12), 42.0, "cookie_view_proj must round-trip the matrix");
+        assert_eq!(
+            read_f32(12),
+            42.0,
+            "cookie_view_proj must round-trip the matrix"
+        );
     }
 
     /// A spot light must (a) count as renderable (`flags.x == 1.0` — the
@@ -5973,7 +6058,10 @@ mod tests {
 
         // flags.x is the buffer's first f32.
         let flags_x = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        assert_eq!(flags_x, 1.0, "a spot-only scene must still engage the lit branch");
+        assert_eq!(
+            flags_x, 1.0,
+            "a spot-only scene must still engage the lit branch"
+        );
 
         // light_spot[0] starts after 5 leading vec4s + 2 MESH3D_MAX_LIGHTS
         // vec4 arrays (positions, colors).
@@ -5988,7 +6076,10 @@ mod tests {
         let dir = [read_f32(0), read_f32(1), read_f32(2)];
         let len2 = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
         assert!(len2 > 0.25, "spot direction must not read as zero: {dir:?}");
-        assert!(read_f32(3) >= 1.0, "exponent must be clamped to at least 1.0");
+        assert!(
+            read_f32(3) >= 1.0,
+            "exponent must be clamped to at least 1.0"
+        );
     }
 
     /// A directional light must flag itself via `light_pos[0].w == -1.0`
@@ -6014,7 +6105,10 @@ mod tests {
         let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[], None);
 
         let flags_x = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        assert_eq!(flags_x, 1.0, "a directional-only scene must still engage the lit branch");
+        assert_eq!(
+            flags_x, 1.0,
+            "a directional-only scene must still engage the lit branch"
+        );
 
         // light_pos[0] starts right after the 5 leading vec4s.
         let pos0_offset = 16 * 5;
@@ -6027,7 +6121,10 @@ mod tests {
         };
         let dir = [read_f32(0), read_f32(1), read_f32(2)];
         let len2 = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
-        assert!((len2 - 1.0).abs() < 1e-4, "direction must be unit-length: {dir:?}");
+        assert!(
+            (len2 - 1.0).abs() < 1e-4,
+            "direction must be unit-length: {dir:?}"
+        );
         assert_eq!(read_f32(3), -1.0, "w must carry the directional sentinel");
     }
 
@@ -6056,19 +6153,37 @@ mod tests {
         let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[], None);
 
         let flags_x = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        assert_eq!(flags_x, 1.0, "a tube-only scene must still engage the lit branch");
+        assert_eq!(
+            flags_x, 1.0,
+            "a tube-only scene must still engage the lit branch"
+        );
 
         let pos0_offset = 16 * 5;
         let spot0_offset = 16 * 5 + 16 * MESH3D_MAX_LIGHTS * 2;
         let read_f32 = |offset: usize, i: usize| {
-            f32::from_le_bytes(bytes[offset + i * 4..offset + i * 4 + 4].try_into().unwrap())
+            f32::from_le_bytes(
+                bytes[offset + i * 4..offset + i * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            )
         };
-        assert_eq!(read_f32(pos0_offset, 3), -3.0, "w must carry the tube sentinel");
-        let endpoint_b = [read_f32(spot0_offset, 0), read_f32(spot0_offset, 1), read_f32(spot0_offset, 2)];
+        assert_eq!(
+            read_f32(pos0_offset, 3),
+            -3.0,
+            "w must carry the tube sentinel"
+        );
+        let endpoint_b = [
+            read_f32(spot0_offset, 0),
+            read_f32(spot0_offset, 1),
+            read_f32(spot0_offset, 2),
+        ];
         let len2 = endpoint_b[0] * endpoint_b[0]
             + endpoint_b[1] * endpoint_b[1]
             + endpoint_b[2] * endpoint_b[2];
-        assert!(len2 > 1.0, "endpoint B should be a real view-space position, not a unit vector: {endpoint_b:?}");
+        assert!(
+            len2 > 1.0,
+            "endpoint B should be a real view-space position, not a unit vector: {endpoint_b:?}"
+        );
     }
 
     /// WGSL rounds every uniform-address-space struct up to a 16-byte

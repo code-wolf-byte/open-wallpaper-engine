@@ -236,9 +236,24 @@ mod tests {
         assert_eq!(
             tiles,
             vec![
-                ShadowTile { x: 0, y: 0, w: 512, h: 512 },
-                ShadowTile { x: 512, y: 0, w: 512, h: 512 },
-                ShadowTile { x: 1024, y: 0, w: 512, h: 512 },
+                ShadowTile {
+                    x: 0,
+                    y: 0,
+                    w: 512,
+                    h: 512
+                },
+                ShadowTile {
+                    x: 512,
+                    y: 0,
+                    w: 512,
+                    h: 512
+                },
+                ShadowTile {
+                    x: 1024,
+                    y: 0,
+                    w: 512,
+                    h: 512
+                },
             ]
         );
     }
@@ -248,7 +263,15 @@ mod tests {
         // max_width fits exactly 2 tiles per row.
         let (w, h, tiles) = pack_tiles(3, 512, 1024);
         assert_eq!((w, h), (1024, 1024));
-        assert_eq!(tiles[2], ShadowTile { x: 0, y: 512, w: 512, h: 512 });
+        assert_eq!(
+            tiles[2],
+            ShadowTile {
+                x: 0,
+                y: 512,
+                w: 512,
+                h: 512
+            }
+        );
     }
 
     #[test]
@@ -285,9 +308,7 @@ mod tests {
         // Project the target itself: should land at NDC center (x=y=0 after
         // divide), non-degenerate w.
         let p = [0.0, 0.0, 0.0, 1.0];
-        let clip: [f32; 4] = std::array::from_fn(|row| {
-            (0..4).map(|k| vp[k][row] * p[k]).sum()
-        });
+        let clip: [f32; 4] = std::array::from_fn(|row| (0..4).map(|k| vp[k][row] * p[k]).sum());
         assert!(clip[3] > 0.0, "w should be positive: {clip:?}");
         let ndc = [clip[0] / clip[3], clip[1] / clip[3]];
         assert!(ndc[0].abs() < 1e-4 && ndc[1].abs() < 1e-4, "got {ndc:?}");
@@ -303,12 +324,13 @@ mod tests {
         // should still project inside the [-1,1] NDC range (with a little
         // slack for the FOV being an equality bound).
         let p = [radius * 0.99, 0.0, 0.0, 1.0];
-        let clip: [f32; 4] = std::array::from_fn(|row| {
-            (0..4).map(|k| vp[k][row] * p[k]).sum()
-        });
+        let clip: [f32; 4] = std::array::from_fn(|row| (0..4).map(|k| vp[k][row] * p[k]).sum());
         assert!(clip[3] > 0.0);
         let ndc_x = clip[0] / clip[3];
-        assert!(ndc_x.abs() <= 1.0, "edge point escaped the frustum: ndc_x={ndc_x}");
+        assert!(
+            ndc_x.abs() <= 1.0,
+            "edge point escaped the frustum: ndc_x={ndc_x}"
+        );
     }
 
     #[test]
@@ -352,7 +374,10 @@ mod tests {
         let clip: [f32; 4] = std::array::from_fn(|row| (0..4).map(|k| vp[k][row] * p[k]).sum());
         assert!(clip[3] > 0.0);
         let ndc_x = clip[0] / clip[3];
-        assert!(ndc_x.abs() > 1.0, "off-axis point should escape a narrow cone: ndc_x={ndc_x}");
+        assert!(
+            ndc_x.abs() > 1.0,
+            "off-axis point should escape a narrow cone: ndc_x={ndc_x}"
+        );
     }
 
     #[test]
@@ -370,6 +395,9 @@ mod tests {
         let clip: [f32; 4] = std::array::from_fn(|row| (0..4).map(|k| vp[k][row] * p[k]).sum());
         assert!(clip[3] > 0.0);
         let ndc_x = clip[0] / clip[3];
-        assert!(ndc_x.abs() <= 1.0, "point should be inside a wide cone: ndc_x={ndc_x}");
+        assert!(
+            ndc_x.abs() <= 1.0,
+            "point should be inside a wide cone: ndc_x={ndc_x}"
+        );
     }
 }

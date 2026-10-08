@@ -56,9 +56,8 @@ impl WallpaperApplication {
     /// default for that one output rather than failing the whole wallpaper
     /// over one bad per-screen entry.
     fn resolve_screen_content(&self) -> Result<ScreenContent> {
-        let default = WallpaperContent::from_any_path(&self.context.background).with_context(
-            || format!("loading wallpaper {}", self.context.background.display()),
-        )?;
+        let default = WallpaperContent::from_any_path(&self.context.background)
+            .with_context(|| format!("loading wallpaper {}", self.context.background.display()))?;
         let mut by_output = std::collections::HashMap::new();
         for (screen, path) in &self.context.screens {
             match WallpaperContent::from_any_path(path) {

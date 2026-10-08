@@ -59,7 +59,11 @@ const PAUSE_CHECK_INTERVAL: Duration = Duration::from_millis(750);
 pub(super) struct WaylandPlatform;
 
 impl DisplayPlatform for WaylandPlatform {
-    fn spawn_wallpaper(&self, content: ScreenContent, settings: ScreenSettings) -> Result<WallpaperHandle> {
+    fn spawn_wallpaper(
+        &self,
+        content: ScreenContent,
+        settings: ScreenSettings,
+    ) -> Result<WallpaperHandle> {
         let wayland_handle = spawn_wayland_wallpaper(content, settings)?;
         Ok(WallpaperHandle::new(Box::new(wayland_handle)))
     }
@@ -83,7 +87,10 @@ impl WallpaperHandleInner for WaylandHandle {
     }
 }
 
-fn spawn_wayland_wallpaper(content: ScreenContent, settings: ScreenSettings) -> Result<WaylandHandle> {
+fn spawn_wayland_wallpaper(
+    content: ScreenContent,
+    settings: ScreenSettings,
+) -> Result<WaylandHandle> {
     let (signal_tx, signal_rx) = std::sync::mpsc::sync_channel::<LoopSignal>(0);
 
     let thread = thread::spawn(move || {
@@ -555,7 +562,11 @@ fn copy_frame_into_shm_canvas(
     }
 }
 
-fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, signal_tx: SyncSender<LoopSignal>) -> Result<()> {
+fn wallpaper_loop(
+    content: ScreenContent,
+    settings: ScreenSettings,
+    signal_tx: SyncSender<LoopSignal>,
+) -> Result<()> {
     // Open GPU device (prefer iGPU for background tasks; fall back to best).
     let gpu = platform::GpuDevice::open_low_power()
         .or_else(|_| platform::GpuDevice::open_best())
@@ -591,7 +602,9 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, signal_tx: S
     // Playback-pause's fullscreen/maximized detection — see the
     // `foreign_toplevel_manager` field doc for the "not every compositor
     // supports this" graceful-degradation note.
-    let foreign_toplevel_manager = globals.bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 1..=3, ()).ok();
+    let foreign_toplevel_manager = globals
+        .bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 1..=3, ())
+        .ok();
 
     let mut state = WallpaperState {
         registry_state,
@@ -735,19 +748,23 @@ impl OutputHandler for WallpaperState {
         let per_screen = output_name
             .as_deref()
             .is_some_and(|name| self.content.by_output.contains_key(name));
-        let renderer =
-            match build_content_renderer(resolved, self.device.clone(), self.queue.clone(), self.allow_gpu_surface) {
-                Ok(r) => r,
-                Err(e) => {
-                    // Don't take down every other (working) output over one
-                    // bad content path — log and leave this output blank.
-                    tracing::error!(
-                        target: "wallpaper",
-                        "failed to load wallpaper content for output {output_name:?}: {e} — leaving it blank"
-                    );
-                    return;
-                }
-            };
+        let renderer = match build_content_renderer(
+            resolved,
+            self.device.clone(),
+            self.queue.clone(),
+            self.allow_gpu_surface,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                // Don't take down every other (working) output over one
+                // bad content path — log and leave this output blank.
+                tracing::error!(
+                    target: "wallpaper",
+                    "failed to load wallpaper content for output {output_name:?}: {e} — leaving it blank"
+                );
+                return;
+            }
+        };
         tracing::info!(
             target: "wallpaper",
             "output {output_name:?}: {} wallpaper",
@@ -1051,8 +1068,14 @@ impl WallpaperState {
     /// active window" heuristic (not "some window somewhere is fullscreen,"
     /// which could be a minimized/background one the user can't even see).
     fn foreign_toplevel_pause_state(&self) -> (bool, bool) {
-        let fullscreen = self.foreign_toplevels.values().any(|t| t.activated && t.fullscreen);
-        let maximized = self.foreign_toplevels.values().any(|t| t.activated && t.maximized);
+        let fullscreen = self
+            .foreign_toplevels
+            .values()
+            .any(|t| t.activated && t.fullscreen);
+        let maximized = self
+            .foreign_toplevels
+            .values()
+            .any(|t| t.activated && t.maximized);
         (fullscreen, maximized)
     }
 

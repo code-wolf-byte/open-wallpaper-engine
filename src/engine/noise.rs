@@ -224,7 +224,10 @@ mod tests {
                 differs = true;
             }
         }
-        assert!(differs, "4-octave fbm was identical to single-octave Perlin everywhere sampled");
+        assert!(
+            differs,
+            "4-octave fbm was identical to single-octave Perlin everywhere sampled"
+        );
     }
 
     #[test]

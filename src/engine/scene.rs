@@ -93,7 +93,8 @@ impl Scene {
                     .unwrap_or([0.0; 3]);
                 let direction = || crate::engine::camera3d::rotate_euler([0.0, 0.0, -1.0], angles);
 
-                let is_spot = matches!(o.light_type(), LightType::Spot) || o.spot_cone_degrees().is_some();
+                let is_spot =
+                    matches!(o.light_type(), LightType::Spot) || o.spot_cone_degrees().is_some();
                 let light = if matches!(o.light_type(), LightType::Directional) {
                     crate::engine::lighting::Light::Directional {
                         direction: direction(),
@@ -310,8 +311,16 @@ impl General {
     /// the fog pass when this returns `Some`.
     pub fn fog(&self) -> Option<crate::engine::lighting::Fog> {
         use crate::engine::lighting::Fog;
-        let d = self.fog_distance.as_ref().and_then(parse_value_f32).unwrap_or(0.0);
-        let h = self.fog_height.as_ref().and_then(parse_value_f32).unwrap_or(0.0);
+        let d = self
+            .fog_distance
+            .as_ref()
+            .and_then(parse_value_f32)
+            .unwrap_or(0.0);
+        let h = self
+            .fog_height
+            .as_ref()
+            .and_then(parse_value_f32)
+            .unwrap_or(0.0);
         if d <= 0.0 && h <= 0.0 {
             return None;
         }
@@ -1118,7 +1127,11 @@ pub fn parse_value_vec3(v: &serde_json::Value) -> Option<[f64; 3]> {
 pub fn parse_value_vec4(v: &serde_json::Value) -> Option<[f64; 4]> {
     match v {
         serde_json::Value::Array(arr) if arr.len() >= 3 => {
-            let g = |i: usize| arr.get(i).and_then(|x| x.as_f64()).unwrap_or(if i == 3 { 1.0 } else { 0.0 });
+            let g = |i: usize| {
+                arr.get(i)
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(if i == 3 { 1.0 } else { 0.0 })
+            };
             Some([g(0), g(1), g(2), g(3)])
         }
         serde_json::Value::Object(m) => m.get("value").and_then(|inner| parse_value_vec4(inner)),
@@ -1173,7 +1186,10 @@ mod tests {
         .unwrap();
         let lights = scene.lights();
         assert_eq!(lights.len(), 1);
-        assert!(matches!(lights[0].0, crate::engine::lighting::Light::Point { .. }));
+        assert!(matches!(
+            lights[0].0,
+            crate::engine::lighting::Light::Point { .. }
+        ));
     }
 
     // Only one of the two cone fields set is treated as "no cone data" —
@@ -1208,7 +1224,11 @@ mod tests {
         let lights = scene.lights();
         assert_eq!(lights.len(), 1);
         match &lights[0].0 {
-            crate::engine::lighting::Light::Directional { direction, intensity, .. } => {
+            crate::engine::lighting::Light::Directional {
+                direction,
+                intensity,
+                ..
+            } => {
                 assert!((*intensity - 0.6).abs() < 1e-5);
                 // angles.y = 90°: forward (-Z rotated by yaw) points toward -X.
                 assert!(direction[0] < -0.9, "direction={direction:?}");
@@ -1222,10 +1242,9 @@ mod tests {
     // fallback, not the only path.
     #[test]
     fn light_string_lspot_resolves_to_spot_without_cone_fields() {
-        let scene = Scene::from_json(
-            r#"{"objects": [{"id": 1, "light": "lspot", "origin": "0 0 0"}]}"#,
-        )
-        .unwrap();
+        let scene =
+            Scene::from_json(r#"{"objects": [{"id": 1, "light": "lspot", "origin": "0 0 0"}]}"#)
+                .unwrap();
         assert!(matches!(
             scene.lights()[0].0,
             crate::engine::lighting::Light::Spot { .. }
@@ -1246,8 +1265,14 @@ mod tests {
         .unwrap();
         let lights = scene.lights();
         assert_eq!(lights.len(), 2);
-        assert!(matches!(lights[0].0, crate::engine::lighting::Light::Point { .. }));
-        assert!(matches!(lights[1].0, crate::engine::lighting::Light::Point { .. }));
+        assert!(matches!(
+            lights[0].0,
+            crate::engine::lighting::Light::Point { .. }
+        ));
+        assert!(matches!(
+            lights[1].0,
+            crate::engine::lighting::Light::Point { .. }
+        ));
     }
 
     // `castvolumetrics: true` must surface as `Some((density, exponent))`
@@ -1274,10 +1299,9 @@ mod tests {
     // volumetric shaft nobody asked for.
     #[test]
     fn volumetrics_params_none_by_default() {
-        let scene = Scene::from_json(
-            r#"{"objects": [{"id": 1, "light": true, "origin": "0 0 0"}]}"#,
-        )
-        .unwrap();
+        let scene =
+            Scene::from_json(r#"{"objects": [{"id": 1, "light": true, "origin": "0 0 0"}]}"#)
+                .unwrap();
         assert_eq!(scene.lights()[0].2, None);
     }
 
@@ -1299,8 +1323,14 @@ mod tests {
         let lights = scene.lights();
         assert_eq!(lights.len(), 3);
         assert_eq!(lights[0].3.as_deref(), Some("cookie/flashlight1"));
-        assert_eq!(lights[1].3, None, "a Point light must never carry a cookie path");
-        assert_eq!(lights[2].3, None, "usecookie absent must leave the cookie path None");
+        assert_eq!(
+            lights[1].3, None,
+            "a Point light must never carry a cookie path"
+        );
+        assert_eq!(
+            lights[2].3, None,
+            "usecookie absent must leave the cookie path None"
+        );
     }
 
     #[test]
@@ -1327,7 +1357,12 @@ mod tests {
         let lights = scene.lights();
         assert_eq!(lights.len(), 1);
         match &lights[0].0 {
-            crate::engine::lighting::Light::Tube { origin_a, origin_b, intensity, .. } => {
+            crate::engine::lighting::Light::Tube {
+                origin_a,
+                origin_b,
+                intensity,
+                ..
+            } => {
                 assert_eq!(*origin_a, [1.0, 2.0, 3.0]);
                 assert_eq!(*origin_b, [1.0, 2.0, 7.0]);
                 assert!((*intensity - 0.7).abs() < 1e-5);
@@ -1340,12 +1375,13 @@ mod tests {
     // (origin_a == origin_b) rather than panicking or defaulting oddly.
     #[test]
     fn tube_endpoints_default_to_a_zero_length_segment() {
-        let scene = Scene::from_json(
-            r#"{"objects": [{"id": 1, "light": "ltube", "origin": "5 0 0"}]}"#,
-        )
-        .unwrap();
+        let scene =
+            Scene::from_json(r#"{"objects": [{"id": 1, "light": "ltube", "origin": "5 0 0"}]}"#)
+                .unwrap();
         match &scene.lights()[0].0 {
-            crate::engine::lighting::Light::Tube { origin_a, origin_b, .. } => {
+            crate::engine::lighting::Light::Tube {
+                origin_a, origin_b, ..
+            } => {
                 assert_eq!(origin_a, origin_b);
             }
             other => panic!("expected Tube, got {other:?}"),
