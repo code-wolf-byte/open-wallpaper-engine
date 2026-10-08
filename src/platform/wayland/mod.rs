@@ -536,10 +536,19 @@ impl WallpaperState {
             }
         };
 
-        let quality = self.surfaces[idx].settings.lock().unwrap().quality;
+        let (quality, scaling) = {
+            let s = self.surfaces[idx].settings.lock().unwrap();
+            (s.quality, s.scaling)
+        };
+        // Scenes size themselves to the output already; the fit modes are
+        // for video, image and web content.
+        let mode = match &self.surfaces[idx].renderer {
+            ContentRenderer::Scene(_) => crate::render::ScaleMode::Stretch,
+            ContentRenderer::Frames(_) => scaling,
+        };
         let pixels = self
             .gpu_scaler
-            .scale(frame.as_ref(), width, height, quality);
+            .scale(frame.as_ref(), width, height, quality, mode);
         if pixels.len() != active_len {
             tracing::error!(
                 target: "wallpaper",

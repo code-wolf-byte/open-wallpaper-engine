@@ -35,15 +35,16 @@ pub struct ApplicationContext {
 
 impl ApplicationContext {
     pub fn new(background: PathBuf) -> Self {
-        let fps = crate::settings::WpSettings::load()
-            .fps
-            .unwrap_or(crate::render::settings::DEFAULT_FPS);
+        let saved = crate::settings::WpSettings::load();
+        let fps = saved.fps.unwrap_or(crate::render::settings::DEFAULT_FPS);
+        let scaling = saved.scaling.unwrap_or_default();
         Self {
             background,
             screens: HashMap::new(),
             properties: HashMap::new(),
             settings: Arc::new(Mutex::new(RenderSettings {
                 fps,
+                scaling,
                 ..Default::default()
             })),
             screen_settings: HashMap::new(),

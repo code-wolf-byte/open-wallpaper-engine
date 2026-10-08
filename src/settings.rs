@@ -58,6 +58,9 @@ pub struct WpSettings {
     /// Frame-rate cap for animated wallpapers; `None` = the default (30).
     #[serde(default)]
     pub fps: Option<u32>,
+    /// How video, image and web wallpapers fit the screen; `None` = fill.
+    #[serde(default)]
+    pub scaling: Option<crate::render::ScaleMode>,
     /// The playlist `wp-engine run` plays, if any.
     #[serde(default)]
     pub active_playlist: Option<String>,

@@ -6,4 +6,4 @@ pub mod web;
 
 pub use content::{ScreenContent, WallpaperContent};
 pub use frame::FrameSource;
-pub use settings::{RenderSettings, ScreenSettings};
+pub use settings::{RenderSettings, ScaleMode, ScreenSettings};
