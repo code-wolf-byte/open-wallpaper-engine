@@ -80,6 +80,9 @@ impl SceneProperties {
             return props;
         };
         props.load_from_project_json(&json);
+        if let Some(preset) = preset_overrides_for(dir) {
+            props.apply_overrides(preset);
+        }
         props.apply_overrides(global_overrides().lock().unwrap().clone());
         props
     }
@@ -393,6 +396,68 @@ pub fn set_global_overrides(overrides: HashMap<String, String>) {
     *global_overrides().lock().unwrap() = overrides;
 }
 
+// ── Preset overrides ──────────────────────────────────────────────────────────
+// A Workshop preset is a property set layered onto another item. Its values
+// apply to that item's directory, under the user's own `--set-property`
+// overrides. Keyed by the canonical dependency directory.
+
+fn preset_store() -> &'static Mutex<HashMap<std::path::PathBuf, HashMap<String, String>>> {
+    static PRESETS: OnceLock<Mutex<HashMap<std::path::PathBuf, HashMap<String, String>>>> =
+        OnceLock::new();
+    PRESETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn canonical(dir: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+/// Register `preset`'s values as overrides for wallpapers loaded from
+/// `target_dir`. String values naming a file inside `preset_dir` (presets
+/// ship their own `files/`) are rewritten to absolute paths, since the
+/// wallpaper itself is loaded from `target_dir`. `null` entries (group
+/// headers) are skipped.
+pub fn register_preset(
+    target_dir: &Path,
+    preset_dir: &Path,
+    preset: &serde_json::Map<String, Value>,
+) {
+    let overrides = preset_to_overrides(preset_dir, preset);
+    preset_store()
+        .lock()
+        .unwrap()
+        .insert(canonical(target_dir), overrides);
+}
+
+fn preset_to_overrides(
+    preset_dir: &Path,
+    preset: &serde_json::Map<String, Value>,
+) -> HashMap<String, String> {
+    preset
+        .iter()
+        .filter_map(|(name, value)| {
+            let raw = match value {
+                Value::Null => return None,
+                Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+                Value::Number(n) => n.to_string(),
+                Value::String(s) => {
+                    let local = preset_dir.join(s);
+                    if !s.is_empty() && !Path::new(s).is_absolute() && local.is_file() {
+                        local.display().to_string()
+                    } else {
+                        s.clone()
+                    }
+                }
+                other => other.to_string(),
+            };
+            Some((name.clone(), raw))
+        })
+        .collect()
+}
+
+fn preset_overrides_for(dir: &Path) -> Option<HashMap<String, String>> {
+    preset_store().lock().unwrap().get(&canonical(dir)).cloned()
+}
+
 /// Parse a `name=value` CLI argument (bare `name` means boolean true).
 pub fn parse_property_arg(arg: &str) -> (String, String) {
     match arg.split_once('=') {
@@ -411,6 +476,31 @@ pub fn list_properties(dir: &Path) -> Result<Vec<SceneProperty>> {
     let mut props = SceneProperties::default();
     props.load_from_project_json(&json);
     Ok(props.iter().cloned().collect())
+}
+
+#[cfg(test)]
+mod preset_tests {
+    use super::*;
+
+    #[test]
+    fn preset_values_become_override_strings_with_local_files_absolutized() {
+        let dir = std::env::temp_dir().join(format!("wp-preset-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        std::fs::write(dir.join("files/bg.jpg"), b"x").unwrap();
+        let preset: serde_json::Map<String, Value> = serde_json::from_str(
+            r#"{"on":true,"off":false,"n":58,"col":"1 0 0","bg":"files/bg.jpg","hdr":null,"missing":"files/nope.jpg"}"#,
+        )
+        .unwrap();
+        let o = preset_to_overrides(&dir, &preset);
+        assert_eq!(o["on"], "1");
+        assert_eq!(o["off"], "0");
+        assert_eq!(o["n"], "58");
+        assert_eq!(o["col"], "1 0 0");
+        assert_eq!(o["bg"], dir.join("files/bg.jpg").display().to_string());
+        assert_eq!(o["missing"], "files/nope.jpg");
+        assert!(!o.contains_key("hdr"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg(test)]
