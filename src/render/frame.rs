@@ -35,6 +35,15 @@ impl FrameSource {
     /// For video this blocks until the first frame is decoded so the wallpaper
     /// surface is never shown blank.
     pub fn from_content(content: WallpaperContent) -> Result<Self> {
+        Self::from_content_with(content, super::web::WebOptions::default())
+    }
+
+    /// [`Self::from_content`] with a web wallpaper's page size and frame
+    /// rate (the output it will show on).
+    pub fn from_content_with(
+        content: WallpaperContent,
+        web: super::web::WebOptions,
+    ) -> Result<Self> {
         match content {
             WallpaperContent::Static(img) => Ok(FrameSource::Static(img)),
             WallpaperContent::Scene { dir } => {
@@ -87,7 +96,7 @@ impl FrameSource {
             // exactly what CEF's off-screen painting produces. Scene fallback
             // rendering shares it for the same reason.
             WallpaperContent::Web { html } => {
-                let (first, rx, input_tx) = super::web::start_web_stream(&html)?;
+                let (first, rx, input_tx) = super::web::start_web_stream(&html, web)?;
                 Ok(FrameSource::Video {
                     current: Arc::new(first),
                     rx,

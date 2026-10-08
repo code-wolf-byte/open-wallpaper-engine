@@ -100,6 +100,27 @@ enum Command {
         #[arg(long = "set-property", value_name = "NAME=VALUE")]
         properties: Vec<String>,
     },
+    /// Render a video, image or web wallpaper's frame to a PNG at a given
+    /// size (for debugging)
+    RenderFrame {
+        /// Workshop ID, directory, or file
+        id_or_path: String,
+        #[arg(long, default_value = "frame_output.png")]
+        output: PathBuf,
+        #[arg(long, default_value_t = 1920)]
+        width: u32,
+        #[arg(long, default_value_t = 1080)]
+        height: u32,
+        /// Frame rate handed to web pages
+        #[arg(long, default_value_t = 30)]
+        fps: u32,
+        /// Keep rendering this long before saving the latest frame
+        #[arg(long, default_value_t = 2.0)]
+        seconds: f32,
+        /// Override a user property: NAME=VALUE (repeatable)
+        #[arg(long = "set-property", value_name = "NAME=VALUE")]
+        properties: Vec<String>,
+    },
     /// Preview an animated scene wallpaper in a window (for testing animation)
     PreviewScene {
         /// Workshop ID or directory path
@@ -266,6 +287,22 @@ fn main() {
             height,
         }) => cmd_preview_scene(&id_or_path, width, height),
         Some(Command::TestScene { id_or_path, frames }) => cmd_test_scene(&id_or_path, frames),
+        Some(Command::RenderFrame {
+            id_or_path,
+            output,
+            width,
+            height,
+            fps,
+            seconds,
+            properties,
+        }) => cmd_render_frame(
+            &id_or_path,
+            &output,
+            (width, height),
+            fps,
+            seconds,
+            properties,
+        ),
         Some(Command::Config { action }) => cmd_config(action),
         Some(Command::Run { foreground }) => cmd_run(foreground),
         Some(Command::Daemon) => cmd_daemon(),
@@ -1044,6 +1081,42 @@ fn cmd_render_scene(
     let img = scene.render();
     img.save(output)?;
     println!("Saved to {}", output.display());
+    Ok(())
+}
+
+fn cmd_render_frame(
+    id_or_path: &str,
+    output: &std::path::Path,
+    size: (u32, u32),
+    fps: u32,
+    seconds: f32,
+    properties: Vec<String>,
+) -> Result<()> {
+    engine::properties::set_global_overrides(
+        properties
+            .iter()
+            .map(|p| engine::properties::parse_property_arg(p))
+            .collect(),
+    );
+    let path = resolve_id_or_path(id_or_path)?;
+    let content = wp_engine::render::WallpaperContent::from_any_path(&path)?;
+    let mut source = wp_engine::render::FrameSource::from_content_with(
+        content,
+        wp_engine::render::web::WebOptions { size, fps },
+    )?;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs_f32(seconds.max(0.0));
+    while std::time::Instant::now() < until {
+        source.try_advance();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let frame = source.current_frame();
+    frame.save(output)?;
+    println!(
+        "Saved {}x{} frame to {}",
+        frame.width(),
+        frame.height(),
+        output.display()
+    );
     Ok(())
 }
 

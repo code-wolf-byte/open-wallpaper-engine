@@ -18,15 +18,30 @@ use std::path::Path;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::Arc;
 
-/// Off-screen render size for web wallpapers.
-///
-/// ponytail: fixed 1080p. CEF needs explicit dimensions up front and
-/// `FrameSource` is built before any output is known, so the platform scaler
-/// resizes to each monitor exactly as it does for a 1080p video. Plumb real
-/// output dimensions through `FrameSource::from_content` if someone runs these
-/// on a 4K panel and complains about softness.
+/// Off-screen render size for web wallpapers when the output's size isn't
+/// known yet.
 pub const WEB_WIDTH: u32 = 1920;
 pub const WEB_HEIGHT: u32 = 1080;
+
+/// How to render a web wallpaper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebOptions {
+    /// Page size in pixels — the output's resolution, so the page lays out
+    /// and renders at native size instead of being rescaled.
+    pub size: (u32, u32),
+    /// Frame-rate cap, delivered to the page via `applyGeneralProperties`
+    /// and used as Chromium's off-screen paint rate.
+    pub fps: u32,
+}
+
+impl Default for WebOptions {
+    fn default() -> Self {
+        Self {
+            size: (WEB_WIDTH, WEB_HEIGHT),
+            fps: crate::render::settings::DEFAULT_FPS,
+        }
+    }
+}
 
 /// Start rendering `html` and return its first frame, a stream of the rest,
 /// and a sender the caller can push mouse input into (see [`WebInputEvent`]).
@@ -36,12 +51,54 @@ pub const WEB_HEIGHT: u32 = 1080;
 /// callers never present a blank surface.
 pub fn start_web_stream(
     html: &Path,
+    options: WebOptions,
 ) -> Result<(
     RgbaImage,
     Receiver<Arc<RgbaImage>>,
     SyncSender<WebInputEvent>,
 )> {
-    imp::start_web_stream(html)
+    imp::start_web_stream(html, options)
+}
+
+/// Colours for the media thumbnail listeners, sampled from local album art
+/// (`file://` URLs — MPRIS players usually cache art locally):
+/// `[primary, secondary, tertiary, text, highContrast]` as `#rrggbb`.
+/// `None` for remote or unreadable art.
+pub fn art_colors(art_url: &str) -> Option<[String; 5]> {
+    let path = art_url.strip_prefix("file://")?;
+    let img = image::open(path).ok()?.thumbnail(32, 32).into_rgb8();
+    let n = (img.width() * img.height()).max(1) as f32;
+    let mut avg = [0f32; 3];
+    for p in img.pixels() {
+        for c in 0..3 {
+            avg[c] += p[c] as f32 / n;
+        }
+    }
+    let hex = |c: [f32; 3]| {
+        format!(
+            "#{:02x}{:02x}{:02x}",
+            c[0].clamp(0.0, 255.0) as u8,
+            c[1].clamp(0.0, 255.0) as u8,
+            c[2].clamp(0.0, 255.0) as u8
+        )
+    };
+    let luminance = 0.2126 * avg[0] + 0.7152 * avg[1] + 0.0722 * avg[2];
+    let text = if luminance > 140.0 {
+        [0.0; 3]
+    } else {
+        [255.0; 3]
+    };
+    Some([
+        hex(avg),
+        hex(avg.map(|c| c * 0.6)),
+        hex(avg.map(|c| c + (255.0 - c) * 0.4)),
+        hex(text),
+        hex(if luminance > 140.0 {
+            [0.0; 3]
+        } else {
+            [255.0; 3]
+        }),
+    ])
 }
 
 /// `true` when this binary can actually render web wallpapers.
@@ -49,14 +106,9 @@ pub fn is_supported() -> bool {
     cfg!(feature = "web")
 }
 
-/// A mouse input event to forward into the embedded page — mirrors exactly
-/// what the C++ reference itself forwards (`CWeb::updateMouse`): move plus
-/// left/right click. Nothing else (scroll, middle click, keyboard) is
-/// forwarded there either — its own `// TODO: ANY OTHER MOUSE EVENTS TO
-/// SEND?` confirms that's the real engine's actual current scope, not an
-/// approximation. Coordinates are normalized `[0,1]²` (top-left origin,
-/// matching every other consumer of the platform layer's own pointer
-/// tracking) so callers never need to know CEF's fixed pixel canvas size.
+/// Input and state changes to forward into the embedded page. Pointer
+/// coordinates are normalized `[0,1]²` (top-left origin, like every other
+/// pointer consumer here), so callers never need the page's pixel size.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WebInputEvent {
     MouseMove {
@@ -69,11 +121,24 @@ pub enum WebInputEvent {
         button: WebMouseButton,
         pressed: bool,
     },
+    /// Scroll, in pixels (positive `dy` scrolls down).
+    Wheel {
+        x_norm: f32,
+        y_norm: f32,
+        dx: f32,
+        dy: f32,
+    },
+    /// The playback policy paused or resumed the wallpaper: the page's
+    /// `setPaused` listener is told, and Chromium stops painting meanwhile.
+    Paused(bool),
+    /// The frame-rate cap changed (`applyGeneralProperties({fps})`).
+    Fps(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebMouseButton {
     Left,
+    Middle,
     Right,
 }
 
@@ -101,6 +166,7 @@ mod imp {
 
     pub fn start_web_stream(
         html: &Path,
+        _options: WebOptions,
     ) -> Result<(
         RgbaImage,
         Receiver<Arc<RgbaImage>>,
@@ -133,6 +199,16 @@ mod imp {
     /// How long to wait for Chromium to paint the first frame before giving up.
     const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 
+    /// The current page's size in pixels. One browser is live at a time, so
+    /// the render handler and input forwarding read it from here.
+    static VIEW_W: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(WEB_WIDTH);
+    static VIEW_H: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(WEB_HEIGHT);
+
+    fn view_size() -> (u32, u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (VIEW_W.load(Relaxed).max(1), VIEW_H.load(Relaxed).max(1))
+    }
+
     /// Work item for the CEF thread. CEF may only be initialised once per
     /// process and its message loop must be pumped from the one thread that
     /// initialised it, so every browser is created there rather than on the
@@ -140,6 +216,8 @@ mod imp {
     struct OpenRequest {
         url: String,
         frames: SyncSender<Arc<RgbaImage>>,
+        /// Page size and paint rate (the output's).
+        options: WebOptions,
         /// project.json's `general.properties`, already serialised, ready to
         /// hand to the page's `applyUserProperties`.
         properties: String,
@@ -169,17 +247,65 @@ mod imp {
   if (window.__wpEngineBridge) return;
   var pendingProps = null, propListener = null, audioCb = null;
   var mediaListener = null, pendingMedia = null;
+  var pendingGeneral = null, pendingPaused = null;
+  var mediaCbs = { status: [], properties: [], thumbnail: [], playback: [], timeline: [] };
+
+  function call(obj, name, args) {
+    if (obj && typeof obj[name] === 'function') {
+      try { obj[name].apply(obj, args); } catch (e) { console.error(e); }
+    }
+  }
+
+  // Directory properties: WE announces their files once loaded.
+  function announceDirectories(p) {
+    if (!p) { return; }
+    for (var name in p) {
+      var files = p[name] && p[name].__files;
+      if (files && files.length) { call(propListener, 'userDirectoryFilesAddedOrChanged', [name, files]); }
+    }
+  }
+
+  // WE delivers properties once the page has loaded; a listener assigned
+  // early in a script must not be called before the elements it touches
+  // exist.
+  var loaded = document.readyState === 'complete';
+  window.addEventListener('load', function () { loaded = true; deliverAll(); });
+
+  function deliverAll() {
+    if (!propListener || !loaded) { return; }
+    if (pendingProps) { call(propListener, 'applyUserProperties', [pendingProps]); announceDirectories(pendingProps); }
+    if (pendingGeneral) { call(propListener, 'applyGeneralProperties', [pendingGeneral]); }
+    if (pendingPaused !== null) { call(propListener, 'setPaused', [pendingPaused]); }
+  }
 
   Object.defineProperty(window, 'wallpaperPropertyListener', {
     configurable: true,
     get: function () { return propListener; },
-    set: function (v) {
-      propListener = v;
-      if (v && pendingProps && typeof v.applyUserProperties === 'function') {
-        try { v.applyUserProperties(pendingProps); } catch (e) { console.error(e); }
-      }
-    }
+    set: function (v) { propListener = v; deliverAll(); }
   });
+
+  window.__wpGeneral = function (g) {
+    pendingGeneral = g;
+    if (loaded) { call(propListener, 'applyGeneralProperties', [g]); }
+  };
+  window.__wpPaused = function (b) {
+    pendingPaused = b;
+    call(propListener, 'setPaused', [b]);
+  };
+
+  // The register-style media API WE pages use.
+  function registerMedia(kind) {
+    return function (cb) {
+      if (typeof cb !== 'function') { return; }
+      mediaCbs[kind].push(cb);
+      if (pendingMedia) { deliverMedia(pendingMedia); }
+    };
+  }
+  window.wallpaperRegisterMediaStatusListener = registerMedia('status');
+  window.wallpaperRegisterMediaPropertiesListener = registerMedia('properties');
+  window.wallpaperRegisterMediaThumbnailListener = registerMedia('thumbnail');
+  window.wallpaperRegisterMediaPlaybackListener = registerMedia('playback');
+  window.wallpaperRegisterMediaTimelineListener = registerMedia('timeline');
 
   window.wallpaperRegisterAudioListener = function (cb) { audioCb = cb; };
 
@@ -207,12 +333,26 @@ mod imp {
   // INSTEAD OF HARDCODING THEM`) — matched here rather than attempting real
   // album-art color extraction the reference itself doesn't have either.
   window.wallpaperMediaIntegration = {
+    PLAYBACK_STOPPED: 0,
+    PLAYBACK_PLAYING: 1,
+    PLAYBACK_PAUSED: 2,
     listen: function (cb) {
       mediaListener = cb;
       if (pendingMedia) { deliverMedia(pendingMedia); }
     }
   };
   function deliverMedia(m) {
+    var c = m.colors || ['#1f1f1f', '#000000', '#404040', '#ffffff', '#ffffff'];
+    var fire = function (kind, ev) {
+      mediaCbs[kind].forEach(function (cb) { try { cb(ev); } catch (e) { console.error(e); } });
+    };
+    fire('status', { enabled: true });
+    fire('properties', { title: m.title, artist: m.artist, albumTitle: m.album, subTitle: '',
+                         albumArtist: '', genres: '', contentType: 'music' });
+    fire('thumbnail', { thumbnail: m.artUrl || '', primaryColor: c[0], secondaryColor: c[1],
+                        tertiaryColor: c[2], textColor: c[3], highContrastColor: c[4] });
+    fire('playback', { state: m.playbackState });
+    fire('timeline', { position: m.position / 1e6, duration: m.duration / 1e6 });
     if (!mediaListener) { return; }
     var calls = [
       ['mediaPropertiesChanged', { title: m.title, artist: m.artist, albumTitle: m.album }],
@@ -236,8 +376,9 @@ mod imp {
 
   window.__wpProps = function (p) {
     pendingProps = p;
-    if (propListener && typeof propListener.applyUserProperties === 'function') {
-      try { propListener.applyUserProperties(p); } catch (e) { console.error(e); }
+    if (loaded) {
+      call(propListener, 'applyUserProperties', [p]);
+      announceDirectories(p);
     }
   };
   window.__wpAudio = function (a) {
@@ -412,6 +553,7 @@ mod imp {
         // fresh channel (see `OpenRequest::input_rx`).
         let mut open: Vec<(Browser, Receiver<WebInputEvent>)> = Vec::new();
         let mut properties = String::new();
+        let mut general = String::new();
         let mut audio: Option<crate::engine::audio::AudioCapture> = None;
         let mut last_audio_push = Instant::now();
         // MPRIS is a freedesktop.org/Linux-only surface — see `engine::media`.
@@ -429,6 +571,7 @@ mod imp {
                         media = None;
                     }
                     properties = req.properties.clone();
+                    general = format!("{{\"fps\":{}}}", req.options.fps);
                     let wants_audio = req.wants_audio;
                     #[cfg(target_os = "linux")]
                     let wants_media = req.wants_media;
@@ -476,6 +619,13 @@ mod imp {
                     );
                     // One delivery per navigation is enough once it lands.
                     properties.clear();
+                }
+                if !general.is_empty() {
+                    eval_in_page(
+                        browser,
+                        &format!("window.__wpGeneral&&window.__wpGeneral({general});"),
+                    );
+                    general.clear();
                 }
 
                 if let Some(capture) = &audio {
@@ -526,9 +676,10 @@ mod imp {
         let Some(host) = browser.host() else {
             return;
         };
+        let (w, h) = view_size();
         let to_px = |x_norm: f32, y_norm: f32| MouseEvent {
-            x: (x_norm.clamp(0.0, 1.0) * WEB_WIDTH as f32) as i32,
-            y: (y_norm.clamp(0.0, 1.0) * WEB_HEIGHT as f32) as i32,
+            x: (x_norm.clamp(0.0, 1.0) * w as f32) as i32,
+            y: (y_norm.clamp(0.0, 1.0) * h as f32) as i32,
             modifiers: 0,
         };
         match event {
@@ -543,6 +694,7 @@ mod imp {
             } => {
                 let type_ = match button {
                     WebMouseButton::Left => MouseButtonType::LEFT,
+                    WebMouseButton::Middle => MouseButtonType::MIDDLE,
                     WebMouseButton::Right => MouseButtonType::RIGHT,
                 };
                 host.send_mouse_click_event(
@@ -550,6 +702,30 @@ mod imp {
                     type_,
                     (!pressed) as i32,
                     1,
+                );
+            }
+            WebInputEvent::Wheel {
+                x_norm,
+                y_norm,
+                dx,
+                dy,
+            } => {
+                // CEF's deltas are positive for scrolling up/left.
+                host.send_mouse_wheel_event(Some(&to_px(x_norm, y_norm)), -dx as i32, -dy as i32);
+            }
+            WebInputEvent::Paused(paused) => {
+                // Hidden browsers stop painting and throttle their timers.
+                host.was_hidden(paused as i32);
+                eval_in_page(
+                    browser,
+                    &format!("window.__wpPaused&&window.__wpPaused({paused});"),
+                );
+            }
+            WebInputEvent::Fps(fps) => {
+                host.set_windowless_frame_rate(fps.clamp(1, 60) as i32);
+                eval_in_page(
+                    browser,
+                    &format!("window.__wpGeneral&&window.__wpGeneral({{\"fps\":{fps}}});"),
                 );
             }
         }
@@ -595,9 +771,15 @@ mod imp {
             .as_deref()
             .map(json_str)
             .unwrap_or_else(|| "null".to_string());
+        let colors = info
+            .art_url
+            .as_deref()
+            .and_then(super::art_colors)
+            .map(|c| serde_json::to_string(&c).unwrap_or_else(|_| "null".into()))
+            .unwrap_or_else(|| "null".to_string());
         format!(
             "window.__wpMedia&&window.__wpMedia({{title:{title},artist:{artist},album:{album},\
-             playbackState:{state},position:{pos},duration:{dur},artUrl:{art_url}}});",
+             playbackState:{state},position:{pos},duration:{dur},artUrl:{art_url},colors:{colors}}});",
             title = json_str(&info.title),
             artist = json_str(&info.artist),
             album = json_str(&info.album),
@@ -610,19 +792,22 @@ mod imp {
     fn create_browser(req: &OpenRequest) -> Option<Browser> {
         let render_handler = WallpaperRenderHandler::new(req.frames.clone());
         let mut client = WallpaperClient::new(render_handler);
+        let (w, h) = (req.options.size.0.max(1), req.options.size.1.max(1));
+        VIEW_W.store(w, std::sync::atomic::Ordering::Relaxed);
+        VIEW_H.store(h, std::sync::atomic::Ordering::Relaxed);
         let window_info = WindowInfo {
             windowless_rendering_enabled: 1,
             bounds: Rect {
                 x: 0,
                 y: 0,
-                width: WEB_WIDTH as i32,
-                height: WEB_HEIGHT as i32,
+                width: w as i32,
+                height: h as i32,
             },
             ..Default::default()
         }
         .set_as_windowless(0);
         let browser_settings = BrowserSettings {
-            windowless_frame_rate: 60,
+            windowless_frame_rate: req.options.fps.clamp(1, 60) as i32,
             // CEF's OSR default is fully transparent (`0x00000000`) — meant
             // for embedding a browser view over other content, not for a
             // desktop background. A wallpaper whose page hasn't painted an
@@ -787,6 +972,7 @@ mod imp {
     #[cfg(target_os = "linux")]
     fn uses_media_listener(dir: &Path) -> bool {
         scans_bundle_for(dir, b"wallpaperMediaIntegration")
+            || scans_bundle_for(dir, b"wallpaperRegisterMedia")
     }
 
     /// Substring search over raw bytes — these bundles are minified and not
@@ -826,11 +1012,12 @@ mod imp {
             fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
                 // CEF treats an empty rect as an error and paints nothing.
                 if let Some(rect) = rect {
+                    let (w, h) = view_size();
                     *rect = Rect {
                         x: 0,
                         y: 0,
-                        width: WEB_WIDTH as i32,
-                        height: WEB_HEIGHT as i32,
+                        width: w as i32,
+                        height: h as i32,
                     };
                 }
             }
@@ -877,6 +1064,7 @@ mod imp {
 
     pub fn start_web_stream(
         html: &Path,
+        options: WebOptions,
     ) -> Result<(
         RgbaImage,
         Receiver<Arc<RgbaImage>>,
@@ -894,11 +1082,14 @@ mod imp {
         // side means a full channel drops rather than blocking the render
         // loop, same trade `frames` itself already makes.
         let (input_tx, input_rx) = sync_channel::<WebInputEvent>(64);
+        let properties = user_properties_json(&dir);
+        tracing::debug!(target: "web", "user properties for {}: {properties}", dir.display());
         cef_thread()
             .send(OpenRequest {
                 url,
                 frames,
-                properties: user_properties_json(&dir),
+                options,
+                properties,
                 wants_audio: uses_audio_listener(&dir),
                 #[cfg(target_os = "linux")]
                 wants_media: uses_media_listener(&dir),

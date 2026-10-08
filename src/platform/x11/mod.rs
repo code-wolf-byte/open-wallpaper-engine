@@ -382,6 +382,7 @@ fn build_content_renderer(
     content: WallpaperContent,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    web: crate::render::web::WebOptions,
 ) -> Result<ContentRenderer> {
     Ok(match content {
         WallpaperContent::Scene { dir } => {
@@ -395,8 +396,20 @@ fn build_content_renderer(
                 }
             }
         }
-        other => ContentRenderer::Frames(FrameSource::from_content(other)?),
+        other => ContentRenderer::Frames(FrameSource::from_content_with(other, web)?),
     })
+}
+
+/// A web wallpaper's page size and frame rate for one output.
+fn web_options(
+    rect: OutputRect,
+    settings: &ScreenSettings,
+    name: Option<&str>,
+) -> crate::render::web::WebOptions {
+    crate::render::web::WebOptions {
+        size: (rect.width as u32, rect.height as u32),
+        fps: settings.resolve(name).lock().unwrap().fps,
+    }
 }
 
 /// One monitor's independent render state: its own content, own `ContentRenderer`,
@@ -413,6 +426,9 @@ struct OutputInstance {
     settings: Arc<Mutex<RenderSettings>>,
     left_down: bool,
     right_down: bool,
+    /// Pause state and frame-rate cap last sent to a web page here.
+    web_paused: bool,
+    web_fps: u32,
 }
 
 fn wallpaper_loop(
@@ -451,7 +467,8 @@ fn wallpaper_loop(
             .as_deref()
             .is_some_and(|n| content.by_output.contains_key(n));
         let resolved = content.resolve(named.name.as_deref());
-        match build_content_renderer(resolved, device.clone(), queue.clone()) {
+        let web = web_options(named.rect, &settings, named.name.as_deref());
+        match build_content_renderer(resolved, device.clone(), queue.clone(), web) {
             Ok(renderer) => {
                 tracing::info!(
                     target: "wallpaper",
@@ -466,6 +483,8 @@ fn wallpaper_loop(
                     settings: output_settings,
                     left_down: false,
                     right_down: false,
+                    web_paused: false,
+                    web_fps: web.fps,
                 });
             }
             // Don't take down every other (working) output over one bad
@@ -542,6 +561,22 @@ fn wallpaper_loop(
         }
         let action = crate::engine::playback_gate::decide(&policy, &playback_state);
         let paused = action.halts();
+        // Tell web pages about pause edges and frame-rate changes.
+        for output in &mut outputs {
+            let fps = output.settings.lock().unwrap().fps;
+            if let ContentRenderer::Frames(fs) = &output.renderer {
+                if let Some(tx) = fs.web_input() {
+                    if paused != output.web_paused {
+                        let _ = tx.try_send(crate::render::web::WebInputEvent::Paused(paused));
+                    }
+                    if fps != output.web_fps {
+                        let _ = tx.try_send(crate::render::web::WebInputEvent::Fps(fps));
+                    }
+                }
+            }
+            output.web_paused = paused;
+            output.web_fps = fps;
+        }
         crate::engine::audio::set_muted(action >= PlaybackAction::Mute);
         crate::engine::audio::set_master_volume(settings.default.lock().unwrap().volume);
 
@@ -559,7 +594,8 @@ fn wallpaper_loop(
             stopped = false;
             for output in &mut outputs {
                 let resolved = content.resolve(output.named.name.as_deref());
-                match build_content_renderer(resolved, device.clone(), queue.clone()) {
+                let web = web_options(output.named.rect, &settings, output.named.name.as_deref());
+                match build_content_renderer(resolved, device.clone(), queue.clone(), web) {
                     Ok(r) => output.renderer = r,
                     Err(e) => {
                         tracing::error!(target: "wallpaper", "resuming output {:?}: {e}", output.named.name)

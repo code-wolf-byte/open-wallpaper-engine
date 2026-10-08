@@ -143,6 +143,7 @@ fn build_content_renderer(
     device: wgpu::Device,
     queue: wgpu::Queue,
     allow_gpu_surface: bool,
+    web: crate::render::web::WebOptions,
 ) -> Result<ContentRenderer> {
     Ok(match content {
         WallpaperContent::Scene { dir } if allow_gpu_surface => {
@@ -156,7 +157,7 @@ fn build_content_renderer(
                 }
             }
         }
-        other => ContentRenderer::Frames(FrameSource::from_content(other)?),
+        other => ContentRenderer::Frames(FrameSource::from_content_with(other, web)?),
     })
 }
 
@@ -194,6 +195,8 @@ struct WallpaperSurface {
     /// a capped draw is already scheduled.
     last_draw: Option<Instant>,
     draw_scheduled: bool,
+    /// Frame-rate cap last sent to a web page on this surface.
+    web_fps: u32,
 }
 
 struct WallpaperState {
@@ -383,10 +386,26 @@ impl WallpaperState {
         let action = self.playback_action(Instant::now());
         crate::engine::audio::set_muted(action >= PlaybackAction::Mute);
         if action.halts() {
+            if !self.paused {
+                self.notify_web(crate::render::web::WebInputEvent::Paused(true));
+            }
             self.paused = true;
             return;
         }
+        if self.paused {
+            self.notify_web(crate::render::web::WebInputEvent::Paused(false));
+        }
         self.paused = false;
+        // A changed frame-rate cap reaches web pages too.
+        let fps = self.surfaces[idx].settings.lock().unwrap().fps;
+        if self.surfaces[idx].web_fps != fps {
+            self.surfaces[idx].web_fps = fps;
+            if let ContentRenderer::Frames(fs) = &self.surfaces[idx].renderer {
+                if let Some(tx) = fs.web_input() {
+                    let _ = tx.try_send(crate::render::web::WebInputEvent::Fps(fps));
+                }
+            }
+        }
         crate::engine::audio::set_master_volume(self.settings.default.lock().unwrap().volume);
 
         // Frame-rate cap: a callback that arrives early waits on a timer.
@@ -799,7 +818,25 @@ impl OutputHandler for WallpaperState {
         // output-info aggregation, `None` when the compositor never reports
         // one (no per-screen assignment can ever match; falls back to the
         // default wallpaper below, same as always).
-        let output_name = self.output_state.info(&output).and_then(|info| info.name);
+        let info = self.output_state.info(&output);
+        let output_name = info.as_ref().and_then(|info| info.name.clone());
+        // A web page renders at the output's native mode.
+        let web = crate::render::web::WebOptions {
+            size: info
+                .as_ref()
+                .and_then(|i| i.modes.iter().find(|m| m.current).map(|m| m.dimensions))
+                .map(|(w, h)| (w.max(1) as u32, h.max(1) as u32))
+                .unwrap_or((
+                    crate::render::web::WEB_WIDTH,
+                    crate::render::web::WEB_HEIGHT,
+                )),
+            fps: self
+                .settings
+                .resolve(output_name.as_deref())
+                .lock()
+                .unwrap()
+                .fps,
+        };
 
         let resolved = self.content.resolve(output_name.as_deref());
         let per_screen = output_name
@@ -810,6 +847,7 @@ impl OutputHandler for WallpaperState {
             self.device.clone(),
             self.queue.clone(),
             self.allow_gpu_surface,
+            web,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -856,6 +894,7 @@ impl OutputHandler for WallpaperState {
             output_name,
             last_draw: None,
             draw_scheduled: false,
+            web_fps: web.fps,
         });
     }
 
@@ -937,6 +976,7 @@ impl SeatHandler for WallpaperState {
 /// `PointerEventKind::Press`/`Release`'s raw `button` field actually carries.
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
 
 impl PointerHandler for WallpaperState {
     fn pointer_frame(
@@ -954,10 +994,19 @@ impl PointerHandler for WallpaperState {
             // and left/right click only (its own `// TODO: ANY OTHER MOUSE
             // EVENTS TO SEND?` confirms that's the real engine's actual
             // scope, not an approximation here).
-            let (button, pressed) = match event.kind {
+            let mut wheel: Option<(f32, f32)> = None;
+            let (button, pressed) = match &event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => (None, false),
-                PointerEventKind::Press { button, .. } => (Some(button), true),
-                PointerEventKind::Release { button, .. } => (Some(button), false),
+                PointerEventKind::Press { button, .. } => (Some(*button), true),
+                PointerEventKind::Release { button, .. } => (Some(*button), false),
+                PointerEventKind::Axis {
+                    horizontal,
+                    vertical,
+                    ..
+                } => {
+                    wheel = Some((horizontal.absolute as f32, vertical.absolute as f32));
+                    (None, false)
+                }
                 _ => continue,
             };
             let Some(idx) = self
@@ -991,12 +1040,18 @@ impl PointerHandler for WallpaperState {
                 }
                 ContentRenderer::Frames(fs) => {
                     let Some(tx) = fs.web_input() else { continue };
-                    let event = match button {
-                        None => crate::render::web::WebInputEvent::MouseMove {
+                    let event = match (button, wheel) {
+                        (None, Some((dx, dy))) => crate::render::web::WebInputEvent::Wheel {
+                            x_norm: norm[0],
+                            y_norm: norm[1],
+                            dx,
+                            dy,
+                        },
+                        (None, None) => crate::render::web::WebInputEvent::MouseMove {
                             x_norm: norm[0],
                             y_norm: norm[1],
                         },
-                        Some(code) => {
+                        (Some(code), _) => {
                             let Some(button) = web_mouse_button(code) else {
                                 continue;
                             };
@@ -1022,6 +1077,7 @@ fn web_mouse_button(code: u32) -> Option<crate::render::web::WebMouseButton> {
     match code {
         BTN_LEFT => Some(crate::render::web::WebMouseButton::Left),
         BTN_RIGHT => Some(crate::render::web::WebMouseButton::Right),
+        BTN_MIDDLE => Some(crate::render::web::WebMouseButton::Middle),
         _ => None,
     }
 }
@@ -1189,11 +1245,19 @@ impl WallpaperState {
                 let resolved = self
                     .content
                     .resolve(self.surfaces[i].output_name.as_deref());
+                let web = crate::render::web::WebOptions {
+                    size: (
+                        self.surfaces[i].width.max(1),
+                        self.surfaces[i].height.max(1),
+                    ),
+                    fps: self.surfaces[i].settings.lock().unwrap().fps,
+                };
                 match build_content_renderer(
                     resolved,
                     self.device.clone(),
                     self.queue.clone(),
                     self.allow_gpu_surface,
+                    web,
                 ) {
                     Ok(r) => {
                         self.surfaces[i].renderer = r;
@@ -1207,6 +1271,17 @@ impl WallpaperState {
         action
     }
 
+    /// Send `event` to every output showing a web wallpaper.
+    fn notify_web(&self, event: crate::render::web::WebInputEvent) {
+        for s in &self.surfaces {
+            if let ContentRenderer::Frames(fs) = &s.renderer {
+                if let Some(tx) = fs.web_input() {
+                    let _ = tx.try_send(event);
+                }
+            }
+        }
+    }
+
     /// Runs on its own `PAUSE_CHECK_INTERVAL` timer (inserted once at
     /// startup, independent of any surface's frame callbacks) — the only
     /// thing that can notice a halt has cleared once `draw_at` has stopped
@@ -1215,7 +1290,11 @@ impl WallpaperState {
         let was_paused = self.paused;
         let action = self.playback_action(Instant::now());
         crate::engine::audio::set_muted(action >= PlaybackAction::Mute);
+        if !was_paused && action.halts() {
+            self.notify_web(crate::render::web::WebInputEvent::Paused(true));
+        }
         if was_paused && !action.halts() {
+            self.notify_web(crate::render::web::WebInputEvent::Paused(false));
             self.paused = false;
             for idx in 0..self.surfaces.len() {
                 if self.surfaces[idx].renderer.is_animated() {
@@ -1230,7 +1309,7 @@ impl WallpaperState {
 
 #[cfg(test)]
 mod tests {
-    use super::{pointer_norm, web_mouse_button, BTN_LEFT, BTN_RIGHT};
+    use super::{pointer_norm, web_mouse_button, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 
     #[test]
     fn pointer_norm_is_top_origin_and_clamped() {
@@ -1253,13 +1332,11 @@ mod tests {
     /// Middle click and anything else (side buttons) must map to `None`
     /// rather than a guessed-at mapping.
     #[test]
-    fn web_mouse_button_maps_left_and_right_only() {
-        use crate::engine::playback_gate::PlaybackAction;
+    fn web_mouse_button_maps_left_middle_and_right() {
         use crate::render::web::WebMouseButton;
         assert_eq!(web_mouse_button(BTN_LEFT), Some(WebMouseButton::Left));
         assert_eq!(web_mouse_button(BTN_RIGHT), Some(WebMouseButton::Right));
-        const BTN_MIDDLE: u32 = 0x112;
-        assert_eq!(web_mouse_button(BTN_MIDDLE), None);
+        assert_eq!(web_mouse_button(BTN_MIDDLE), Some(WebMouseButton::Middle));
         assert_eq!(web_mouse_button(0), None);
     }
 }
