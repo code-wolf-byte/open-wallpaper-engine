@@ -372,9 +372,12 @@ impl WallpaperState {
         // callback chain has stalled like this).
         if self.should_pause(Instant::now()) {
             self.paused = true;
+            crate::engine::audio::set_muted(true);
             return;
         }
         self.paused = false;
+        crate::engine::audio::set_muted(false);
+        crate::engine::audio::set_master_volume(self.settings.default.lock().unwrap().volume);
         self.ensure_gpu_surface(idx);
         if self.surfaces[idx].gpu.is_some() {
             self.draw_gpu(idx);
@@ -1116,6 +1119,7 @@ impl WallpaperState {
         } else {
             self.paused = now_paused;
         }
+        crate::engine::audio::set_muted(self.paused);
     }
 }
 

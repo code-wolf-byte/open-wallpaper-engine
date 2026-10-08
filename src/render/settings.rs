@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 pub struct RenderSettings {
     /// GPU render quality / source down-sample factor.
     pub quality: RenderQuality,
-    /// Volume in 0.0–1.0 (stored for future audio support; not yet applied).
+    /// Master volume in 0.0–1.0, applied to every wallpaper audio stream via
+    /// `engine::audio::set_master_volume` each frame.
     pub volume: f32,
 }
 

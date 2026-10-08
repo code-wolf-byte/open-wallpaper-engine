@@ -261,43 +261,156 @@ fn pick_input_device(host: &cpal::Host) -> Option<cpal::Device> {
 
 // ── Sound-object playback ─────────────────────────────────────────────────────
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+/// Process-wide master gain (f32 bits) every wallpaper audio stream is scaled
+/// by — the user's volume setting. Wallpaper Engine has one global volume, so
+/// one atomic read on the audio thread is all the mixing this needs.
+static MASTER_VOLUME: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0
+/// Silences every stream without tearing it down: set while the wallpaper is
+/// paused by the playback gate, or muted by the pause policy.
+static MUTED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_master_volume(v: f32) {
+    let v = if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    MASTER_VOLUME.store(v.to_bits(), Ordering::Relaxed);
+}
+
+pub fn master_volume() -> f32 {
+    f32::from_bits(MASTER_VOLUME.load(Ordering::Relaxed))
+}
+
+pub fn set_muted(muted: bool) {
+    MUTED.store(muted, Ordering::Relaxed);
+}
+
+/// The gain a stream should apply right now: master volume, or 0 when muted.
+pub fn output_gain() -> f32 {
+    if MUTED.load(Ordering::Relaxed) {
+        0.0
+    } else {
+        master_volume()
+    }
+}
+
+/// Live controls for one playing sound, shared between the audio thread and
+/// whoever drives it (the SceneScript sound API).
+#[derive(Debug)]
+pub struct SoundControl {
+    /// Per-sound volume (f32 bits), before the master gain.
+    volume: AtomicU32,
+    playing: AtomicBool,
+    /// Set to rewind to the first sample on the next callback.
+    rewind: AtomicBool,
+}
+
+impl SoundControl {
+    fn new(volume: f32, playing: bool) -> Self {
+        Self {
+            volume: AtomicU32::new(volume.to_bits()),
+            playing: AtomicBool::new(playing),
+            rewind: AtomicBool::new(false),
+        }
+    }
+    pub fn volume(&self) -> f32 {
+        f32::from_bits(self.volume.load(Ordering::Relaxed))
+    }
+    pub fn set_volume(&self, v: f32) {
+        let v = if v.is_finite() {
+            v.clamp(0.0, 4.0)
+        } else {
+            1.0
+        };
+        self.volume.store(v.to_bits(), Ordering::Relaxed);
+    }
+    pub fn is_playing(&self) -> bool {
+        self.playing.load(Ordering::Relaxed)
+    }
+    pub fn play(&self) {
+        self.playing.store(true, Ordering::Relaxed);
+    }
+    pub fn pause(&self) {
+        self.playing.store(false, Ordering::Relaxed);
+    }
+    pub fn stop(&self) {
+        self.playing.store(false, Ordering::Relaxed);
+        self.rewind.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Plays a WE `sound` object's audio file (decoded via ffmpeg) out the default
-/// output device, optionally looped, at a fixed volume. One stream per sound;
-/// the OS mixer sums them. Dropping it stops playback.
+/// output device, optionally looped. One stream per sound; the OS mixer sums
+/// them. Dropping it stops playback.
 pub struct SoundPlayback {
     _stream: cpal::Stream,
+    control: Arc<SoundControl>,
 }
 
 impl SoundPlayback {
-    /// Decode `path` and start playback. Returns `None` if there's no output
-    /// device or the file can't be decoded — sound is always best-effort.
-    pub fn start(path: &std::path::Path, volume: f32, looping: bool) -> Option<Self> {
-        let host = cpal::default_host();
-        let device = host.default_output_device()?;
-        let config = device.default_output_config().ok()?;
-        let out_rate = config.sample_rate().0;
-        let out_ch = config.channels() as usize;
+    /// Decode `path` and start playback (or hold it ready but silent when
+    /// `start_playing` is false — WE's `startsilent`). Returns `None` if
+    /// there's no output device or the file can't be decoded — sound is
+    /// always best-effort.
+    pub fn start(
+        path: &std::path::Path,
+        volume: f32,
+        looping: bool,
+        start_playing: bool,
+    ) -> Option<Self> {
+        let samples = decode_audio_file_for_default_output(path)?;
+        Self::from_samples(
+            samples,
+            volume,
+            looping,
+            start_playing,
+            &path.display().to_string(),
+        )
+    }
 
-        let samples = decode_audio_file(path, out_rate, out_ch)?;
+    fn from_samples(
+        (samples, config): (Vec<f32>, cpal::SupportedStreamConfig),
+        volume: f32,
+        looping: bool,
+        start_playing: bool,
+        label: &str,
+    ) -> Option<Self> {
         if samples.is_empty() {
             return None;
         }
-        let vol = volume.clamp(0.0, 4.0);
+        let device = cpal::default_host().default_output_device()?;
+        let control = Arc::new(SoundControl::new(volume.clamp(0.0, 4.0), start_playing));
+        let ctl = control.clone();
         let mut pos = 0usize;
         let stream = device
             .build_output_stream(
                 &config.into(),
                 move |out: &mut [f32], _| {
+                    if ctl.rewind.swap(false, Ordering::Relaxed) {
+                        pos = 0;
+                    }
+                    if !ctl.is_playing() {
+                        out.fill(0.0);
+                        return;
+                    }
+                    let gain = ctl.volume() * output_gain();
                     for s in out.iter_mut() {
                         if pos >= samples.len() {
                             if looping {
                                 pos = 0;
                             } else {
+                                // A one-shot sound finished: park it so a
+                                // script's `play()` starts it from the top.
+                                ctl.playing.store(false, Ordering::Relaxed);
+                                ctl.rewind.store(true, Ordering::Relaxed);
                                 *s = 0.0;
                                 continue;
                             }
                         }
-                        *s = samples.get(pos).copied().unwrap_or(0.0) * vol;
+                        *s = samples[pos] * gain;
                         pos += 1;
                     }
                 },
@@ -306,9 +419,26 @@ impl SoundPlayback {
             )
             .ok()?;
         stream.play().ok()?;
-        tracing::info!(target: "audio", "playing '{}' (vol {vol:.2}, loop {looping})", path.display());
-        Some(Self { _stream: stream })
+        tracing::info!(target: "audio", "sound '{label}' ready (vol {volume:.2}, loop {looping}, playing {start_playing})");
+        Some(Self {
+            _stream: stream,
+            control,
+        })
     }
+
+    pub fn control(&self) -> Arc<SoundControl> {
+        self.control.clone()
+    }
+}
+
+/// Decode `path` for the default output device's native format.
+fn decode_audio_file_for_default_output(
+    path: &std::path::Path,
+) -> Option<(Vec<f32>, cpal::SupportedStreamConfig)> {
+    let device = cpal::default_host().default_output_device()?;
+    let config = device.default_output_config().ok()?;
+    let samples = decode_audio_file(path, config.sample_rate().0, config.channels() as usize)?;
+    Some((samples, config))
 }
 
 /// Decode an audio file to interleaved f32 samples at `out_rate`/`out_ch` using
@@ -387,6 +517,29 @@ fn decode_audio_file(path: &std::path::Path, out_rate: u32, out_ch: usize) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn master_volume_clamps_and_mute_zeroes_gain() {
+        set_master_volume(2.0);
+        assert_eq!(master_volume(), 1.0);
+        set_master_volume(0.25);
+        assert_eq!(output_gain(), 0.25);
+        set_muted(true);
+        assert_eq!(output_gain(), 0.0);
+        set_muted(false);
+        set_master_volume(f32::NAN);
+        assert_eq!(master_volume(), 1.0);
+    }
+
+    #[test]
+    fn sound_control_stop_rewinds_and_pauses() {
+        let c = SoundControl::new(0.5, true);
+        c.stop();
+        assert!(!c.is_playing());
+        assert!(c.rewind.load(Ordering::Relaxed));
+        c.set_volume(9.0);
+        assert_eq!(c.volume(), 4.0);
+    }
 
     #[test]
     fn uniform_bytes_layout_is_std430() {
