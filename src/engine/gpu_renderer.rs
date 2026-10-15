@@ -4203,9 +4203,10 @@ impl GpuSceneInstance {
                 0,
                 &spectrum.to_uniform_bytes(),
             );
-            let level = spectrum.average_level();
+            let bands =
+                std::array::from_fn(|i| (spectrum.s16_left[i] + spectrum.s16_right[i]) * 0.5);
             for system in &mut self.particle_systems {
-                system.set_audio_level(level);
+                system.set_audio_bands(bands);
             }
         }
 
