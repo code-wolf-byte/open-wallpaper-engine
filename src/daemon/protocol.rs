@@ -137,6 +137,12 @@ pub enum Request {
     SetFps {
         fps: u32,
     },
+    /// User properties of `wallpaper` (Workshop ID or folder) changed in the
+    /// saved settings; shown live wherever it is displayed.
+    PropertiesChanged {
+        wallpaper: String,
+        names: Vec<String>,
+    },
     /// Audio capture device for audio-reactive wallpapers; `None` =
     /// automatic. Takes effect on the next apply.
     SetAudioDevice {

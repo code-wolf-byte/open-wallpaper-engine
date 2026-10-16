@@ -446,6 +446,8 @@ struct OutputInstance {
     /// Pause state and frame-rate cap last sent to a web page here.
     web_paused: bool,
     web_fps: u32,
+    /// How far into `settings.property_edits` this output has applied.
+    props_seen: usize,
 }
 
 fn wallpaper_loop(
@@ -509,6 +511,7 @@ fn wallpaper_loop(
                     if per_screen { "per-screen" } else { "default" }
                 );
                 let output_settings = settings.resolve(named.name.as_deref());
+                let props_seen = output_settings.lock().unwrap().property_edits.len();
                 outputs.push(OutputInstance {
                     named,
                     renderer,
@@ -517,6 +520,7 @@ fn wallpaper_loop(
                     right_down: false,
                     web_paused: false,
                     web_fps: web.fps,
+                    props_seen,
                 });
             }
             // Don't take down every other (working) output over one bad
@@ -608,6 +612,45 @@ fn wallpaper_loop(
             }
             output.web_paused = paused;
             output.web_fps = fps;
+        }
+        // Live user-property edits for whatever each output shows: scenes
+        // apply them in place (or rebuild), web pages get applyUserProperties.
+        for output in &mut outputs {
+            if output.settings.lock().unwrap().property_edits.len() == output.props_seen {
+                continue;
+            }
+            let resolved = content.resolve(output.named.name.as_deref());
+            let Some(dir) = resolved.project_dir().map(std::path::Path::to_path_buf) else {
+                output.props_seen = output.settings.lock().unwrap().property_edits.len();
+                continue;
+            };
+            let edits = output
+                .settings
+                .lock()
+                .unwrap()
+                .property_edits_since(&mut output.props_seen, &dir);
+            if edits.is_empty() {
+                continue;
+            }
+            let rebuild = match &mut output.renderer {
+                ContentRenderer::Scene(scene) => !scene.set_user_properties(&edits),
+                ContentRenderer::Frames(fs) => {
+                    if let Some(tx) = fs.web_input() {
+                        let json = crate::render::web::user_properties_subset(&dir, &edits);
+                        let _ = tx.try_send(crate::render::web::WebInputEvent::Properties(json));
+                    }
+                    false
+                }
+            };
+            if rebuild {
+                let web = web_options(output.named.rect, &settings, output.named.name.as_deref());
+                match build_content_renderer(resolved, device.clone(), queue.clone(), web) {
+                    Ok(r) => output.renderer = r,
+                    Err(e) => {
+                        tracing::error!(target: "wallpaper", "reloading output {:?}: {e}", output.named.name)
+                    }
+                }
+            }
         }
         crate::engine::audio::set_muted(action >= PlaybackAction::Mute);
         crate::engine::audio::set_master_volume(settings.default.lock().unwrap().volume);

@@ -1838,6 +1838,8 @@ pub struct GpuSceneInstance {
     /// The scene's SceneScript runtime, ticked once per frame. Lives here (on
     /// the render thread) because boa's `Context` is `!Send`.
     scripts: crate::engine::script::ScriptHost,
+    /// What live user-property edits diff against.
+    live_props: LiveProps,
     /// Per-object visibility as scripts leave it, indexed like `scene.objects`
     /// (authored visibility at load). A layer draws only when its object and
     /// every ancestor are visible.
@@ -2867,6 +2869,7 @@ impl GpuSceneInstance {
                 &raw_scene,
             ),
             timelines: build_timelines(&raw_scene, &resolved.transform_graph),
+            live_props: LiveProps::new(dir, &raw_scene),
             object_visible: resolved
                 .scene
                 .objects
@@ -3768,6 +3771,127 @@ impl GpuSceneInstance {
         if moved.iter().any(|m| *m) {
             self.apply_object_transforms(&moved);
         }
+    }
+
+    /// The user properties `names` changed in the saved settings: show them
+    /// live. Returns `false` when the scene must be rebuilt instead (see
+    /// [`Self::apply_user_properties`]).
+    pub fn set_user_properties(&mut self, names: &[String]) -> bool {
+        let props =
+            crate::engine::properties::SceneProperties::from_project_dir(&self.live_props.dir);
+        self.apply_user_properties(props, names)
+    }
+
+    /// Re-resolve the scene against `props` and push each object's
+    /// differences through the same path SceneScript writes take; scripts
+    /// get `applyUserProperties` for `names`. Returns `false` when a change
+    /// can't be applied live (scene-wide settings, an effect that wasn't
+    /// built at load, a field scripts can't set).
+    fn apply_user_properties(
+        &mut self,
+        props: crate::engine::properties::SceneProperties,
+        names: &[String],
+    ) -> bool {
+        let lp = &mut self.live_props;
+        lp.props = props;
+        let mut next = lp.raw.clone();
+        lp.props.resolve_scene_json(&mut next);
+        let prev = std::mem::replace(&mut lp.resolved, next);
+        if prev.get("general") != lp.resolved.get("general") {
+            return false;
+        }
+        let objects = |v: &serde_json::Value| {
+            v.get("objects")
+                .and_then(|o| o.as_array())
+                .cloned()
+                .unwrap_or_default()
+        };
+        let (before, after) = (objects(&prev), objects(&lp.resolved));
+        if before.len() != after.len() {
+            return false;
+        }
+        let user: serde_json::Map<String, serde_json::Value> = names
+            .iter()
+            .filter_map(|n| {
+                Some((
+                    n.clone(),
+                    serde_json::json!({ "value": lp.props.get(n)?.clone() }),
+                ))
+            })
+            .collect();
+        let mut objects = Vec::new();
+        for (i, (a, b)) in before.iter().zip(&after).enumerate() {
+            let mut diffs = Vec::new();
+            changed_leaves(a, b, &mut Vec::new(), &mut diffs);
+            if diffs.is_empty() {
+                continue;
+            }
+            let mut change = crate::engine::script::ObjectChange::default();
+            for (path, v) in &diffs {
+                if self.live_change(i, path, v, &mut change).is_none() {
+                    tracing::debug!(target: "properties", "object {i}: {} needs a reload", path.join("."));
+                    return false;
+                }
+            }
+            objects.push((i, change));
+        }
+        self.apply_script_changes(crate::engine::script::ScriptChanges {
+            objects,
+            commands: Vec::new(),
+        });
+        self.scripts
+            .apply_user_properties(&serde_json::Value::Object(user));
+        true
+    }
+
+    /// One changed scene.json field of object `object`, as a script change.
+    /// `None` when it has no live counterpart.
+    fn live_change(
+        &self,
+        object: usize,
+        path: &[String],
+        v: &serde_json::Value,
+        c: &mut crate::engine::script::ObjectChange,
+    ) -> Option<()> {
+        use crate::engine::scene::{parse_value_bool, parse_value_f32, parse_value_vec3};
+        // `{"user": …, "value": X}` bindings resolve to their `value`.
+        let v = v.get("value").unwrap_or(v);
+        let vec3 = |v| parse_value_vec3(v).map(|a| a.map(|x| x as f32));
+        let path: Vec<&str> = path.iter().map(String::as_str).collect();
+        match path.as_slice() {
+            ["visible"] => c.visible = Some(parse_value_bool(v)?),
+            ["alpha"] => c.alpha = Some(parse_value_f32(v)?),
+            ["brightness"] => c.brightness = Some(parse_value_f32(v)?),
+            ["color"] => c.color = Some(vec3(v)?),
+            ["origin"] => c.origin = Some(vec3(v)?),
+            ["scale"] => c.scale = Some(vec3(v)?),
+            ["volume"] => c.volume = Some(parse_value_f32(v)?),
+            ["pointsize"] => c.pointsize = Some(parse_value_f32(v)?),
+            ["text"] => c.text = Some(v.as_str()?.to_string()),
+            ["instanceoverride", k] => {
+                c.extra.insert(format!("instance.{k}"), v.clone());
+            }
+            ["effects", e, rest @ ..] => {
+                let e: usize = e.parse().ok()?;
+                // Effects hidden at load were never built.
+                self.scene_effects
+                    .iter()
+                    .any(|d| d.layer_idx == object && d.effect_index == e)
+                    .then_some(())?;
+                match rest {
+                    ["visible"] => {
+                        c.extra
+                            .insert(format!("effects.{e}.visible"), parse_value_bool(v)?.into());
+                    }
+                    ["passes", pass, "constantshadervalues", k] => {
+                        c.extra.insert(format!("effects.{e}.{pass}.{k}"), v.clone());
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+        Some(())
     }
 
     /// A script wrote a declared extra property: `instance.<key>` (particle
@@ -5938,6 +6062,66 @@ pub fn gpu_scene_render_loop(
     }
 }
 
+/// The unresolved scene.json, the wallpaper's user properties, and the scene
+/// as last resolved against them.
+struct LiveProps {
+    dir: std::path::PathBuf,
+    raw: serde_json::Value,
+    props: crate::engine::properties::SceneProperties,
+    resolved: serde_json::Value,
+}
+
+impl LiveProps {
+    fn new(dir: &Path, raw: &serde_json::Value) -> Self {
+        let props = crate::engine::properties::SceneProperties::from_project_dir(dir);
+        let mut resolved = raw.clone();
+        props.resolve_scene_json(&mut resolved);
+        Self {
+            dir: dir.to_path_buf(),
+            raw: raw.clone(),
+            props,
+            resolved,
+        }
+    }
+}
+
+/// Collect the leaves that differ between `a` and `b` as (path, new value).
+/// A `{"user": …}` binding counts as one leaf, as do arrays that changed
+/// length.
+fn changed_leaves(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+    path: &mut Vec<String>,
+    out: &mut Vec<(Vec<String>, serde_json::Value)>,
+) {
+    use serde_json::Value;
+    if a == b {
+        return;
+    }
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) if !y.contains_key("user") => {
+            for k in x.keys().chain(y.keys().filter(|k| !x.contains_key(*k))) {
+                path.push(k.clone());
+                changed_leaves(
+                    x.get(k).unwrap_or(&Value::Null),
+                    y.get(k).unwrap_or(&Value::Null),
+                    path,
+                    out,
+                );
+                path.pop();
+            }
+        }
+        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => {
+            for (i, (p, q)) in x.iter().zip(y).enumerate() {
+                path.push(i.to_string());
+                changed_leaves(p, q, path, out);
+                path.pop();
+            }
+        }
+        _ => out.push((path.clone(), b.clone())),
+    }
+}
+
 type ShaderVals = std::collections::HashMap<String, f32>;
 
 /// Insert a constant under every spelling the packer might look up: the raw
@@ -6554,6 +6738,46 @@ mod hit_tests {
             late.iter().filter(|a| **a > 0.3).count() >= late.len() - 1,
             "faded in: {late:?}"
         );
+    }
+
+    #[test]
+    fn changed_leaves_stops_at_user_bindings() {
+        let a = serde_json::json!({"visible": {"user": "grid", "value": false},
+            "effects": [{"passes": [{"constantshadervalues": {"speed": 1}}]}], "name": "x"});
+        let b = serde_json::json!({"visible": {"user": "grid", "value": true},
+            "effects": [{"passes": [{"constantshadervalues": {"speed": 2}}]}], "name": "x"});
+        let mut out = Vec::new();
+        changed_leaves(&a, &b, &mut Vec::new(), &mut out);
+        let paths: Vec<String> = out.iter().map(|(p, _)| p.join(".")).collect();
+        assert_eq!(
+            paths,
+            ["effects.0.passes.0.constantshadervalues.speed", "visible"]
+        );
+        assert_eq!(out[1].1["value"], true);
+    }
+
+    /// A user setting bound to layer visibility (2156479578: `grid` shows
+    /// the Grid layer) applies live, without rebuilding the scene.
+    #[test]
+    #[ignore]
+    fn bool_setting_toggles_a_layer_live() {
+        let Some(dir) = crate::workshop::find_item_dir("2156479578", None) else {
+            eprintln!("workshop item 2156479578 not installed; skipping");
+            return;
+        };
+        let mut scene = GpuSceneInstance::open(&dir).expect("scene loads");
+        let before = scene.object_visible[4];
+        let flipped = if before { "0" } else { "1" };
+        assert!(
+            {
+                let mut props = scene.live_props.props.clone();
+                props.apply_overrides(HashMap::from([("grid".to_string(), flipped.to_string())]));
+                scene.apply_user_properties(props, &["grid".to_string()])
+            },
+            "applied live"
+        );
+        assert_eq!(scene.object_visible[4], !before);
+        scene.render();
     }
 
     /// End to end against a real Workshop scene with clickable layers
