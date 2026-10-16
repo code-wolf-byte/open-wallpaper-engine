@@ -237,6 +237,8 @@ struct WallpaperSurface {
     draw_scheduled: bool,
     /// Frame-rate cap last sent to a web page on this surface.
     web_fps: u32,
+    /// How far into `settings.property_edits` this surface has applied.
+    props_seen: usize,
 }
 
 struct WallpaperState {
@@ -465,6 +467,7 @@ impl WallpaperState {
             }
         }
         crate::engine::audio::set_master_volume(self.settings.default.lock().unwrap().volume);
+        self.apply_property_edits(idx);
 
         // Frame-rate cap: a callback that arrives early waits on a timer.
         let interval = self.surfaces[idx].settings.lock().unwrap().frame_interval();
@@ -960,6 +963,7 @@ impl OutputHandler for WallpaperState {
         layer.commit();
 
         let settings = self.settings.resolve(output_name.as_deref());
+        let props_seen = settings.lock().unwrap().property_edits.len();
 
         self.surfaces.push(WallpaperSurface {
             gpu: None,
@@ -976,6 +980,7 @@ impl OutputHandler for WallpaperState {
             last_draw: None,
             draw_scheduled: false,
             web_fps: web.fps,
+            props_seen,
         });
     }
 
@@ -1465,12 +1470,64 @@ impl WallpaperState {
         action
     }
 
+    /// Apply live user-property edits to surface `idx`'s renderer: scenes in
+    /// place (or rebuilt), web pages through `applyUserProperties`. In span
+    /// and clone layouts surface 0 owns the shared renderer.
+    fn apply_property_edits(&mut self, idx: usize) {
+        let s = &mut self.surfaces[idx];
+        let total = s.settings.lock().unwrap().property_edits.len();
+        if total == s.props_seen {
+            return;
+        }
+        let resolved = self.content.resolve(s.output_name.as_deref());
+        let Some(dir) = resolved.project_dir().map(std::path::Path::to_path_buf) else {
+            s.props_seen = total;
+            return;
+        };
+        let edits = s
+            .settings
+            .lock()
+            .unwrap()
+            .property_edits_since(&mut s.props_seen, &dir);
+        if edits.is_empty()
+            || (idx > 0 && self.content.layout != crate::render::ScreenLayout::PerScreen)
+        {
+            return;
+        }
+        let rebuild = match &mut s.renderer.borrow_mut().content {
+            ContentRenderer::Scene(scene) => !scene.set_user_properties(&edits),
+            ContentRenderer::Frames(fs) => {
+                if let Some(tx) = fs.web_input() {
+                    let json = crate::render::web::user_properties_subset(&dir, &edits);
+                    let _ = tx.try_send(crate::render::web::WebInputEvent::Properties(json));
+                }
+                false
+            }
+        };
+        if rebuild {
+            let web = crate::render::web::WebOptions {
+                size: (s.width.max(1), s.height.max(1)),
+                fps: s.settings.lock().unwrap().fps,
+            };
+            match build_content_renderer(
+                resolved,
+                self.device.clone(),
+                self.queue.clone(),
+                self.allow_gpu_surface,
+                web,
+            ) {
+                Ok(r) => s.renderer.borrow_mut().content = r,
+                Err(e) => tracing::error!(target: "wallpaper", "reloading output {idx}: {e}"),
+            }
+        }
+    }
+
     /// Send `event` to every output showing a web wallpaper.
     fn notify_web(&self, event: crate::render::web::WebInputEvent) {
         for s in &self.surfaces {
             if let ContentRenderer::Frames(fs) = &s.renderer.borrow().content {
                 if let Some(tx) = fs.web_input() {
-                    let _ = tx.try_send(event);
+                    let _ = tx.try_send(event.clone());
                 }
             }
         }

@@ -182,9 +182,8 @@ pub struct Emitter {
     /// stops emitting. Absent = emits forever.
     #[serde(default)]
     pub duration: Option<f64>,
-    /// Presence of any `audioprocessing*` field makes emission react to the
-    /// captured audio level (rate scales with loudness). We use the mode as
-    /// the trigger; band bounds are parsed but not yet split per-frequency.
+    /// Presence of `audioprocessingmode`/`bounds` makes emission react to
+    /// captured audio; the rest shape the response (see `AudioResponse`).
     #[serde(default)]
     pub audioprocessingmode: Option<serde_json::Value>,
     #[serde(default)]
@@ -192,7 +191,72 @@ pub struct Emitter {
     #[serde(default)]
     pub audioprocessingexponent: Option<serde_json::Value>,
     #[serde(default)]
+    pub audioprocessingfrequencystart: Option<serde_json::Value>,
+    #[serde(default)]
     pub audioprocessingfrequencyend: Option<serde_json::Value>,
+}
+
+/// An emitter's audio response, with the defaults and clamping of WE's own
+/// parser (wallpaper64.exe `FUN_1401c1e20`): `exponent` 2.0, `bounds`
+/// "0.8 1.0", bands `0..=1` of the 16-band spectrum, both clamped to 15 and
+/// swapped if reversed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AudioResponse {
+    exponent: f32,
+    bounds: [f32; 2],
+    bands: [usize; 2],
+}
+
+impl AudioResponse {
+    fn from_emitter(e: &Emitter) -> Option<Self> {
+        if e.audioprocessingmode.is_none() && e.audioprocessingbounds.is_none() {
+            return None;
+        }
+        let band = |v: &Option<serde_json::Value>, d: usize| {
+            v.as_ref()
+                .and_then(|v| v.as_u64())
+                .map_or(d, |b| b as usize)
+                .min(15)
+        };
+        let (a, b) = (
+            band(&e.audioprocessingfrequencystart, 0),
+            band(&e.audioprocessingfrequencyend, 1),
+        );
+        let bounds = match &e.audioprocessingbounds {
+            Some(serde_json::Value::String(s)) => {
+                let p: Vec<f32> = s
+                    .split_whitespace()
+                    .filter_map(|x| x.parse().ok())
+                    .collect();
+                [
+                    p.first().copied().unwrap_or(0.0),
+                    p.get(1).copied().unwrap_or(0.0),
+                ]
+            }
+            Some(v) => value_as_f32(v).map_or([0.8, 1.0], |x| [x, x]),
+            None => [0.8, 1.0],
+        };
+        Some(Self {
+            exponent: e
+                .audioprocessingexponent
+                .as_ref()
+                .and_then(value_as_f32)
+                .unwrap_or(2.0),
+            bounds,
+            bands: [a.min(b), a.max(b)],
+        })
+    }
+
+    /// Rate multiplier for one 16-band spectrum (L/R averaged).
+    // ponytail: WE's runtime consumer of this struct isn't decompiled (its
+    // caller overflows the Ghidra bridge); mean-of-bands -> pow(exponent) ->
+    // lerp(bounds) is reconstructed from the parsed fields, and `mode` is
+    // treated only as an on-switch. Revisit if the consumer is recovered.
+    fn gain(&self, bands16: &[f32; 16]) -> f32 {
+        let s = &bands16[self.bands[0]..=self.bands[1]];
+        let level = (s.iter().sum::<f32>() / s.len() as f32).clamp(0.0, 1.0);
+        lerp_f32(self.bounds[0], self.bounds[1], level.powf(self.exponent))
+    }
 }
 
 /// `min`/`max` are untyped because real presets mix plain numbers
@@ -570,9 +634,9 @@ pub struct ParticleSystem {
     /// Scene-global constant acceleration (`general.gravity*` + `wind*`),
     /// added to every particle's velocity each step. Set post-construction.
     scene_force: [f32; 2],
-    /// Current audio loudness in ~[0,1], set per frame; audio-reactive emitters
-    /// scale their emission rate by it.
-    audio_level: f32,
+    /// Latest 16-band spectrum (L/R averaged), set per frame; audio-reactive
+    /// emitters scale their emission rate by it.
+    audio_bands: [f32; 16],
     /// `movement.drag`: velocity decays by `1 - drag*dt` (clamped at 0)
     /// each step, matching the reference's reversal-preventing clamp.
     movement_drag: f32,
@@ -1233,9 +1297,9 @@ struct EmitterState {
     burst_done: bool,
     /// `duration`: emitter stops after `start_time + duration` (None = forever).
     duration: Option<f32>,
-    /// True when the emitter has `audioprocessing*` — its rate scales with the
-    /// current audio level.
-    audio_reactive: bool,
+    /// Set when the emitter has `audioprocessing*` — its rate follows the
+    /// audio spectrum.
+    audio: Option<AudioResponse>,
 }
 
 impl ParticleSystem {
@@ -1307,8 +1371,7 @@ impl ParticleSystem {
                     burst: e.instantaneous.unwrap_or(0.0).max(0.0) as u32,
                     burst_done: false,
                     duration: e.duration.map(|d| d as f32),
-                    audio_reactive: e.audioprocessingmode.is_some()
-                        || e.audioprocessingbounds.is_some(),
+                    audio: AudioResponse::from_emitter(e),
                 }
             })
             .collect();
@@ -1890,7 +1953,7 @@ impl ParticleSystem {
             time: 0.0,
             start_time: config.starttime.unwrap_or(0.0).max(0.0) as f32,
             scene_force: [0.0, 0.0],
-            audio_level: 0.0,
+            audio_bands: [0.0; 16],
         }
     }
 
@@ -1932,9 +1995,9 @@ impl ParticleSystem {
         self.scene_force = force;
     }
 
-    /// Set the current audio loudness (~[0,1]) driving audio-reactive emitters.
-    pub fn set_audio_level(&mut self, level: f32) {
-        self.audio_level = level.clamp(0.0, 4.0);
+    /// Set the 16-band spectrum (~[0,1] per band) driving audio-reactive emitters.
+    pub fn set_audio_bands(&mut self, bands: [f32; 16]) {
+        self.audio_bands = bands;
     }
 
     /// Tell the system its resolved sprite's frame count/loop duration, so
@@ -2373,13 +2436,7 @@ impl ParticleSystem {
                 emitter.accumulator += emitter.burst as f32;
                 emitter.burst_done = true;
             }
-            // Audio-reactive emitters scale their rate with loudness (a small
-            // baseline keeps a trickle when quiet).
-            let audio_gain = if emitter.audio_reactive {
-                0.15 + self.audio_level
-            } else {
-                1.0
-            };
+            let audio_gain = emitter.audio.map_or(1.0, |a| a.gain(&self.audio_bands));
             emitter.accumulator += emitter.rate * self.rate_mult * audio_gain * dt;
             while emitter.accumulator >= 1.0 && self.particles.len() < self.max_count {
                 emitter.accumulator -= 1.0;
@@ -4767,6 +4824,28 @@ mod tests {
             sys.particles.is_empty(),
             "particle should be deleted on contact"
         );
+    }
+
+    /// Audio response: WE's parser defaults, band clamp/swap, and the gain
+    /// range follows `bounds` over the selected bands only.
+    #[test]
+    fn audio_response_defaults_bands_and_bounds() {
+        let em = |j: &str| serde_json::from_str::<Emitter>(j).unwrap();
+        assert_eq!(AudioResponse::from_emitter(&em("{}")), None);
+        let d = AudioResponse::from_emitter(&em(r#"{"audioprocessingmode": 1}"#)).unwrap();
+        assert_eq!((d.exponent, d.bounds, d.bands), (2.0, [0.8, 1.0], [0, 1]));
+        let r = AudioResponse::from_emitter(&em(
+            r#"{"audioprocessingbounds": "0.2 1.5", "audioprocessingexponent": 1,
+                "audioprocessingfrequencystart": 40, "audioprocessingfrequencyend": 6}"#,
+        ))
+        .unwrap();
+        assert_eq!(r.bands, [6, 15]);
+        let mut bands = [0.0; 16];
+        assert_eq!(r.gain(&bands), 0.2);
+        bands[0] = 1.0; // outside 6..=15: no effect
+        assert_eq!(r.gain(&bands), 0.2);
+        bands[6..].fill(1.0);
+        assert!((r.gain(&bands) - 1.5).abs() < 1e-6);
     }
 
     /// `boids` cohesion pulls two distant particles toward each other.

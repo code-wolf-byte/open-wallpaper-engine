@@ -14,6 +14,33 @@ pub struct RenderSettings {
     pub fps: u32,
     /// How video, image and web content fits an output of another aspect.
     pub scaling: ScaleMode,
+    /// Live user-property edits, appended by the daemon and never removed:
+    /// several outputs can share these settings, so each reader keeps its
+    /// own position (see [`RenderSettings::property_edits_since`]).
+    // ponytail: grows by one small entry per edit for the daemon's lifetime.
+    pub property_edits: Vec<PropertyEdit>,
+}
+
+/// User property `name` of the wallpaper in `dir` (canonical) changed; its
+/// new value is in the saved settings.
+#[derive(Debug, Clone)]
+pub struct PropertyEdit {
+    pub dir: std::path::PathBuf,
+    pub name: String,
+}
+
+impl RenderSettings {
+    /// Names of properties edited past `*seen` for the wallpaper in `dir`;
+    /// advances `*seen`.
+    pub fn property_edits_since(&self, seen: &mut usize, dir: &std::path::Path) -> Vec<String> {
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let new = self.property_edits.get(*seen..).unwrap_or_default();
+        *seen = self.property_edits.len();
+        new.iter()
+            .filter(|e| e.dir == dir)
+            .map(|e| e.name.clone())
+            .collect()
+    }
 }
 
 /// How a frame of one aspect ratio fills an output of another.
@@ -101,6 +128,7 @@ impl Default for RenderSettings {
             volume: 1.0,
             fps: DEFAULT_FPS,
             scaling: ScaleMode::default(),
+            property_edits: Vec::new(),
         }
     }
 }

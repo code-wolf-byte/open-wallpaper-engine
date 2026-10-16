@@ -21,7 +21,7 @@ use std::sync::{Mutex, OnceLock};
 /// `directory` (2), `scenetexture` (1). `is_settable()` distinguishes the
 /// two decorative types (plus a missing/empty `type`, which real content
 /// also uses for the same static-label purpose) from everything else.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SceneProperty {
     pub name: String,
     /// Declared type: "slider" | "color" | "bool" | "combo" | "text" | ...
@@ -46,6 +46,12 @@ pub struct SceneProperty {
     pub min: Option<f64>,
     pub max: Option<f64>,
     pub step: Option<f64>,
+    /// Display position: WE lists properties by `order`, then `index`.
+    pub order: i64,
+    pub index: i64,
+    /// JS expression over other properties (`show.value == true`) that
+    /// decides whether WE shows this row; `None` = always shown.
+    pub condition: Option<String>,
 }
 
 impl SceneProperty {
@@ -83,7 +89,11 @@ impl SceneProperties {
         if let Some(preset) = preset_overrides_for(dir) {
             props.apply_overrides(preset);
         }
-        props.apply_overrides(global_overrides().lock().unwrap().clone());
+        props.apply_overrides(crate::settings::WpSettings::load().property_overrides_for_dir(dir));
+        let (scope, overrides) = global_overrides().lock().unwrap().clone();
+        if scope.is_none_or(|s| s == canonical(dir)) {
+            props.apply_overrides(overrides);
+        }
         props
     }
 
@@ -95,17 +105,15 @@ impl SceneProperties {
         else {
             return;
         };
+        let strings = localization(project);
+        let tr = |s: &str| strings.get(s).cloned().unwrap_or_else(|| s.to_string());
         for (name, decl) in map {
             let kind = decl
                 .get("type")
                 .and_then(|t| t.as_str())
                 .unwrap_or("")
                 .to_string();
-            let text = decl
-                .get("text")
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string();
+            let text = tr(decl.get("text").and_then(|t| t.as_str()).unwrap_or(""));
             let value = decl.get("value").cloned().unwrap_or(Value::Null);
             let options = decl
                 .get("options")
@@ -130,11 +138,8 @@ impl SceneProperties {
                                 Some(v @ Value::Number(_)) => json_value_as_string(v),
                                 _ => return None,
                             };
-                            let label = opt
-                                .get("label")
-                                .and_then(|l| l.as_str())
-                                .unwrap_or(&value)
-                                .to_string();
+                            let label =
+                                tr(opt.get("label").and_then(|l| l.as_str()).unwrap_or(&value));
                             Some((value, label))
                         })
                         .collect()
@@ -143,6 +148,13 @@ impl SceneProperties {
             let min = decl.get("min").and_then(|v| v.as_f64());
             let max = decl.get("max").and_then(|v| v.as_f64());
             let step = decl.get("step").and_then(|v| v.as_f64());
+            let int = |k: &str| decl.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0) as i64;
+            let condition = decl
+                .get("condition")
+                .and_then(|c| c.as_str())
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(String::from);
             self.properties.insert(
                 name.clone(),
                 SceneProperty {
@@ -154,6 +166,9 @@ impl SceneProperties {
                     min,
                     max,
                     step,
+                    order: int("order"),
+                    index: int("index"),
+                    condition,
                 },
             );
         }
@@ -189,13 +204,8 @@ impl SceneProperties {
                         name.clone(),
                         SceneProperty {
                             name,
-                            kind: String::new(),
-                            text: String::new(),
                             value: guess_value(&raw),
-                            options: Vec::new(),
-                            min: None,
-                            max: None,
-                            step: None,
+                            ..Default::default()
                         },
                     );
                 }
@@ -211,10 +221,10 @@ impl SceneProperties {
         self.properties.is_empty()
     }
 
-    /// Iterate declared properties (for `list-properties`).
+    /// Iterate declared properties in WE's display order.
     pub fn iter(&self) -> impl Iterator<Item = &SceneProperty> {
         let mut all: Vec<&SceneProperty> = self.properties.values().collect();
-        all.sort_by(|a, b| a.name.cmp(&b.name));
+        all.sort_by(|a, b| (a.order, a.index, &a.name).cmp(&(b.order, b.index, &b.name)));
         all.into_iter()
     }
 
@@ -316,7 +326,7 @@ fn json_value_as_string(v: &Value) -> String {
     }
 }
 
-fn convert_override(prop: &SceneProperty, raw: &str) -> Value {
+pub fn convert_override(prop: &SceneProperty, raw: &str) -> Value {
     match prop.kind.as_str() {
         "bool" => Value::Bool(matches!(raw, "1" | "true" | "yes" | "on")),
         "slider" => {
@@ -381,19 +391,107 @@ fn guess_value(raw: &str) -> Value {
     }
 }
 
-// ── Global override store ─────────────────────────────────────────────────────
-// Set once at startup from CLI/application context; consulted every time a
-// scene's properties are loaded (matches the C++ ApplicationContext's
-// settings.general.properties map).
-
-fn global_overrides() -> &'static Mutex<HashMap<String, String>> {
-    static OVERRIDES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    OVERRIDES.get_or_init(|| Mutex::new(HashMap::new()))
+/// The wallpaper's own label translations (`general.localization`) for the
+/// user's language, falling back to `en-us`, plus WE's one built-in label.
+fn localization(project: &Value) -> HashMap<String, String> {
+    let mut out = HashMap::from([(
+        "ui_browse_properties_scheme_color".to_string(),
+        "Scheme color".to_string(),
+    )]);
+    let Some(langs) = project
+        .pointer("/general/localization")
+        .and_then(|l| l.as_object())
+    else {
+        return out;
+    };
+    // `de_DE.UTF-8` -> `de-de`.
+    let lang = std::env::var("LANG")
+        .unwrap_or_default()
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .replace('_', "-")
+        .to_lowercase();
+    let table = langs
+        .get(&lang)
+        .or_else(|| {
+            langs
+                .iter()
+                .find(|(k, _)| k.split('-').next() == lang.split('-').next())
+                .map(|(_, v)| v)
+        })
+        .or_else(|| langs.get("en-us"));
+    if let Some(table) = table.and_then(|t| t.as_object()) {
+        out.extend(
+            table
+                .iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))),
+        );
+    }
+    out
 }
 
-/// Install `--set-property` overrides for all scenes loaded in this process.
+/// Which of `props` WE would show: each row's `condition` (a JS expression
+/// such as `show.value == true && mode.value != 2`) evaluated against
+/// `values`, the current value of every property by name. A condition that
+/// fails to evaluate shows its row rather than hiding a setting.
+pub fn visible_rows(props: &[SceneProperty], values: &HashMap<String, Value>) -> Vec<bool> {
+    use boa_engine::{Context, Source};
+    if props.iter().all(|p| p.condition.is_none()) {
+        return vec![true; props.len()];
+    }
+    let mut ctx = Context::default();
+    // Conditions come from the wallpaper: keep a hostile one from hanging us.
+    ctx.runtime_limits_mut().set_loop_iteration_limit(10_000);
+    ctx.runtime_limits_mut().set_recursion_limit(64);
+    let scope: serde_json::Map<String, Value> = props
+        .iter()
+        .map(|p| {
+            let v = values.get(&p.name).unwrap_or(&p.value).clone();
+            (p.name.clone(), serde_json::json!({ "value": v }))
+        })
+        .collect();
+    let setup = format!(
+        "(function(p){{for (var k in p) globalThis[k] = p[k];}})({});",
+        Value::Object(scope)
+    );
+    if ctx.eval(Source::from_bytes(setup.as_bytes())).is_err() {
+        return vec![true; props.len()];
+    }
+    props
+        .iter()
+        .map(|p| match &p.condition {
+            None => true,
+            Some(c) => ctx
+                .eval(Source::from_bytes(format!("!!({c})").as_bytes()))
+                .ok()
+                .and_then(|v| v.as_boolean())
+                .unwrap_or(true),
+        })
+        .collect()
+}
+
+// ── Global override store ─────────────────────────────────────────────────────
+// Set at startup from CLI/application context; consulted every time a
+// scene's properties are loaded, after the wallpaper's own saved settings.
+// Scoped to one wallpaper directory so other screens' wallpapers don't
+// inherit them.
+
+type ScopedOverrides = (Option<std::path::PathBuf>, HashMap<String, String>);
+
+fn global_overrides() -> &'static Mutex<ScopedOverrides> {
+    static OVERRIDES: OnceLock<Mutex<ScopedOverrides>> = OnceLock::new();
+    OVERRIDES.get_or_init(|| Mutex::new((None, HashMap::new())))
+}
+
+/// Install `--set-property` overrides for every scene this process loads.
 pub fn set_global_overrides(overrides: HashMap<String, String>) {
-    *global_overrides().lock().unwrap() = overrides;
+    *global_overrides().lock().unwrap() = (None, overrides);
+}
+
+/// Install overrides that apply only to the wallpaper in `dir`.
+pub fn set_overrides_for(dir: &Path, overrides: HashMap<String, String>) {
+    *global_overrides().lock().unwrap() = (Some(canonical(dir)), overrides);
 }
 
 // ── Preset overrides ──────────────────────────────────────────────────────────
@@ -524,6 +622,64 @@ mod preset_tests {
 mod tests {
     use super::*;
 
+    #[test]
+    fn conditions_follow_current_values_and_survive_hostile_input() {
+        let prop = |name: &str, kind: &str, value: Value, cond: Option<&str>| SceneProperty {
+            name: name.into(),
+            kind: kind.into(),
+            value,
+            condition: cond.map(String::from),
+            ..Default::default()
+        };
+        let props = vec![
+            prop("show", "bool", Value::Bool(true), None),
+            prop("mode", "combo", Value::String("2".into()), None),
+            prop(
+                "a",
+                "slider",
+                1.into(),
+                Some("show.value == true && mode.value != 2"),
+            ),
+            prop(
+                "b",
+                "slider",
+                1.into(),
+                Some("mode.value == 2 || !show.value"),
+            ),
+            prop(
+                "hang",
+                "bool",
+                Value::Bool(true),
+                Some("(function(){while(true){}})()"),
+            ),
+            prop("bad", "bool", Value::Bool(true), Some("nope.value ==")),
+        ];
+        assert_eq!(
+            visible_rows(&props, &HashMap::new()),
+            [true, true, false, true, true, true]
+        );
+        let values = HashMap::from([("mode".to_string(), Value::from(1))]);
+        assert_eq!(visible_rows(&props, &values)[2..4], [true, false]);
+    }
+
+    #[test]
+    fn labels_use_the_wallpapers_own_translations() {
+        let project = serde_json::json!({"general": {
+            "localization": {"en-us": {"ui_HEADER_AUDIO": "Audio"}},
+            "properties": {
+                "h": {"type": "text", "text": "ui_HEADER_AUDIO"},
+                "c": {"type": "color", "text": "ui_browse_properties_scheme_color", "order": -1}
+            }
+        }});
+        let mut props = SceneProperties::default();
+        props.load_from_project_json(&project);
+        let rows: Vec<_> = props
+            .iter()
+            .map(|p| (p.name.as_str(), p.text.as_str()))
+            .collect();
+        assert_eq!(rows, [("c", "Scheme color"), ("h", "Audio")]);
+    }
+
     fn props_with(name: &str, kind: &str, value: Value) -> SceneProperties {
         let mut p = SceneProperties::default();
         p.properties.insert(
@@ -536,7 +692,7 @@ mod tests {
                 options: Vec::new(),
                 min: None,
                 max: None,
-                step: None,
+                ..Default::default()
             },
         );
         p

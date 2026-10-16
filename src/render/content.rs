@@ -30,6 +30,16 @@ pub enum WallpaperContent {
 }
 
 impl WallpaperContent {
+    /// The wallpaper folder user properties belong to, if any.
+    pub fn project_dir(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Scene { dir } => Some(dir),
+            Self::Web { html } => html.parent(),
+            Self::Video { path } => path.parent(),
+            Self::Static(_) => None,
+        }
+    }
+
     /// Parse a Workshop `Wallpaper` into the appropriate content variant.
     ///
     /// Returns `Err` for types that are not yet renderable (Scene, Web,

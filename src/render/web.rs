@@ -60,6 +60,12 @@ pub fn start_web_stream(
     imp::start_web_stream(html, options)
 }
 
+/// The current values of `names` from `dir`'s user properties, as the JSON
+/// object a page's `applyUserProperties` receives.
+pub fn user_properties_subset(dir: &Path, names: &[String]) -> String {
+    imp::user_properties_subset(dir, names)
+}
+
 /// Colours for the media thumbnail listeners, sampled from local album art
 /// (`file://` URLs — MPRIS players usually cache art locally):
 /// `[primary, secondary, tertiary, text, highContrast]` as `#rrggbb`.
@@ -109,7 +115,7 @@ pub fn is_supported() -> bool {
 /// Input and state changes to forward into the embedded page. Pointer
 /// coordinates are normalized `[0,1]²` (top-left origin, like every other
 /// pointer consumer here), so callers never need the page's pixel size.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WebInputEvent {
     MouseMove {
         x_norm: f32,
@@ -133,6 +139,8 @@ pub enum WebInputEvent {
     Paused(bool),
     /// The frame-rate cap changed (`applyGeneralProperties({fps})`).
     Fps(u32),
+    /// User properties changed: an `applyUserProperties` JSON object.
+    Properties(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +171,10 @@ pub fn subprocess_main() -> Option<i32> {
 mod imp {
     use super::*;
     use anyhow::anyhow;
+
+    pub fn user_properties_subset(_dir: &Path, _names: &[String]) -> String {
+        String::new()
+    }
 
     pub fn start_web_stream(
         html: &Path,
@@ -728,6 +740,12 @@ mod imp {
                     &format!("window.__wpGeneral&&window.__wpGeneral({{\"fps\":{fps}}});"),
                 );
             }
+            WebInputEvent::Properties(json) => {
+                eval_in_page(
+                    browser,
+                    &format!("window.__wpProps&&window.__wpProps({json});"),
+                );
+            }
         }
     }
 
@@ -919,6 +937,14 @@ mod imp {
         }
 
         serde_json::to_string(props).unwrap_or_default()
+    }
+
+    pub fn user_properties_subset(dir: &Path, names: &[String]) -> String {
+        let all: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&user_properties_json(dir)).unwrap_or_default();
+        let subset: serde_json::Map<_, _> =
+            all.into_iter().filter(|(k, _)| names.contains(k)).collect();
+        serde_json::Value::Object(subset).to_string()
     }
 
     /// Does this wallpaper's bundle reference `needle` anywhere in its

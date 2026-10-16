@@ -10,10 +10,13 @@ use crate::render::{ScaleMode, ScreenLayout};
 use crate::settings::{Playlist, WpSettings};
 use serde_json::Value;
 
-/// The selected wallpaper's declared properties, loaded once per selection.
+/// The selected wallpaper's declared properties, loaded once per selection,
+/// in WE's display order (headings included).
 pub(super) struct PropertyEditor {
     pub idx: usize,
     pub props: Vec<SceneProperty>,
+    /// Which rows their `condition` currently shows; refreshed on each edit.
+    pub visible: Vec<bool>,
 }
 
 const PLAYBACK_CONDITIONS: [(&str, &str); 6] = [
@@ -39,11 +42,11 @@ const PLAYLIST_MODES: [(&str, &str); 4] = [
     ("login", "Next one each login"),
 ];
 
-/// A property's label without the HTML real content decorates it with.
-fn label(p: &SceneProperty) -> String {
+/// `text` without the HTML (tags and common entities) real content uses.
+fn plain_text(text: &str) -> String {
     let mut out = String::new();
     let mut in_tag = false;
-    for c in p.text.chars() {
+    for c in text.chars() {
         match c {
             '<' => in_tag = true,
             '>' => in_tag = false,
@@ -51,12 +54,46 @@ fn label(p: &SceneProperty) -> String {
             _ => {}
         }
     }
-    let out = out.trim_matches(|c: char| c.is_whitespace() || c == '—' || c == '-');
+    let out = out
+        .replace("&emsp;", " ")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&");
+    out.trim_matches(|c: char| c.is_whitespace() || c == '—' || c == '-')
+        .to_string()
+}
+
+/// A property's label, falling back to its name when the text is empty or
+/// an untranslated `ui_` key.
+fn label(p: &SceneProperty) -> String {
+    let out = plain_text(&p.text);
     if out.is_empty() || out.starts_with("ui_") {
         p.name.replace('_', " ")
     } else {
         out.to_string()
     }
+}
+
+/// Ask the desktop for a file or folder via zenity or kdialog.
+// ponytail: shells out instead of a file-dialog crate; use the XDG portal
+// (zbus is already a dependency) if neither tool is common enough.
+fn pick_path(directory: bool) -> Option<String> {
+    let zenity: &[&str] = if directory {
+        &["--file-selection", "--directory"]
+    } else {
+        &["--file-selection"]
+    };
+    let kdialog: &[&str] = if directory {
+        &["--getexistingdirectory"]
+    } else {
+        &["--getopenfilename"]
+    };
+    [("zenity", zenity), ("kdialog", kdialog)]
+        .iter()
+        .find_map(|(cmd, args)| {
+            let out = std::process::Command::new(cmd).args(*args).output().ok()?;
+            let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+            (out.status.success() && !path.is_empty()).then_some(path)
+        })
 }
 
 /// A declared value in the string form overrides are saved in.
@@ -179,23 +216,29 @@ impl WpApp {
     pub(super) fn render_properties(&mut self, ui: &mut egui::Ui, idx: usize) {
         if self.prop_editor.as_ref().map(|e| e.idx) != Some(idx) {
             let props = crate::engine::properties::list_properties(&self.wallpapers[idx].path)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|p| p.is_settable())
-                .collect();
-            self.prop_editor = Some(PropertyEditor { idx, props });
+                .unwrap_or_default();
+            self.prop_editor = Some(PropertyEditor {
+                idx,
+                props,
+                visible: Vec::new(),
+            });
         }
-        let editor = self.prop_editor.take().unwrap();
-        if !editor.props.is_empty() {
+        let mut editor = self.prop_editor.take().unwrap();
+        if editor.visible.len() != editor.props.len() {
+            editor.visible = self.visible_rows(idx, &editor.props);
+        }
+        let settable = editor.props.iter().filter(|p| p.is_settable()).count();
+        if settable > 0 {
             egui::CollapsingHeader::new(
-                egui::RichText::new(format!("Properties ({})", editor.props.len()))
-                    .color(TEXT_PRIMARY),
+                egui::RichText::new(format!("Properties ({settable})")).color(TEXT_PRIMARY),
             )
             .default_open(true)
             .show(ui, |ui| {
-                self.property_rows(ui, idx, &editor.props);
+                if self.property_rows(ui, idx, &editor.props, &editor.visible) {
+                    editor.visible.clear();
+                }
                 ui.label(
-                    egui::RichText::new("Changes show when you apply the wallpaper.")
+                    egui::RichText::new("Changes apply live while this wallpaper is showing.")
                         .size(11.0)
                         .color(TEXT_MUTED),
                 );
@@ -204,9 +247,48 @@ impl WpApp {
         self.prop_editor = Some(editor);
     }
 
-    fn property_rows(&mut self, ui: &mut egui::Ui, idx: usize, props: &[SceneProperty]) {
+    /// Each row's visibility under the current saved values.
+    fn visible_rows(&self, idx: usize, props: &[SceneProperty]) -> Vec<bool> {
+        let saved = self
+            .saved
+            .property_overrides(&self.wallpapers[idx].workshop_id);
+        let values = props
+            .iter()
+            .filter_map(|p| {
+                let raw = saved.get(&p.name)?;
+                Some((
+                    p.name.clone(),
+                    crate::engine::properties::convert_override(p, raw),
+                ))
+            })
+            .collect();
+        crate::engine::properties::visible_rows(props, &values)
+    }
+
+    /// Draws the rows WE would show; returns whether a value was changed.
+    fn property_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        idx: usize,
+        props: &[SceneProperty],
+        visible: &[bool],
+    ) -> bool {
         let key = self.wallpapers[idx].workshop_id.clone();
-        for p in props {
+        let mut changed = false;
+        for (p, _) in props.iter().zip(visible).filter(|(_, v)| **v) {
+            if !p.is_settable() {
+                // `text`/`group`/untyped rows are headings and spacers.
+                let text = plain_text(&p.text);
+                if text.is_empty() || text.starts_with("ui_") {
+                    ui.add_space(4.0);
+                } else if p.kind == "group" {
+                    ui.add_space(4.0);
+                    ui.strong(text);
+                } else {
+                    ui.label(egui::RichText::new(text).color(TEXT_MUTED));
+                }
+                continue;
+            }
             let saved = self
                 .saved
                 .properties
@@ -268,8 +350,14 @@ impl WpApp {
                             });
                         ui.label(label(p));
                     }
-                    // textinput, file, directory, scenetexture: free text.
+                    // textinput, file, directory, scenetexture: free text, with
+                    // a picker for the path kinds.
                     _ => {
+                        if matches!(p.kind.as_str(), "file" | "directory" | "scenetexture")
+                            && ui.small_button("📂").on_hover_text("Browse…").clicked()
+                        {
+                            commit = pick_path(p.kind == "directory");
+                        }
                         let id = ui.make_persistent_id(("prop_text", &p.name));
                         let mut text = ui
                             .data_mut(|d| d.get_temp::<String>(id))
@@ -298,8 +386,16 @@ impl WpApp {
                     self.saved.set_property(&key, &p.name, &value);
                 }
                 self.save_settings();
+                // Show it live on whichever screens display this wallpaper.
+                #[cfg(target_os = "linux")]
+                self.daemon.send(crate::daemon::Request::PropertiesChanged {
+                    wallpaper: key.clone(),
+                    names: vec![p.name.clone()],
+                });
+                changed = true;
             }
         }
+        changed
     }
 
     // ── Settings window ──────────────────────────────────────────────────────
@@ -654,7 +750,7 @@ mod tests {
             options: Vec::new(),
             min: None,
             max: None,
-            step: None,
+            ..Default::default()
         };
         assert_eq!(label(&p), "Add Wave");
         p.text = "ui_browse_properties_scheme_color".into();

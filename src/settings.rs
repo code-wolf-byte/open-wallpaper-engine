@@ -204,6 +204,24 @@ impl WpSettings {
             .unwrap_or_default()
     }
 
+    /// Saved overrides for the wallpaper in `dir`, whichever key they were
+    /// saved under: its Workshop ID (the folder name) or its canonical path.
+    pub fn property_overrides_for_dir(
+        &self,
+        dir: &Path,
+    ) -> std::collections::HashMap<String, String> {
+        let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let keys = [
+            dir.file_name().map(|n| n.to_string_lossy().into_owned()),
+            Some(canonical.display().to_string()),
+        ];
+        keys.iter()
+            .flatten()
+            .filter_map(|k| self.properties.get(k))
+            .flat_map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .collect()
+    }
+
     pub fn set_property(&mut self, id_or_path: &str, name: &str, value: &str) {
         self.properties
             .entry(normalize_key(id_or_path))
@@ -338,6 +356,25 @@ mod tests {
             Some(&"2".to_string())
         );
         assert!(settings.property_overrides("wallpaper-c").is_empty());
+    }
+
+    /// The GUI saves Workshop items under their ID; loading goes by folder.
+    #[test]
+    fn overrides_for_dir_match_the_workshop_id_folder_name() {
+        let mut settings = WpSettings::default();
+        settings
+            .properties
+            .entry("123456".into())
+            .or_default()
+            .insert("speed".into(), "3".into());
+        let dir = Path::new("/nonexistent/431960/123456");
+        assert_eq!(
+            settings.property_overrides_for_dir(dir).get("speed"),
+            Some(&"3".to_string())
+        );
+        assert!(settings
+            .property_overrides_for_dir(Path::new("/nonexistent/other"))
+            .is_empty());
     }
 
     #[test]

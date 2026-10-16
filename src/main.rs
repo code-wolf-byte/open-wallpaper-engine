@@ -556,6 +556,8 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
     use wp_engine::settings::{Playlist, WpSettings};
 
     let mut settings = WpSettings::load();
+    // Property edits to show live on a running daemon once saved.
+    let mut live: Option<(String, Vec<String>)> = None;
 
     match action {
         ConfigAction::Show => {
@@ -569,15 +571,19 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
             return Ok(());
         }
         ConfigAction::SetProperty { id, properties } => {
+            let mut names = Vec::new();
             for arg in &properties {
                 let (name, value) = engine::properties::parse_property_arg(arg);
                 println!("{id}: {name} = {value}");
                 settings.set_property(&id, &name, &value);
+                names.push(name);
             }
+            live = Some((id, names));
         }
         ConfigAction::UnsetProperty { id, name } => {
             if settings.unset_property(&id, &name) {
                 println!("Removed {id}: {name}");
+                live = Some((id, vec![name]));
             } else {
                 println!("No saved override for {id}: {name}");
                 return Ok(());
@@ -712,6 +718,12 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
     }
 
     settings.save()?;
+    if let Some((wallpaper, names)) = live.filter(|_| wp_engine::daemon::is_running()) {
+        let _ = wp_engine::daemon::request(&wp_engine::daemon::Request::PropertiesChanged {
+            wallpaper,
+            names,
+        });
+    }
     Ok(())
 }
 

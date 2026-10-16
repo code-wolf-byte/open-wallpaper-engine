@@ -62,13 +62,6 @@ impl Default for AudioSpectrum {
 pub const UNIFORM_BYTES: usize = (BANDS_16 * 2 + BANDS_32 * 2 + BANDS_64 * 2) * 4;
 
 impl AudioSpectrum {
-    /// Overall loudness in ~[0,1+]: the mean of the 64-band L/R magnitudes.
-    /// Drives audio-reactive particle emitters.
-    pub fn average_level(&self) -> f32 {
-        let sum: f32 = self.s64_left.iter().chain(&self.s64_right).sum();
-        sum / (BANDS_64 as f32 * 2.0)
-    }
-
     /// Serialize into the std430 layout the emitted `WEAudio` block expects:
     /// arrays in canonical order (16L,16R,32L,32R,64L,64R), tightly packed
     /// (`float[N]` has a 4-byte stride in std430 — no vec4 padding).

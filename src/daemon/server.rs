@@ -258,6 +258,31 @@ pub(super) fn handle_request(req: Request, state: &Mutex<State>) -> Response {
             }
             Response::Ok
         }
+        Request::PropertiesChanged { wallpaper, names } => {
+            let Some(dir) = crate::workshop::find_item_dir(&wallpaper, None)
+                .or_else(|| Some(std::path::PathBuf::from(&wallpaper)).filter(|p| p.is_dir()))
+            else {
+                return Response::Error {
+                    message: format!("unknown wallpaper '{wallpaper}'"),
+                };
+            };
+            let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+            if let Some(app) = &state.app {
+                // Every output's settings: each applies only edits for the
+                // wallpaper it is actually showing.
+                let context = app.context();
+                for s in std::iter::once(&context.settings).chain(context.screen_settings.values())
+                {
+                    let mut s = s.lock().unwrap();
+                    for name in &names {
+                        let (dir, name) = (dir.clone(), name.clone());
+                        s.property_edits
+                            .push(crate::render::settings::PropertyEdit { dir, name });
+                    }
+                }
+            }
+            Response::Ok
+        }
         Request::SetVolume { volume } => {
             if let Some(app) = &state.app {
                 app.context().settings.lock().unwrap().volume = volume.clamp(0.0, 1.0);
