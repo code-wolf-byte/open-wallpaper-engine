@@ -3273,7 +3273,7 @@ impl GpuSceneInstance {
     /// upload can't simply be reused from a `Mesh3dGpu` built later.
     fn upload_mesh3d_geometry(
         renderer: &GpuSceneRenderer,
-        mesh: &crate::engine::mesh3d::Mesh3d,
+        mesh: &crate::engine::model::mesh3d::Mesh3d,
     ) -> (wgpu::Buffer, wgpu::Buffer, u32) {
         let mut verts: Vec<u8> = Vec::with_capacity(mesh.positions.len() * 32);
         for ((p, uv), n) in mesh.positions.iter().zip(&mesh.uvs).zip(&mesh.normals) {
