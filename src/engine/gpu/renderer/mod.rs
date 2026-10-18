@@ -240,7 +240,7 @@ impl GpuSceneRenderer {
 
         let audio_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("audio_spectrum"),
-            size: crate::engine::audio::UNIFORM_BYTES as u64,
+            size: crate::services::audio::UNIFORM_BYTES as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1746,7 +1746,7 @@ struct ParticleGpuAssets {
 pub(crate) struct SceneSound {
     /// Index of the owning object in `scene.objects` (or a script-created one).
     pub object: usize,
-    pub playback: crate::engine::audio::SoundPlayback,
+    pub playback: crate::services::audio::SoundPlayback,
 }
 
 /// Start a `sound` object's first decodable file, held silent when
@@ -1754,7 +1754,7 @@ pub(crate) struct SceneSound {
 fn start_scene_sound(
     dir: &Path,
     obj: &crate::engine::model::scene::SceneObject,
-) -> Option<crate::engine::audio::SoundPlayback> {
+) -> Option<crate::services::audio::SoundPlayback> {
     let sound = obj.sound.as_ref()?;
     let start_silent = obj
         .startsilent
@@ -1780,7 +1780,7 @@ fn start_scene_sound(
         _ => Vec::new(),
     };
     files.into_iter().find_map(|f| {
-        crate::engine::audio::SoundPlayback::start(&dir.join(&f), volume, looping, !start_silent)
+        crate::services::audio::SoundPlayback::start(&dir.join(&f), volume, looping, !start_silent)
     })
 }
 
@@ -1878,7 +1878,7 @@ pub struct GpuSceneInstance {
     /// Desktop-audio capture, started only when an effect reads
     /// `g_AudioSpectrum*` (else `None` and the spectrum stays silent). Polled
     /// once per frame into the renderer's `audio_buf`.
-    audio_capture: Option<crate::engine::audio::AudioCapture>,
+    audio_capture: Option<crate::services::audio::AudioCapture>,
     /// Live playback streams for `sound` objects; kept alive for the scene's
     /// lifetime (dropping stops the audio).
     sounds: Vec<SceneSound>,
@@ -2463,7 +2463,7 @@ impl GpuSceneInstance {
         let uses_audio =
             particles_use_audio || effect_runtimes.iter().flatten().any(|r| r.uses_audio);
         let audio_capture = if uses_audio {
-            crate::engine::audio::AudioCapture::start()
+            crate::services::audio::AudioCapture::start()
         } else {
             None
         };
@@ -3580,7 +3580,7 @@ impl GpuSceneInstance {
         if !self.scripts_want_audio && self.scripts.wants_audio() {
             self.scripts_want_audio = true;
             if self.audio_capture.is_none() {
-                self.audio_capture = crate::engine::audio::AudioCapture::start();
+                self.audio_capture = crate::services::audio::AudioCapture::start();
             }
         }
     }
@@ -4046,7 +4046,7 @@ impl GpuSceneInstance {
     }
 
     /// Sound controls belonging to scene object `index`.
-    fn sounds_of(&self, index: usize) -> Vec<std::sync::Arc<crate::engine::audio::SoundControl>> {
+    fn sounds_of(&self, index: usize) -> Vec<std::sync::Arc<crate::services::audio::SoundControl>> {
         self.sounds
             .iter()
             .filter(|s| s.object == index)
