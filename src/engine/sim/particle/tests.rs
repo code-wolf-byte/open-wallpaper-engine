@@ -90,7 +90,7 @@ fn instance_override_count_lifetime_colorn() {
 }
 
 /// `enabled: false` in an instanceoverride must drop the whole system at
-/// the layer level (checked in render.rs/animated.rs, config-level here).
+/// the layer level (checked in model::resolve/cpu::animated, config-level here).
 #[test]
 fn instance_override_enabled_parses() {
     let o: InstanceOverride =
