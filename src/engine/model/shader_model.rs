@@ -2,7 +2,7 @@
 //   regex dep removed → ComboAnnotation::parse_combos uses manual serde_json parse
 //   UniformDefault::from_json String branch uses bounds-safe .get() indexing
 //   from_resolved_glsl wraps Option<serde_json::Value> correctly
-use crate::engine::shaders::uniform_meta::parse_uniform_metadata;
+use crate::engine::gpu::shaders::uniform_meta::parse_uniform_metadata;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]

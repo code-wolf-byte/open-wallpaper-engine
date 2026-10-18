@@ -22,13 +22,13 @@ use std::time::{Duration, Instant};
 
 use crate::engine::camera_dynamics::{CameraDynamics, CameraFrameDynamics};
 use crate::engine::gpu::fbo::RenderTargetPool;
+use crate::engine::gpu::shaders::{effect_def, loader, resolver, transpiler};
 use crate::engine::model::{ShaderModel, WEBlending};
 use crate::engine::particle;
 use crate::engine::scene::{parse_value_bool, parse_value_f32};
-use crate::engine::shaders::{effect_def, loader, resolver, transpiler};
 use crate::platform::GpuDevice;
 
-const SHADER_SRC: &str = include_str!("../shaders/gpu_shaders.wgsl");
+const SHADER_SRC: &str = include_str!("../gpu/shaders/gpu_shaders.wgsl");
 
 /// Per-layer ping-pong buffer key in the FBO pool (each layer's effect chain
 /// gets its own pair, sized to that layer's object size).
@@ -5823,7 +5823,7 @@ fn load_effect_instance(
         // washes over the whole layer instead of being confined to the mask
         // (e.g. nitro.frag's `#if MASK` block silently compiling out).
         let sampler_combos: Vec<Option<String>> =
-            crate::engine::shaders::uniform_meta::parse_uniform_metadata(&frag_glsl)
+            crate::engine::gpu::shaders::uniform_meta::parse_uniform_metadata(&frag_glsl)
                 .into_iter()
                 .filter(|m| m.uniform_type == "sampler2D")
                 .map(|m| m.combo)

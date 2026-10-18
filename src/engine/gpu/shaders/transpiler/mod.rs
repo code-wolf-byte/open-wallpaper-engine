@@ -782,7 +782,7 @@ pub fn translate_full(model: &ShaderModel, vert_glsl: Option<&str>) -> Result<Tr
     let mut annotated: std::collections::HashMap<String, (String, Option<String>, [f32; 4])> =
         std::collections::HashMap::new();
     if let Some(v) = vert_glsl {
-        for meta in crate::engine::shaders::uniform_meta::parse_uniform_metadata(v) {
+        for meta in crate::engine::gpu::shaders::uniform_meta::parse_uniform_metadata(v) {
             annotated.insert(
                 meta.uniform_name.clone(),
                 (
