@@ -12,7 +12,7 @@ use crate::engine::model::scene::SceneObject;
 use crate::engine::sim::particle::{
     InstanceOverride, ParticleConfig, ParticleSprite, ParticleSystem,
 };
-use crate::engine::tex::TexFile;
+use crate::formats::tex::TexFile;
 
 struct SceneAnimState {
     /// Paired with each layer's `order_index` (its position in
