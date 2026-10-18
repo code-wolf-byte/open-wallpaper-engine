@@ -1,20 +1,21 @@
-//! Wallpaper Engine scene rendering engine.
+//! The scene engine: turns a Wallpaper Engine scene into frames.
 //!
-//! The production live-render path is [`gpu_renderer::GpuSceneInstance`]; the
-//! backend-neutral [`graph::SceneGraph`] feeds the CPU compositor and
-//! diagnostics.
+//! - [`model`]: what the scene is — `scene.json` types, resolving them into
+//!   layers, materials and shader metadata, static meshes
+//! - [`sim`]: what changes over time — particles, timelines, SceneScript,
+//!   camera motion, puppet animation
+//! - [`gpu`]: how it is drawn — the renderer
+//!   ([`gpu::renderer::GpuSceneInstance`] is the live path), render targets,
+//!   blending, lighting, shadows, text, and the GLSL→WGSL shader pipeline
+//! - [`cpu`]: the CPU fallback renderer, used when the GPU path can't start
+//!
+//! File formats live in [`crate::formats`], user properties in
+//! [`crate::workshop::properties`].
 
 pub mod cpu;
 pub mod gpu;
 pub mod model;
 pub mod sim;
 
-// Convenience re-exports.
-pub use crate::engine::cpu::graph::SceneGraph;
-pub use crate::engine::gpu::fbo::{RenderTarget, RenderTargetPool};
-pub use crate::engine::model::resolve::ResolvedScene;
-pub use crate::engine::model::scene::Scene;
-pub use crate::engine::sim::camera_dynamics::{CameraDynamics, CameraFrameDynamics};
-pub use crate::formats::pkg::Package;
-pub use crate::formats::tex::TexFile;
-pub use crate::workshop::properties::SceneProperties;
+pub use cpu::graph::SceneGraph;
+pub use model::resolve::ResolvedScene;
