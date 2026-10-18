@@ -55,7 +55,7 @@ fn disablepropagation_severs_transform_inheritance() {
 }
 
 /// The object-attachment API's `thisLayer.disablepropagation()` (see
-/// `engine::script::OBJECT_ATTACHMENT_API_JS`) is this same
+/// `engine::sim::script::OBJECT_ATTACHMENT_API_JS`) is this same
 /// `disablepropagation` rule, just evaluated live per-frame instead of
 /// baked once from scene.json — `TransformGraph::world`'s `disabled`
 /// slice must sever object `i`'s *own* inheritance from its parent
