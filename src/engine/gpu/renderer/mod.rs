@@ -6654,7 +6654,7 @@ struct TimelineEntry {
     key: String,
     /// Base value, which transform keyframes are offsets from.
     base: Vec<f32>,
-    anim: crate::engine::timeline::PropertyAnimation,
+    anim: crate::engine::sim::timeline::PropertyAnimation,
     /// Last value applied, to skip re-applying an idle animation.
     last: Option<Vec<f32>>,
 }
@@ -6664,7 +6664,7 @@ fn build_timelines(
     raw_scene: &serde_json::Value,
     graph: &crate::engine::render::TransformGraph,
 ) -> Vec<TimelineEntry> {
-    use crate::engine::timeline::PropertyAnimation;
+    use crate::engine::sim::timeline::PropertyAnimation;
     let mut out = Vec::new();
     let objects = raw_scene.get("objects").and_then(|o| o.as_array());
     for (i, raw) in objects.into_iter().flatten().enumerate() {
