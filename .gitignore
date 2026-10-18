@@ -34,3 +34,6 @@ CLAUDE.md
 cpp-implementation/
 scratchpad/
 .cargo/
+
+# Release archives (scripts/release.sh)
+dist/
