@@ -252,7 +252,7 @@ fn main() {
     // binary with `--type=...`. That must be handled before anything else —
     // before clap, which would reject the flag, and before any thread starts.
     // Returns `Some` only in a child process, which must then exit at once.
-    if let Some(code) = wp_engine::render::web::subprocess_main() {
+    if let Some(code) = wp_engine::content::web::subprocess_main() {
         std::process::exit(code);
     }
 
@@ -684,14 +684,14 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
             println!("While {condition}: {}", a.label());
         }
         ConfigAction::SetScaling { mode } => {
-            let m = wp_engine::render::ScaleMode::parse(&mode).ok_or_else(|| {
+            let m = wp_engine::content::ScaleMode::parse(&mode).ok_or_else(|| {
                 anyhow!("invalid mode '{mode}' (expected fill, fit, stretch or center)")
             })?;
             settings.scaling = Some(m);
             println!("Scaling: {}", m.label());
         }
         ConfigAction::SetLayout { layout } => {
-            let l = wp_engine::render::ScreenLayout::parse(&layout).ok_or_else(|| {
+            let l = wp_engine::content::ScreenLayout::parse(&layout).ok_or_else(|| {
                 anyhow!("invalid layout '{layout}' (expected per-screen, span or clone)")
             })?;
             settings.layout = Some(l);
@@ -761,13 +761,13 @@ fn cmd_autostart(state: &str) -> Result<()> {
 
 fn resolve_scene_dir(id_or_path: &str) -> Result<PathBuf> {
     let dir = resolve_id_or_path(id_or_path)?;
-    wp_engine::render::WallpaperContent::preset_base_dir(&dir)
+    wp_engine::content::WallpaperContent::preset_base_dir(&dir)
 }
 
 /// Runs using persisted settings (`wp-engine config` to set them up first):
 /// every `screens` entry gets its own independent wallpaper *and* its own
 /// independent render quality on its own output (real per-screen rendering
-/// — see `render::ScreenContent`/`render::ScreenSettings`); any output with
+/// — see `content::ScreenContent`/`content::ScreenSettings`); any output with
 /// no specific entry falls back to the first configured screen's wallpaper,
 /// else `default_background`, else the first playlist's first item.
 ///
@@ -828,7 +828,7 @@ fn cmd_run(foreground: bool) -> Result<()> {
                     println!(" (quality: {})", q.label());
                     context.screen_settings.insert(
                         screen.clone(),
-                        Arc::new(Mutex::new(wp_engine::render::RenderSettings {
+                        Arc::new(Mutex::new(wp_engine::content::RenderSettings {
                             quality: q,
                             fps: context.settings.lock().unwrap().fps,
                             ..Default::default()
@@ -1150,10 +1150,10 @@ fn cmd_render_frame(
             .collect(),
     );
     let path = resolve_id_or_path(id_or_path)?;
-    let content = wp_engine::render::WallpaperContent::from_any_path(&path)?;
-    let mut source = wp_engine::render::FrameSource::from_content_with(
+    let content = wp_engine::content::WallpaperContent::from_any_path(&path)?;
+    let mut source = wp_engine::content::FrameSource::from_content_with(
         content,
-        wp_engine::render::web::WebOptions { size, fps },
+        wp_engine::content::web::WebOptions { size, fps },
     )?;
     let until = std::time::Instant::now() + std::time::Duration::from_secs_f32(seconds.max(0.0));
     while std::time::Instant::now() < until {
