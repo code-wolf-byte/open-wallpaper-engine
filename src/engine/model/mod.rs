@@ -1,4 +1,5 @@
 pub mod dynamic_value;
+pub mod mesh3d;
 pub mod objects;
 pub mod parser;
 pub mod property;
