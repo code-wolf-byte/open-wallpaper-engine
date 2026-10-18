@@ -109,7 +109,7 @@ impl FrameSource {
                 let audio = crate::services::audio::StreamingAudio::start(&path);
 
                 thread::spawn(move || {
-                    if let Err(e) = super::ffmpeg::video_decode_loop(&path, &tx) {
+                    if let Err(e) = crate::content::video::video_decode_loop(&path, &tx) {
                         tracing::error!(target: "video", "video decoder error for '{}': {e}", path.display());
                     }
                 });
