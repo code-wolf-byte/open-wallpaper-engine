@@ -1,3 +1,14 @@
+//! Wallpaper Engine particle systems: a [`ParticleSystem`] built from a
+//! [`ParticleConfig`], stepped every frame, and drawn on the CPU or handed to
+//! the GPU renderer as vertices.
+//!
+//! This file holds the runtime state types; the rest is split by role:
+//! - `config`: the JSON config types and value-parsing helpers
+//! - `build`: reading a config into a system
+//! - `step`: the per-frame simulation and its inputs
+//! - `operators`: operator parameters and their math
+//! - `draw`: CPU drawing, rope geometry, GPU vertices
+
 use image::RgbaImage;
 use serde::Deserialize;
 
