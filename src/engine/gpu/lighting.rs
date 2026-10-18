@@ -28,7 +28,7 @@
 //!
 //! Both shadow-cascade mixing and the spot-light cookie texture lookup this
 //! comment used to list here have since been wired in on the GPU side —
-//! `engine::shadow`/`mesh3d_shadow_factor` in `gpu_shaders.wgsl` for
+//! `engine::gpu::shadow`/`mesh3d_shadow_factor` in `gpu_shaders.wgsl` for
 //! shadows, `mesh3d_cookie_factor` for the cookie — because both need a
 //! real depth/color texture sampler this pure-CPU-math module intentionally
 //! doesn't have. `shadow_factor` stays a plain parameter here for the same
@@ -542,7 +542,7 @@ pub enum Light {
         radius: f32,
         /// The raw `outercone` half-angle in degrees — kept alongside the
         /// already-derived Phong `exponent` because the shadow-atlas
-        /// projection (`engine::shadow::spot_light_view_proj`) needs the
+        /// projection (`engine::gpu::shadow::spot_light_view_proj`) needs the
         /// actual cone width for its frustum FOV, and recovering it by
         /// inverting `exponent`'s formula would be lossy at the exponent's
         /// clamp bounds.
