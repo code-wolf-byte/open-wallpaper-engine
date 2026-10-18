@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 mod config;
+mod properties;
 
 // ── Layout ────────────────────────────────────────────────────────────────────
 
@@ -137,7 +138,7 @@ pub struct WpApp {
 
     /// `settings.json`, edited by the property editor and settings window.
     saved: crate::settings::WpSettings,
-    prop_editor: Option<config::PropertyEditor>,
+    prop_editor: Option<properties::PropertyEditor>,
     show_settings: bool,
     settings_tab: config::SettingsTab,
     show_displays: bool,
