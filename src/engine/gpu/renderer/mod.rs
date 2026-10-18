@@ -1647,14 +1647,15 @@ struct SceneLayerGpu {
     /// Embedded-video stream — `frames[0]` is replaced with the newest
     /// decoded frame each tick (the decoder thread paces itself by PTS;
     /// draining to the latest frame drops rather than lags).
-    video: Option<std::sync::Arc<std::sync::Mutex<crate::engine::render::VideoLayerStream>>>,
+    video:
+        Option<std::sync::Arc<std::sync::Mutex<crate::engine::model::resolve::VideoLayerStream>>>,
     blend_mode: u32,
     /// Live alpha; SceneScript may change it per frame.
     alpha: f32,
     /// Script-driven text: re-evaluated each tick; when the output string
     /// changes, `frames[0]` is re-rasterized and `rect` re-derived (clocks
     /// tick, dates roll over — 42 of the corpus's 58 script wallpapers).
-    text_dynamic: Option<crate::engine::render::TextDynamic>,
+    text_dynamic: Option<crate::engine::model::resolve::TextDynamic>,
     color: [f32; 3],
     brightness: f32,
     frame_duration_ms: u32,
@@ -1690,7 +1691,7 @@ struct SceneLayerGpu {
     text_raster_cost: Duration,
     /// Composition/fullscreen layer: `frames[0]` is refilled each frame
     /// with the scene drawn beneath it (see `capture_backdrop`).
-    backdrop: Option<crate::engine::render::Backdrop>,
+    backdrop: Option<crate::engine::model::resolve::Backdrop>,
     /// Spritesheet frame a script picked (`getTextureAnimation().setFrame`),
     /// overriding the timed animation.
     script_frame: Option<usize>,
@@ -1922,7 +1923,7 @@ pub struct GpuSceneInstance {
     /// mesh's MVP and each layer's projected rect.
     camera3d: Option<crate::engine::sim::camera3d::PerspectiveCamera>,
     /// Parent chain per object, for recomposing transforms scripts change.
-    transform_graph: crate::engine::render::TransformGraph,
+    transform_graph: crate::engine::model::resolve::TransformGraph,
     /// `general.zoom`, retained because the per-frame parent recompose rebuilds
     /// orthographic rects and has to apply the same scene-wide scale the build
     /// path does.
@@ -1931,7 +1932,7 @@ pub struct GpuSceneInstance {
     /// `update(value)` is handed the CURRENT value, so a script written as
     /// `value.y += ...` accumulates — resetting to the authored value each
     /// frame turns continuous rotation into jitter in place.
-    current_locals: Vec<crate::engine::render::Xform>,
+    current_locals: Vec<crate::engine::model::resolve::Xform>,
 }
 
 /// One static 3D mesh, uploaded once: geometry never changes, and its MVP is
@@ -2329,7 +2330,7 @@ impl GpuSceneInstance {
     }
 
     fn build(mut renderer: GpuSceneRenderer, dir: &Path) -> Result<Self> {
-        let resolved = crate::engine::render::ResolvedScene::from_directory(dir)?;
+        let resolved = crate::engine::model::resolve::ResolvedScene::from_directory(dir)?;
         // The unparsed scene.json: scripts and timelines read fields the
         // typed model drops.
         let raw_scene: serde_json::Value = crate::engine::assets::AssetStore::from_directory(dir)
@@ -2739,8 +2740,11 @@ impl GpuSceneInstance {
                     else {
                         return None;
                     };
-                    let image =
-                        crate::engine::render::resolve_static_texture(Some(dir), None, path)?;
+                    let image = crate::engine::model::resolve::resolve_static_texture(
+                        Some(dir),
+                        None,
+                        path,
+                    )?;
                     let vp = crate::engine::gpu::shadow::spot_light_view_proj(
                         *origin,
                         *direction,
@@ -3072,7 +3076,7 @@ impl GpuSceneInstance {
     /// and the per-slot `(view_proj, uv_rect)` data for `mesh3d_lighting_bytes`.
     fn build_shadow_atlas(
         renderer: &GpuSceneRenderer,
-        mesh3d_layers: &[crate::engine::render::Mesh3dLayer],
+        mesh3d_layers: &[crate::engine::model::resolve::Mesh3dLayer],
         lights: &[(
             crate::engine::gpu::lighting::Light,
             bool,
@@ -3305,7 +3309,7 @@ impl GpuSceneInstance {
     fn build_mesh3d(
         renderer: &GpuSceneRenderer,
         cam: &crate::engine::sim::camera3d::PerspectiveCamera,
-        layer: &crate::engine::render::Mesh3dLayer,
+        layer: &crate::engine::model::resolve::Mesh3dLayer,
         lighting_ubo: &wgpu::Buffer,
         shadow_atlas_view: &wgpu::TextureView,
         cookie_view: &wgpu::TextureView,
@@ -3972,7 +3976,7 @@ impl GpuSceneInstance {
     /// scene.json-shaped config. Image, solid and text objects only; their
     /// effects are not instantiated.
     fn create_object(&mut self, index: usize, config: &serde_json::Value) {
-        use crate::engine::render::Xform;
+        use crate::engine::model::resolve::Xform;
         // Keep every per-object table indexed in step with the script side,
         // even when this object can't be built.
         let n = index + 1;
@@ -4008,14 +4012,16 @@ impl GpuSceneInstance {
             self.scene_pkg =
                 crate::engine::pkg::Package::from_file(&self.scene_dir.join("scene.pkg")).ok();
         }
-        let Some(mut layer) =
-            crate::engine::render::runtime_layer(&self.scene_dir, self.scene_pkg.as_ref(), &obj)
-        else {
+        let Some(mut layer) = crate::engine::model::resolve::runtime_layer(
+            &self.scene_dir,
+            self.scene_pkg.as_ref(),
+            &obj,
+        ) else {
             tracing::debug!(target: "script", "createLayer: object {index} has nothing to draw");
             return;
         };
         layer.order_index = index;
-        let local = crate::engine::render::obj_local_xform(&obj);
+        let local = crate::engine::model::resolve::obj_local_xform(&obj);
         self.current_locals[index] = local;
         self.transform_graph.local[index] = local;
         self.transform_graph.name[index] = obj.name.clone();
@@ -4123,7 +4129,7 @@ impl GpuSceneInstance {
     /// the layers and meshes they move: those whose own object or any
     /// ancestor `moved`.
     fn apply_object_transforms(&mut self, moved: &[bool]) {
-        use crate::engine::render::Xform;
+        use crate::engine::model::resolve::Xform;
         let n = self.current_locals.len();
         let parent = self.transform_graph.parent.clone();
         // affected[i]: object i or an ancestor moved.
@@ -6522,7 +6528,7 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
 /// the object's scene.json origin, before alignment.
 fn gpu_layer_from(
     renderer: &GpuSceneRenderer,
-    l: &crate::engine::render::Layer,
+    l: &crate::engine::model::resolve::Layer,
     w: u32,
     h: u32,
     zoom: f32,
@@ -6666,7 +6672,7 @@ struct TimelineEntry {
 /// Collect every animated property from the raw scene.json objects.
 fn build_timelines(
     raw_scene: &serde_json::Value,
-    graph: &crate::engine::render::TransformGraph,
+    graph: &crate::engine::model::resolve::TransformGraph,
 ) -> Vec<TimelineEntry> {
     use crate::engine::sim::timeline::PropertyAnimation;
     let mut out = Vec::new();
@@ -6710,7 +6716,7 @@ fn build_timelines(
                 .local
                 .get(i)
                 .copied()
-                .unwrap_or(crate::engine::render::Xform::IDENTITY);
+                .unwrap_or(crate::engine::model::resolve::Xform::IDENTITY);
             let base: Vec<f32> = match key.as_str() {
                 "origin" => local.t.iter().map(|v| *v as f32).collect(),
                 "scale" => local.s.iter().map(|v| *v as f32).collect(),
@@ -6735,7 +6741,7 @@ fn build_timelines(
 fn build_script_host(
     dir: &Path,
     scene: &crate::engine::model::scene::Scene,
-    graph: &crate::engine::render::TransformGraph,
+    graph: &crate::engine::model::resolve::TransformGraph,
     canvas: [u32; 2],
     raw_scene: &serde_json::Value,
 ) -> crate::engine::sim::script::ScriptHost {
@@ -6776,7 +6782,7 @@ fn build_script_host(
             .local
             .get(i)
             .copied()
-            .unwrap_or(crate::engine::render::Xform::IDENTITY);
+            .unwrap_or(crate::engine::model::resolve::Xform::IDENTITY);
         let text = obj.text.as_ref().and_then(|t| match t {
             serde_json::Value::String(s) => Some(s.clone()),
             serde_json::Value::Object(m) => {
