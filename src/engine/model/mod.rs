@@ -3,6 +3,7 @@ pub mod mesh3d;
 pub mod objects;
 pub mod parser;
 pub mod property;
+pub mod resolve;
 pub mod scene;
 pub mod shader_model;
 
