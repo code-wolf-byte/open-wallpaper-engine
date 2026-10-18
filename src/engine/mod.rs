@@ -6,8 +6,6 @@
 
 pub mod cpu;
 pub mod gpu;
-#[cfg(target_os = "linux")]
-pub mod media;
 pub mod model;
 pub mod playback_gate;
 pub mod properties;
