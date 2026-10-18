@@ -1,3 +1,14 @@
+//! Resolving a scene: `scene.json` (with user properties applied) becomes a
+//! [`ResolvedScene`] of drawable layers with their textures loaded.
+//!
+//! - `layers`: building image, particle, text, mesh, light and backdrop
+//!   layers from scene objects
+//! - `textures`: loading textures from the folder, `scene.pkg` and shared
+//!   assets, and streaming embedded video
+//! - `transform`: object transforms and the parent chain
+//!
+//! The CPU compositor that draws a `ResolvedScene` is `engine::cpu::compose`.
+
 use anyhow::{Context, Result};
 use image::RgbaImage;
 use std::collections::HashMap;
