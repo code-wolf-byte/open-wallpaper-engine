@@ -43,7 +43,7 @@ pub struct ResolvedScene {
 }
 
 /// A scene object whose `model` field references a static 3D mesh. Rendered as
-/// real geometry through the perspective camera (see `engine::mesh3d`), not as
+/// real geometry through the perspective camera (see `engine::model::mesh3d`), not as
 /// a flat quad — spheres, skyboxes and cylinders can't be billboarded.
 pub struct Mesh3dLayer {
     pub name: String,
@@ -1345,7 +1345,7 @@ fn extract_text_string(v: &serde_json::Value) -> Option<String> {
 }
 
 /// Build a text object's rendered bitmap as a normal `Layer` (see
-/// `engine::text` module docs for why: no scripting engine means text never
+/// `engine::gpu::text` module docs for why: no scripting engine means text never
 /// changes after this one rasterization, so it can reuse 100% of the
 /// existing image-layer pipeline in both render paths for free).
 fn text_layer_from_object(
@@ -1838,7 +1838,7 @@ fn load_texture_from_pkg(pkg: &Package, image_path: &str) -> Result<LoadedImage>
 /// Resolve a bare texture-reference path (same rules as any other material
 /// texture reference — loose file under `dir`, `.tex` fallback, then `pkg`)
 /// to a decoded image, or `None` if it doesn't resolve. Used by
-/// `GpuSceneInstance::build` (gpu_renderer.rs) to load a spot light's
+/// `GpuSceneInstance::build` (gpu::renderer) to load a spot light's
 /// `cookie` texture without duplicating `load_texture_from_dir`/
 /// `load_texture_from_pkg`'s resolution logic.
 pub(crate) fn resolve_static_texture(
@@ -2092,7 +2092,7 @@ fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<LoadedImage> {
 
 /// If the model JSON names a `"puppet"` mesh, its texture is a packed UV
 /// atlas — reassemble it by rasterizing the rest-pose mesh (see
-/// `engine::puppet`), and keep the parsed model + atlas around as a
+/// `engine::sim::puppet`), and keep the parsed model + atlas around as a
 /// `PuppetRuntime` so the live render loop can re-pose it over time when
 /// the model carries MDLA animations. On any parse failure the decoded
 /// texture passes through unchanged, so a malformed .mdl degrades to the
