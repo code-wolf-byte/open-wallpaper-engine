@@ -1837,7 +1837,7 @@ pub struct GpuSceneInstance {
     mouse_norm: [f32; 2],
     /// The scene's SceneScript runtime, ticked once per frame. Lives here (on
     /// the render thread) because boa's `Context` is `!Send`.
-    scripts: crate::engine::script::ScriptHost,
+    scripts: crate::engine::sim::script::ScriptHost,
     /// What live user-property edits diff against.
     live_props: LiveProps,
     /// Per-object visibility as scripts leave it, indexed like `scene.objects`
@@ -2914,7 +2914,7 @@ impl GpuSceneInstance {
         instance.effect_enabled = vec![true; instance.scene_effects.len()];
         instance.cursor_targets = instance
             .scripts
-            .objects_with_handlers(crate::engine::script::CURSOR_EVENTS);
+            .objects_with_handlers(crate::engine::sim::script::CURSOR_EVENTS);
         Ok(instance)
     }
 
@@ -3431,7 +3431,7 @@ impl GpuSceneInstance {
 
     /// Advance keyframe animations and apply the properties they move.
     fn tick_timelines(&mut self, delta: f32) {
-        use crate::engine::script::{ObjectChange, ScriptChanges};
+        use crate::engine::sim::script::{ObjectChange, ScriptChanges};
         if self.timelines.is_empty() {
             return;
         }
@@ -3566,7 +3566,7 @@ impl GpuSceneInstance {
         );
         self.dispatch_cursor_events();
         self.scripts
-            .frame(time, crate::engine::script::local_time_of_day(), delta);
+            .frame(time, crate::engine::sim::script::local_time_of_day(), delta);
         let changes = self.scripts.collect();
         self.apply_script_changes(changes);
         self.flush_text();
@@ -3663,8 +3663,8 @@ impl GpuSceneInstance {
 
     /// Apply a frame's script changes: transforms recompose through the
     /// parent graph, everything else lands on the object's layers and sounds.
-    fn apply_script_changes(&mut self, changes: crate::engine::script::ScriptChanges) {
-        use crate::engine::script::ScriptCommand;
+    fn apply_script_changes(&mut self, changes: crate::engine::sim::script::ScriptChanges) {
+        use crate::engine::sim::script::ScriptCommand;
         let n = self.current_locals.len();
         let mut moved = vec![false; n];
         let mut visibility_changed = false;
@@ -3831,7 +3831,7 @@ impl GpuSceneInstance {
             if diffs.is_empty() {
                 continue;
             }
-            let mut change = crate::engine::script::ObjectChange::default();
+            let mut change = crate::engine::sim::script::ObjectChange::default();
             for (path, v) in &diffs {
                 if self.live_change(i, path, v, &mut change).is_none() {
                     tracing::debug!(target: "properties", "object {i}: {} needs a reload", path.join("."));
@@ -3840,7 +3840,7 @@ impl GpuSceneInstance {
             }
             objects.push((i, change));
         }
-        self.apply_script_changes(crate::engine::script::ScriptChanges {
+        self.apply_script_changes(crate::engine::sim::script::ScriptChanges {
             objects,
             commands: Vec::new(),
         });
@@ -3856,7 +3856,7 @@ impl GpuSceneInstance {
         object: usize,
         path: &[String],
         v: &serde_json::Value,
-        c: &mut crate::engine::script::ObjectChange,
+        c: &mut crate::engine::sim::script::ObjectChange,
     ) -> Option<()> {
         use crate::engine::scene::{parse_value_bool, parse_value_f32, parse_value_vec3};
         // `{"user": …, "value": X}` bindings resolve to their `value`.
@@ -5492,7 +5492,7 @@ fn named_fbo_key(instance_idx: usize, fbo_name: &str) -> String {
 /// Fraction of the local day in [0,1) (the reference's g_Daytime).
 /// `g_Daytime`: fraction of the local day elapsed.
 fn daytime_fraction() -> f32 {
-    crate::engine::script::local_time_of_day()
+    crate::engine::sim::script::local_time_of_day()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6737,9 +6737,9 @@ fn build_script_host(
     graph: &crate::engine::render::TransformGraph,
     canvas: [u32; 2],
     raw_scene: &serde_json::Value,
-) -> crate::engine::script::ScriptHost {
+) -> crate::engine::sim::script::ScriptHost {
     use crate::engine::scene::{parse_value_f32, parse_value_vec3};
-    use crate::engine::script::{ObjectInit, ScriptHost};
+    use crate::engine::sim::script::{ObjectInit, ScriptHost};
 
     let mut host = ScriptHost::new();
     if scene.objects.iter().all(|o| o.scripts().is_empty()) {
@@ -6837,7 +6837,7 @@ fn build_script_host(
             ("volume", obj.volume.as_ref()),
         ];
         for (prop, value) in props {
-            if let Some((script, authored)) = crate::engine::script::scripted(value) {
+            if let Some((script, authored)) = crate::engine::sim::script::scripted(value) {
                 host.attach(i, Some(prop), script, authored);
             }
         }
@@ -6873,7 +6873,7 @@ fn build_script_host(
             }
         }
         for (key, value) in extras {
-            if let Some((script, authored)) = crate::engine::script::scripted(Some(value)) {
+            if let Some((script, authored)) = crate::engine::sim::script::scripted(Some(value)) {
                 let initial = value
                     .get("value")
                     .cloned()
@@ -6881,7 +6881,7 @@ fn build_script_host(
                 host.declare_property(
                     i,
                     &key,
-                    crate::engine::script::value_kind(&initial),
+                    crate::engine::sim::script::value_kind(&initial),
                     &initial,
                 );
                 host.attach(i, Some(&key), script, authored);

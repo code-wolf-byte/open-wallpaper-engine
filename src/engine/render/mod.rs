@@ -871,13 +871,13 @@ fn select_spritesheet_frame(obj: &SceneObject, loaded: &mut LoadedImage) {
         .and_then(|v| v.get("script"))
         .and_then(|s| s.as_str())
         .and_then(|script| {
-            let init = crate::engine::script::ObjectInit {
+            let init = crate::engine::sim::script::ObjectInit {
                 visible: true,
                 alpha: 1.0,
                 frame_count: loaded.sprite_frames.len() as u32,
                 ..Default::default()
             };
-            crate::engine::script::evaluate_once("visible", script, &init, None).frame
+            crate::engine::sim::script::evaluate_once("visible", script, &init, None).frame
         })
         .unwrap_or(0)
         .min(loaded.sprite_frames.len() as u32 - 1);
@@ -1368,7 +1368,7 @@ fn text_layer_from_object(
         (Some(script), _) => {
             // One-shot load-time evaluation so the layer rasterizes real
             // content (and sizes itself correctly) from frame 0.
-            let init = crate::engine::script::ObjectInit {
+            let init = crate::engine::sim::script::ObjectInit {
                 name: obj.name.clone(),
                 id: obj.id,
                 visible: true,
@@ -1376,10 +1376,15 @@ fn text_layer_from_object(
                 text: Some(static_str.clone()),
                 ..Default::default()
             };
-            crate::engine::script::evaluate_once("text", script, &init, script_properties.as_ref())
-                .text
-                .filter(|t| !t.is_empty())
-                .unwrap_or(static_str)
+            crate::engine::sim::script::evaluate_once(
+                "text",
+                script,
+                &init,
+                script_properties.as_ref(),
+            )
+            .text
+            .filter(|t| !t.is_empty())
+            .unwrap_or(static_str)
         }
         (None, false) => static_str,
         (None, true) => return None,
