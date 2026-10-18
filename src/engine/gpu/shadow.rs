@@ -15,8 +15,8 @@
 //! though WE likely warps that projection (dual-paraboloid or similar) for
 //! wider-than-hemisphere coverage, which this doesn't attempt to replicate.
 
-use crate::audio::model::resolve::Mesh3dLayer;
-use crate::audio::sim::camera3d::{self, Mat4};
+use crate::engine::model::resolve::Mesh3dLayer;
+use crate::engine::sim::camera3d::{self, Mat4};
 
 /// Fixed per-light shadow-map tile size. See module docs: WE's real tile
 /// size is a per-light heuristic not recovered from the binary.

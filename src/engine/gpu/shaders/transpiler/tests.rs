@@ -65,11 +65,11 @@ fn real_godrays_effect_transpiles_through_generic_pipeline() {
             .iter()
             .map(|(k, v)| (k.to_string(), *v))
             .collect();
-        let model = crate::audio::model::ShaderModel::from_resolved_glsl(
+        let model = crate::engine::model::ShaderModel::from_resolved_glsl(
             label.to_string(),
             frag_glsl,
             combos,
-            crate::audio::model::WEBlending::Normal,
+            crate::engine::model::WEBlending::Normal,
         );
         if let Err(e) = translate_full(&model, Some(&vert_glsl)) {
             failures.push(format!("{label}: {e:#}"));
@@ -531,7 +531,7 @@ fn pow_scalar_broadcast_translates() {
         "pow_test".to_string(),
         src.to_string(),
         HashMap::new(),
-        crate::audio::model::shader_model::WEBlending::Normal,
+        crate::engine::model::shader_model::WEBlending::Normal,
     );
     translate(&model).expect("pow(vec3, float) should translate via _wp_pow shims");
 }
@@ -625,7 +625,7 @@ fn audio_spectrum_becomes_live_uniform() {
         "audio_test".to_string(),
         src.to_string(),
         HashMap::new(),
-        crate::audio::model::shader_model::WEBlending::Normal,
+        crate::engine::model::shader_model::WEBlending::Normal,
     );
     let t = translate(&model).expect("audio spectrum shader should translate");
     assert!(

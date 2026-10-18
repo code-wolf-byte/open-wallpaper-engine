@@ -1,4 +1,4 @@
-use wp_engine::audio::cpu::effect::{HandwrittenEffectFallback, SceneEffect};
+use wp_engine::engine::cpu::effect::{HandwrittenEffectFallback, SceneEffect};
 
 #[test]
 fn recognizes_scroll_and_spin_fallbacks() {

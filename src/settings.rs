@@ -53,7 +53,7 @@ pub struct WpSettings {
     /// What happens while another application is focused, maximized,
     /// fullscreen or playing audio, on battery, or while locked.
     #[serde(default)]
-    pub playback: crate::audio::playback_gate::PlaybackPolicy,
+    pub playback: crate::engine::playback_gate::PlaybackPolicy,
     /// Frame-rate cap for animated wallpapers; `None` = the default (30).
     #[serde(default)]
     pub fps: Option<u32>,

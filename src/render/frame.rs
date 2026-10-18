@@ -25,7 +25,7 @@ pub enum FrameSource {
         /// same variant but have no page to receive input.
         web_input: Option<SyncSender<super::web::WebInputEvent>>,
         /// A video's soundtrack, playing while this source lives.
-        audio: Option<crate::audio::audio::StreamingAudio>,
+        audio: Option<crate::engine::audio::StreamingAudio>,
     },
 }
 
@@ -52,13 +52,13 @@ impl FrameSource {
 
                 thread::spawn(move || {
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::audio::gpu::renderer::gpu_scene_render_loop(&dir, &tx, target_fps)
+                        crate::engine::gpu::renderer::gpu_scene_render_loop(&dir, &tx, target_fps)
                     }));
                     match r {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
                             tracing::warn!(target: "render", "GPU scene render failed, falling back to CPU: {e}");
-                            if let Err(e2) = crate::audio::cpu::animated::scene_render_loop(
+                            if let Err(e2) = crate::engine::cpu::animated::scene_render_loop(
                                 &dir, &tx, target_fps,
                             ) {
                                 tracing::error!(target: "render", "CPU scene render error: {e2}");
@@ -71,7 +71,7 @@ impl FrameSource {
                                 .or_else(|| panic_val.downcast_ref::<&str>().map(|s| s.to_string()))
                                 .unwrap_or_else(|| "(unknown panic)".into());
                             tracing::error!(target: "render", "GPU render thread panicked: {msg} — falling back to CPU");
-                            if let Err(e2) = crate::audio::cpu::animated::scene_render_loop(
+                            if let Err(e2) = crate::engine::cpu::animated::scene_render_loop(
                                 &dir, &tx, target_fps,
                             ) {
                                 tracing::error!(target: "render", "CPU scene render error: {e2}");
@@ -106,7 +106,7 @@ impl FrameSource {
             }
             WallpaperContent::Video { path } => {
                 let (tx, rx) = sync_channel::<Arc<RgbaImage>>(2);
-                let audio = crate::audio::audio::StreamingAudio::start(&path);
+                let audio = crate::engine::audio::StreamingAudio::start(&path);
 
                 thread::spawn(move || {
                     if let Err(e) = super::ffmpeg::video_decode_loop(&path, &tx) {

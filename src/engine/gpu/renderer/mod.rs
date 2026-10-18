@@ -20,12 +20,12 @@ use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::audio::gpu::fbo::RenderTargetPool;
-use crate::audio::gpu::shaders::{effect_def, loader, resolver, transpiler};
-use crate::audio::model::scene::{parse_value_bool, parse_value_f32};
-use crate::audio::model::{ShaderModel, WEBlending};
-use crate::audio::sim::camera_dynamics::{CameraDynamics, CameraFrameDynamics};
-use crate::audio::sim::particle;
+use crate::engine::gpu::fbo::RenderTargetPool;
+use crate::engine::gpu::shaders::{effect_def, loader, resolver, transpiler};
+use crate::engine::model::scene::{parse_value_bool, parse_value_f32};
+use crate::engine::model::{ShaderModel, WEBlending};
+use crate::engine::sim::camera_dynamics::{CameraDynamics, CameraFrameDynamics};
+use crate::engine::sim::particle;
 use crate::platform::GpuDevice;
 
 const SHADER_SRC: &str = include_str!("gpu_shaders.wgsl");
@@ -240,7 +240,7 @@ impl GpuSceneRenderer {
 
         let audio_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("audio_spectrum"),
-            size: crate::audio::audio::UNIFORM_BYTES as u64,
+            size: crate::engine::audio::UNIFORM_BYTES as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1122,7 +1122,7 @@ impl GpuSceneRenderer {
 
     pub fn upload_texture(&self, img: &RgbaImage) -> wgpu::Texture {
         let (fw, fh) =
-            crate::audio::gpu::fbo::fit_texture_limit(&self.device, img.width(), img.height());
+            crate::engine::gpu::fbo::fit_texture_limit(&self.device, img.width(), img.height());
         let downscaled;
         let img = if (fw, fh) != img.dimensions() {
             tracing::warn!(
@@ -1641,20 +1641,21 @@ struct SceneLayerGpu {
     /// posed mesh at `PUPPET_UPDATE_INTERVAL` (skinning + CPU raster costs
     /// ~30ms at 4K, so it runs at a capped rate rather than per frame;
     /// idle-style puppet animations are slow enough not to notice).
-    puppet: Option<std::sync::Arc<crate::audio::sim::puppet::PuppetRuntime>>,
+    puppet: Option<std::sync::Arc<crate::engine::sim::puppet::PuppetRuntime>>,
     /// Last animation time `frames[0]` was posed at, seconds.
     puppet_posed_at: f32,
     /// Embedded-video stream — `frames[0]` is replaced with the newest
     /// decoded frame each tick (the decoder thread paces itself by PTS;
     /// draining to the latest frame drops rather than lags).
-    video: Option<std::sync::Arc<std::sync::Mutex<crate::audio::model::resolve::VideoLayerStream>>>,
+    video:
+        Option<std::sync::Arc<std::sync::Mutex<crate::engine::model::resolve::VideoLayerStream>>>,
     blend_mode: u32,
     /// Live alpha; SceneScript may change it per frame.
     alpha: f32,
     /// Script-driven text: re-evaluated each tick; when the output string
     /// changes, `frames[0]` is re-rasterized and `rect` re-derived (clocks
     /// tick, dates roll over — 42 of the corpus's 58 script wallpapers).
-    text_dynamic: Option<crate::audio::model::resolve::TextDynamic>,
+    text_dynamic: Option<crate::engine::model::resolve::TextDynamic>,
     color: [f32; 3],
     brightness: f32,
     frame_duration_ms: u32,
@@ -1690,7 +1691,7 @@ struct SceneLayerGpu {
     text_raster_cost: Duration,
     /// Composition/fullscreen layer: `frames[0]` is refilled each frame
     /// with the scene drawn beneath it (see `capture_backdrop`).
-    backdrop: Option<crate::audio::model::resolve::Backdrop>,
+    backdrop: Option<crate::engine::model::resolve::Backdrop>,
     /// Spritesheet frame a script picked (`getTextureAnimation().setFrame`),
     /// overriding the timed animation.
     script_frame: Option<usize>,
@@ -1745,15 +1746,15 @@ struct ParticleGpuAssets {
 pub(crate) struct SceneSound {
     /// Index of the owning object in `scene.objects` (or a script-created one).
     pub object: usize,
-    pub playback: crate::audio::audio::SoundPlayback,
+    pub playback: crate::engine::audio::SoundPlayback,
 }
 
 /// Start a `sound` object's first decodable file, held silent when
 /// `startsilent` is set.
 fn start_scene_sound(
     dir: &Path,
-    obj: &crate::audio::model::scene::SceneObject,
-) -> Option<crate::audio::audio::SoundPlayback> {
+    obj: &crate::engine::model::scene::SceneObject,
+) -> Option<crate::engine::audio::SoundPlayback> {
     let sound = obj.sound.as_ref()?;
     let start_silent = obj
         .startsilent
@@ -1766,7 +1767,7 @@ fn start_scene_sound(
     let volume = obj
         .volume
         .as_ref()
-        .and_then(crate::audio::model::scene::parse_value_f32)
+        .and_then(crate::engine::model::scene::parse_value_f32)
         .unwrap_or(1.0);
     let mode = obj.playbackmode.as_ref().and_then(|v| v.as_str());
     let looping = mode != Some("nointerrupt") && mode != Some("once");
@@ -1779,7 +1780,7 @@ fn start_scene_sound(
         _ => Vec::new(),
     };
     files.into_iter().find_map(|f| {
-        crate::audio::audio::SoundPlayback::start(&dir.join(&f), volume, looping, !start_silent)
+        crate::engine::audio::SoundPlayback::start(&dir.join(&f), volume, looping, !start_silent)
     })
 }
 
@@ -1837,7 +1838,7 @@ pub struct GpuSceneInstance {
     mouse_norm: [f32; 2],
     /// The scene's SceneScript runtime, ticked once per frame. Lives here (on
     /// the render thread) because boa's `Context` is `!Send`.
-    scripts: crate::audio::sim::script::ScriptHost,
+    scripts: crate::engine::sim::script::ScriptHost,
     /// What live user-property edits diff against.
     live_props: LiveProps,
     /// Per-object visibility as scripts leave it, indexed like `scene.objects`
@@ -1877,7 +1878,7 @@ pub struct GpuSceneInstance {
     /// Desktop-audio capture, started only when an effect reads
     /// `g_AudioSpectrum*` (else `None` and the spectrum stays silent). Polled
     /// once per frame into the renderer's `audio_buf`.
-    audio_capture: Option<crate::audio::audio::AudioCapture>,
+    audio_capture: Option<crate::engine::audio::AudioCapture>,
     /// Live playback streams for `sound` objects; kept alive for the scene's
     /// lifetime (dropping stops the audio).
     sounds: Vec<SceneSound>,
@@ -1889,7 +1890,7 @@ pub struct GpuSceneInstance {
     /// scan there's no equivalent "does this bundle reference it" signal to
     /// scan for across independent per-property scripts.
     #[cfg(target_os = "linux")]
-    media: Option<crate::audio::media::MediaWatcher>,
+    media: Option<crate::engine::media::MediaWatcher>,
     /// True for genuine 3D scenes (`Scene::is_perspective`): layer rects were
     /// projected through a perspective camera and `render()` sorts image
     /// layers back-to-front by `SceneLayerGpu::depth` instead of scene order.
@@ -1920,9 +1921,9 @@ pub struct GpuSceneInstance {
     shadow_atlas_tex: wgpu::Texture,
     /// Retained for the per-frame parent recompose, which has to rebuild each
     /// mesh's MVP and each layer's projected rect.
-    camera3d: Option<crate::audio::sim::camera3d::PerspectiveCamera>,
+    camera3d: Option<crate::engine::sim::camera3d::PerspectiveCamera>,
     /// Parent chain per object, for recomposing transforms scripts change.
-    transform_graph: crate::audio::model::resolve::TransformGraph,
+    transform_graph: crate::engine::model::resolve::TransformGraph,
     /// `general.zoom`, retained because the per-frame parent recompose rebuilds
     /// orthographic rects and has to apply the same scene-wide scale the build
     /// path does.
@@ -1931,7 +1932,7 @@ pub struct GpuSceneInstance {
     /// `update(value)` is handed the CURRENT value, so a script written as
     /// `value.y += ...` accumulates — resetting to the authored value each
     /// frame turns continuous rotation into jitter in place.
-    current_locals: Vec<crate::audio::model::resolve::Xform>,
+    current_locals: Vec<crate::engine::model::resolve::Xform>,
 }
 
 /// One static 3D mesh, uploaded once: geometry never changes, and its MVP is
@@ -1944,7 +1945,7 @@ fn quad_world_corners(center: [f32; 3], angles: [f32; 3], size_px: [f64; 2]) -> 
     let hx = (size_px[0] / 2.0) as f32;
     let hy = (size_px[1] / 2.0) as f32;
     [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]].map(|[cx, cy]| {
-        let off = crate::audio::sim::camera3d::rotate_euler([cx, cy, 0.0], angles);
+        let off = crate::engine::sim::camera3d::rotate_euler([cx, cy, 0.0], angles);
         [center[0] + off[0], center[1] + off[1], center[2] + off[2]]
     })
 }
@@ -1960,7 +1961,7 @@ fn quad_world_corners(center: [f32; 3], angles: [f32; 3], size_px: [f64; 2]) -> 
 /// the composite fallback in all cases; `project_quad_corners` (below) gives
 /// the true quad shape for the common normal-blend case — see its own docs.
 fn project_quad_ndc(
-    cam: &crate::audio::sim::camera3d::PerspectiveCamera,
+    cam: &crate::engine::sim::camera3d::PerspectiveCamera,
     center: [f32; 3],
     angles: [f32; 3],
     size_px: [f64; 2],
@@ -2004,7 +2005,7 @@ fn project_quad_ndc(
 /// full perspective-correct texture mapping is a further, separate
 /// improvement.
 fn project_quad_corners(
-    cam: &crate::audio::sim::camera3d::PerspectiveCamera,
+    cam: &crate::engine::sim::camera3d::PerspectiveCamera,
     center: [f32; 3],
     angles: [f32; 3],
     size_px: [f64; 2],
@@ -2044,7 +2045,7 @@ const MESH3D_MAX_LIGHTS: usize = 8;
 /// Shadow-casting-light cap, mirrored from `engine::shadow::MAX_SHADOW_LIGHTS`
 /// — must also match `MESH3D_MAX_SHADOW_LIGHTS` in `gpu_shaders.wgsl` by
 /// hand, same caveat as `MESH3D_MAX_LIGHTS`.
-const MESH3D_MAX_SHADOW_LIGHTS: usize = crate::audio::gpu::shadow::MAX_SHADOW_LIGHTS;
+const MESH3D_MAX_SHADOW_LIGHTS: usize = crate::engine::gpu::shadow::MAX_SHADOW_LIGHTS;
 
 /// Byte length of the `Mesh3dLighting` uniform buffer: 5 leading `vec4`s
 /// (flags, ambient, fog_distance, fog_height, fog_extra), three
@@ -2062,7 +2063,7 @@ const MESH3D_LIGHTING_BYTES_LEN: usize =
 /// is naturally built in world space, unlike everything else here which
 /// works in the main camera's view space.
 fn mesh3d_transform_bytes(
-    cam: &crate::audio::sim::camera3d::PerspectiveCamera,
+    cam: &crate::engine::sim::camera3d::PerspectiveCamera,
     origin: [f32; 3],
     angles: [f32; 3],
     scale: [f32; 3],
@@ -2072,7 +2073,7 @@ fn mesh3d_transform_bytes(
         cam.mvp(origin, angles, scale),
         cam.model_view(origin, angles, scale),
         cam.normal_view(angles, scale),
-        crate::audio::sim::camera3d::model_matrix(origin, angles, scale),
+        crate::engine::sim::camera3d::model_matrix(origin, angles, scale),
     ] {
         for col in mat.iter() {
             for f in col {
@@ -2106,11 +2107,11 @@ fn mesh3d_transform_bytes(
 /// `flags.y` (as `light_index + 1`, `0.0` = none) and the trailing
 /// `cookie_view_proj` field.
 fn mesh3d_lighting_bytes(
-    scene: &crate::audio::model::scene::Scene,
-    cam: &crate::audio::sim::camera3d::PerspectiveCamera,
+    scene: &crate::engine::model::scene::Scene,
+    cam: &crate::engine::sim::camera3d::PerspectiveCamera,
     shadow_slots: &[Option<usize>],
-    shadow_slot_data: &[(crate::audio::sim::camera3d::Mat4, [f32; 4])],
-    cookie: Option<(usize, crate::audio::sim::camera3d::Mat4)>,
+    shadow_slot_data: &[(crate::engine::sim::camera3d::Mat4, [f32; 4])],
+    cookie: Option<(usize, crate::engine::sim::camera3d::Mat4)>,
 ) -> Vec<u8> {
     let lights = scene.lights();
     let general = scene.general.as_ref();
@@ -2134,10 +2135,10 @@ fn mesh3d_lighting_bytes(
     let has_renderable_light = lights.iter().any(|(l, ..)| {
         matches!(
             l,
-            crate::audio::gpu::lighting::Light::Point { .. }
-                | crate::audio::gpu::lighting::Light::Spot { .. }
-                | crate::audio::gpu::lighting::Light::Directional { .. }
-                | crate::audio::gpu::lighting::Light::Tube { .. }
+            crate::engine::gpu::lighting::Light::Point { .. }
+                | crate::engine::gpu::lighting::Light::Spot { .. }
+                | crate::engine::gpu::lighting::Light::Directional { .. }
+                | crate::engine::gpu::lighting::Light::Tube { .. }
         )
     });
     let cookie_light_flag = cookie.map(|(idx, _)| (idx + 1) as f32).unwrap_or(0.0);
@@ -2189,7 +2190,7 @@ fn mesh3d_lighting_bytes(
                 .unwrap_or(0.0)
         };
         match light {
-            crate::audio::gpu::lighting::Light::Point {
+            crate::engine::gpu::lighting::Light::Point {
                 origin,
                 color,
                 intensity,
@@ -2201,7 +2202,7 @@ fn mesh3d_lighting_bytes(
                 // spot_slot stays [0,0,0,0] — zero-length direction reads as
                 // "not a spot" in `mesh3d_spot_factor`.
             }
-            crate::audio::gpu::lighting::Light::Spot {
+            crate::engine::gpu::lighting::Light::Spot {
                 origin,
                 direction,
                 exponent,
@@ -2218,7 +2219,7 @@ fn mesh3d_lighting_bytes(
                 let vd = cam.to_view_direction(*direction);
                 *spot_slot = [vd[0], vd[1], vd[2], *exponent];
             }
-            crate::audio::gpu::lighting::Light::Directional {
+            crate::engine::gpu::lighting::Light::Directional {
                 direction,
                 color,
                 intensity,
@@ -2240,7 +2241,7 @@ fn mesh3d_lighting_bytes(
                 // spot_slot stays [0,0,0,0] — mesh3d_spot_factor's own
                 // "not a spot" check already no-ops for a directional light.
             }
-            crate::audio::gpu::lighting::Light::Tube {
+            crate::engine::gpu::lighting::Light::Tube {
                 origin_a,
                 origin_b,
                 color,
@@ -2286,7 +2287,7 @@ fn mesh3d_lighting_bytes(
         let vp = shadow_slot_data
             .get(slot)
             .map(|(vp, _)| *vp)
-            .unwrap_or_else(crate::audio::sim::camera3d::identity);
+            .unwrap_or_else(crate::engine::sim::camera3d::identity);
         for col in vp.iter() {
             push4(*col);
         }
@@ -2300,7 +2301,7 @@ fn mesh3d_lighting_bytes(
     }
     let cookie_view_proj = cookie
         .map(|(_, vp)| vp)
-        .unwrap_or_else(crate::audio::sim::camera3d::identity);
+        .unwrap_or_else(crate::engine::sim::camera3d::identity);
     for col in cookie_view_proj.iter() {
         push4(*col);
     }
@@ -2329,7 +2330,7 @@ impl GpuSceneInstance {
     }
 
     fn build(mut renderer: GpuSceneRenderer, dir: &Path) -> Result<Self> {
-        let resolved = crate::audio::model::resolve::ResolvedScene::from_directory(dir)?;
+        let resolved = crate::engine::model::resolve::ResolvedScene::from_directory(dir)?;
         // The unparsed scene.json: scripts and timelines read fields the
         // typed model drops.
         let raw_scene: serde_json::Value = crate::formats::assets::AssetStore::from_directory(dir)
@@ -2340,7 +2341,7 @@ impl GpuSceneInstance {
         let w = resolved.width;
         let h = resolved.height;
 
-        let scene_model = crate::audio::model::scene_to_model(&resolved.scene)?;
+        let scene_model = crate::engine::model::scene_to_model(&resolved.scene)?;
 
         let general = resolved.scene.general.as_ref();
         let clear_color: [f64; 3] = general
@@ -2428,7 +2429,7 @@ impl GpuSceneInstance {
 
         // Perspective (3D) scenes project layer quads through the scene
         // camera instead of mapping pixel origins to NDC directly.
-        let camera3d = crate::audio::sim::camera3d::PerspectiveCamera::from_scene(
+        let camera3d = crate::engine::sim::camera3d::PerspectiveCamera::from_scene(
             &resolved.scene,
             w as f32 / h as f32,
         );
@@ -2462,7 +2463,7 @@ impl GpuSceneInstance {
         let uses_audio =
             particles_use_audio || effect_runtimes.iter().flatten().any(|r| r.uses_audio);
         let audio_capture = if uses_audio {
-            crate::audio::audio::AudioCapture::start()
+            crate::engine::audio::AudioCapture::start()
         } else {
             None
         };
@@ -2722,8 +2723,9 @@ impl GpuSceneInstance {
         // plumbed into `build`, and every real `usecookie` occurrence in
         // this sandbox's cache is zero either way.
         let cookie_data = {
-            use crate::audio::gpu::lighting::Light;
-            let (center, radius) = crate::audio::gpu::shadow::scene_bounds(&resolved.mesh3d_layers);
+            use crate::engine::gpu::lighting::Light;
+            let (center, radius) =
+                crate::engine::gpu::shadow::scene_bounds(&resolved.mesh3d_layers);
             lights
                 .iter()
                 .enumerate()
@@ -2738,12 +2740,12 @@ impl GpuSceneInstance {
                     else {
                         return None;
                     };
-                    let image = crate::audio::model::resolve::resolve_static_texture(
+                    let image = crate::engine::model::resolve::resolve_static_texture(
                         Some(dir),
                         None,
                         path,
                     )?;
-                    let vp = crate::audio::gpu::shadow::spot_light_view_proj(
+                    let vp = crate::engine::gpu::shadow::spot_light_view_proj(
                         *origin,
                         *direction,
                         *outer_cone_degrees,
@@ -2899,7 +2901,7 @@ impl GpuSceneInstance {
             audio_capture,
             sounds,
             #[cfg(target_os = "linux")]
-            media: crate::audio::media::MediaWatcher::start(),
+            media: crate::engine::media::MediaWatcher::start(),
             perspective: camera3d.is_some(),
             mesh3d,
             mesh3d_depth,
@@ -2916,7 +2918,7 @@ impl GpuSceneInstance {
         instance.effect_enabled = vec![true; instance.scene_effects.len()];
         instance.cursor_targets = instance
             .scripts
-            .objects_with_handlers(crate::audio::sim::script::CURSOR_EVENTS);
+            .objects_with_handlers(crate::engine::sim::script::CURSOR_EVENTS);
         Ok(instance)
     }
 
@@ -2939,18 +2941,18 @@ impl GpuSceneInstance {
     /// procedural per-light cone/box mesh — see the report's scoping note).
     fn build_volumetrics(
         renderer: &GpuSceneRenderer,
-        cam: &crate::audio::sim::camera3d::PerspectiveCamera,
+        cam: &crate::engine::sim::camera3d::PerspectiveCamera,
         lights: &[(
-            crate::audio::gpu::lighting::Light,
+            crate::engine::gpu::lighting::Light,
             bool,
             Option<(f32, f32)>,
             Option<String>,
         )],
         shadow_slots: &[Option<usize>],
-        shadow_slot_data: &[(crate::audio::sim::camera3d::Mat4, [f32; 4])],
+        shadow_slot_data: &[(crate::engine::sim::camera3d::Mat4, [f32; 4])],
         shadow_atlas_view: &wgpu::TextureView,
     ) -> Option<wgpu::BindGroup> {
-        use crate::audio::gpu::lighting::Light;
+        use crate::engine::gpu::lighting::Light;
 
         let (idx, origin, color_intensity, density, exponent) = lights
             .iter()
@@ -2996,9 +2998,9 @@ impl GpuSceneInstance {
             .flatten()
             .and_then(|slot| shadow_slot_data.get(slot))
             .map(|(vp, rect)| (*vp, *rect, 1.0f32))
-            .unwrap_or((crate::audio::sim::camera3d::identity(), [0.0; 4], 0.0));
+            .unwrap_or((crate::engine::sim::camera3d::identity(), [0.0; 4], 0.0));
 
-        let inv_view_proj = crate::audio::sim::camera3d::mat4_inverse(&cam.view_proj_raw());
+        let inv_view_proj = crate::engine::sim::camera3d::mat4_inverse(&cam.view_proj_raw());
         let eye = cam.eye();
         // Fixed, honest default range for the ray march — no real content
         // to derive a better heuristic from (see the fn doc comment).
@@ -3006,7 +3008,7 @@ impl GpuSceneInstance {
         const MAX_RANGE: f32 = 40.0;
 
         let mut bytes = Vec::with_capacity(4 * 16 * 4 + 16 * 5);
-        let mut push_mat = |m: &crate::audio::sim::camera3d::Mat4| {
+        let mut push_mat = |m: &crate::engine::sim::camera3d::Mat4| {
             for col in m.iter() {
                 for f in col {
                     bytes.extend_from_slice(&f.to_le_bytes());
@@ -3074,9 +3076,9 @@ impl GpuSceneInstance {
     /// and the per-slot `(view_proj, uv_rect)` data for `mesh3d_lighting_bytes`.
     fn build_shadow_atlas(
         renderer: &GpuSceneRenderer,
-        mesh3d_layers: &[crate::audio::model::resolve::Mesh3dLayer],
+        mesh3d_layers: &[crate::engine::model::resolve::Mesh3dLayer],
         lights: &[(
-            crate::audio::gpu::lighting::Light,
+            crate::engine::gpu::lighting::Light,
             bool,
             Option<(f32, f32)>,
             Option<String>,
@@ -3084,10 +3086,10 @@ impl GpuSceneInstance {
     ) -> (
         wgpu::Texture,
         Vec<Option<usize>>,
-        Vec<(crate::audio::sim::camera3d::Mat4, [f32; 4])>,
+        Vec<(crate::engine::sim::camera3d::Mat4, [f32; 4])>,
     ) {
-        use crate::audio::gpu::lighting::Light;
-        use crate::audio::gpu::shadow;
+        use crate::engine::gpu::lighting::Light;
+        use crate::engine::gpu::shadow;
 
         let mut shadow_slots: Vec<Option<usize>> = vec![None; lights.len()];
 
@@ -3097,7 +3099,7 @@ impl GpuSceneInstance {
         // rather than after filtering casters like the point-only version
         // did.
         let (center, radius) = shadow::scene_bounds(mesh3d_layers);
-        let shadow_casters: Vec<(usize, crate::audio::sim::camera3d::Mat4)> = lights
+        let shadow_casters: Vec<(usize, crate::engine::sim::camera3d::Mat4)> = lights
             .iter()
             .enumerate()
             .filter_map(|(i, (light, casts_shadow, _volumetrics, _))| {
@@ -3232,12 +3234,12 @@ impl GpuSceneInstance {
             pass.set_scissor_rect(tile.x, tile.y, tile.w, tile.h);
             pass.set_pipeline(&renderer.mesh3d_shadow_pipeline);
             for (layer, (vbuf, ibuf, index_count)) in mesh3d_layers.iter().zip(geometry.iter()) {
-                let model = crate::audio::sim::camera3d::model_matrix(
+                let model = crate::engine::sim::camera3d::model_matrix(
                     layer.origin,
                     layer.angles,
                     layer.scale,
                 );
-                let light_mvp = crate::audio::sim::camera3d::mat4_mul(&view_proj, &model);
+                let light_mvp = crate::engine::sim::camera3d::mat4_mul(&view_proj, &model);
                 let mut mvp_bytes = Vec::with_capacity(64);
                 for col in light_mvp.iter() {
                     for f in col {
@@ -3275,7 +3277,7 @@ impl GpuSceneInstance {
     /// upload can't simply be reused from a `Mesh3dGpu` built later.
     fn upload_mesh3d_geometry(
         renderer: &GpuSceneRenderer,
-        mesh: &crate::audio::model::mesh3d::Mesh3d,
+        mesh: &crate::engine::model::mesh3d::Mesh3d,
     ) -> (wgpu::Buffer, wgpu::Buffer, u32) {
         let mut verts: Vec<u8> = Vec::with_capacity(mesh.positions.len() * 32);
         for ((p, uv), n) in mesh.positions.iter().zip(&mesh.uvs).zip(&mesh.normals) {
@@ -3306,8 +3308,8 @@ impl GpuSceneInstance {
     /// both static in real content, so this runs once at load.
     fn build_mesh3d(
         renderer: &GpuSceneRenderer,
-        cam: &crate::audio::sim::camera3d::PerspectiveCamera,
-        layer: &crate::audio::model::resolve::Mesh3dLayer,
+        cam: &crate::engine::sim::camera3d::PerspectiveCamera,
+        layer: &crate::engine::model::resolve::Mesh3dLayer,
         lighting_ubo: &wgpu::Buffer,
         shadow_atlas_view: &wgpu::TextureView,
         cookie_view: &wgpu::TextureView,
@@ -3433,7 +3435,7 @@ impl GpuSceneInstance {
 
     /// Advance keyframe animations and apply the properties they move.
     fn tick_timelines(&mut self, delta: f32) {
-        use crate::audio::sim::script::{ObjectChange, ScriptChanges};
+        use crate::engine::sim::script::{ObjectChange, ScriptChanges};
         if self.timelines.is_empty() {
             return;
         }
@@ -3532,7 +3534,7 @@ impl GpuSceneInstance {
         }
         #[cfg(target_os = "linux")]
         if let Some(info) = self.media.as_ref().and_then(|w| w.try_recv()) {
-            use crate::audio::media::PlaybackState;
+            use crate::engine::media::PlaybackState;
             self.scripts.set_media(
                 info.available,
                 match info.playback_state {
@@ -3568,7 +3570,7 @@ impl GpuSceneInstance {
         );
         self.dispatch_cursor_events();
         self.scripts
-            .frame(time, crate::audio::sim::script::local_time_of_day(), delta);
+            .frame(time, crate::engine::sim::script::local_time_of_day(), delta);
         let changes = self.scripts.collect();
         self.apply_script_changes(changes);
         self.flush_text();
@@ -3578,7 +3580,7 @@ impl GpuSceneInstance {
         if !self.scripts_want_audio && self.scripts.wants_audio() {
             self.scripts_want_audio = true;
             if self.audio_capture.is_none() {
-                self.audio_capture = crate::audio::audio::AudioCapture::start();
+                self.audio_capture = crate::engine::audio::AudioCapture::start();
             }
         }
     }
@@ -3665,8 +3667,8 @@ impl GpuSceneInstance {
 
     /// Apply a frame's script changes: transforms recompose through the
     /// parent graph, everything else lands on the object's layers and sounds.
-    fn apply_script_changes(&mut self, changes: crate::audio::sim::script::ScriptChanges) {
-        use crate::audio::sim::script::ScriptCommand;
+    fn apply_script_changes(&mut self, changes: crate::engine::sim::script::ScriptChanges) {
+        use crate::engine::sim::script::ScriptCommand;
         let n = self.current_locals.len();
         let mut moved = vec![false; n];
         let mut visibility_changed = false;
@@ -3785,7 +3787,7 @@ impl GpuSceneInstance {
     /// [`Self::apply_user_properties`]).
     pub fn set_user_properties(&mut self, names: &[String]) -> bool {
         let props =
-            crate::audio::properties::SceneProperties::from_project_dir(&self.live_props.dir);
+            crate::engine::properties::SceneProperties::from_project_dir(&self.live_props.dir);
         self.apply_user_properties(props, names)
     }
 
@@ -3796,7 +3798,7 @@ impl GpuSceneInstance {
     /// built at load, a field scripts can't set).
     fn apply_user_properties(
         &mut self,
-        props: crate::audio::properties::SceneProperties,
+        props: crate::engine::properties::SceneProperties,
         names: &[String],
     ) -> bool {
         let lp = &mut self.live_props;
@@ -3833,7 +3835,7 @@ impl GpuSceneInstance {
             if diffs.is_empty() {
                 continue;
             }
-            let mut change = crate::audio::sim::script::ObjectChange::default();
+            let mut change = crate::engine::sim::script::ObjectChange::default();
             for (path, v) in &diffs {
                 if self.live_change(i, path, v, &mut change).is_none() {
                     tracing::debug!(target: "properties", "object {i}: {} needs a reload", path.join("."));
@@ -3842,7 +3844,7 @@ impl GpuSceneInstance {
             }
             objects.push((i, change));
         }
-        self.apply_script_changes(crate::audio::sim::script::ScriptChanges {
+        self.apply_script_changes(crate::engine::sim::script::ScriptChanges {
             objects,
             commands: Vec::new(),
         });
@@ -3858,9 +3860,9 @@ impl GpuSceneInstance {
         object: usize,
         path: &[String],
         v: &serde_json::Value,
-        c: &mut crate::audio::sim::script::ObjectChange,
+        c: &mut crate::engine::sim::script::ObjectChange,
     ) -> Option<()> {
-        use crate::audio::model::scene::{parse_value_bool, parse_value_f32, parse_value_vec3};
+        use crate::engine::model::scene::{parse_value_bool, parse_value_f32, parse_value_vec3};
         // `{"user": …, "value": X}` bindings resolve to their `value`.
         let v = v.get("value").unwrap_or(v);
         let vec3 = |v| parse_value_vec3(v).map(|a| a.map(|x| x as f32));
@@ -3974,7 +3976,7 @@ impl GpuSceneInstance {
     /// scene.json-shaped config. Image, solid and text objects only; their
     /// effects are not instantiated.
     fn create_object(&mut self, index: usize, config: &serde_json::Value) {
-        use crate::audio::model::resolve::Xform;
+        use crate::engine::model::resolve::Xform;
         // Keep every per-object table indexed in step with the script side,
         // even when this object can't be built.
         let n = index + 1;
@@ -3989,7 +3991,7 @@ impl GpuSceneInstance {
             let len = self.draw_rank.len();
             self.draw_rank.extend((len..n).map(|i| i as f64));
         }
-        let obj: crate::audio::model::scene::SceneObject =
+        let obj: crate::engine::model::scene::SceneObject =
             match serde_json::from_value(config.clone()) {
                 Ok(o) => o,
                 Err(e) => {
@@ -4010,7 +4012,7 @@ impl GpuSceneInstance {
             self.scene_pkg =
                 crate::formats::pkg::Package::from_file(&self.scene_dir.join("scene.pkg")).ok();
         }
-        let Some(mut layer) = crate::audio::model::resolve::runtime_layer(
+        let Some(mut layer) = crate::engine::model::resolve::runtime_layer(
             &self.scene_dir,
             self.scene_pkg.as_ref(),
             &obj,
@@ -4019,7 +4021,7 @@ impl GpuSceneInstance {
             return;
         };
         layer.order_index = index;
-        let local = crate::audio::model::resolve::obj_local_xform(&obj);
+        let local = crate::engine::model::resolve::obj_local_xform(&obj);
         self.current_locals[index] = local;
         self.transform_graph.local[index] = local;
         self.transform_graph.name[index] = obj.name.clone();
@@ -4044,7 +4046,7 @@ impl GpuSceneInstance {
     }
 
     /// Sound controls belonging to scene object `index`.
-    fn sounds_of(&self, index: usize) -> Vec<std::sync::Arc<crate::audio::audio::SoundControl>> {
+    fn sounds_of(&self, index: usize) -> Vec<std::sync::Arc<crate::engine::audio::SoundControl>> {
         self.sounds
             .iter()
             .filter(|s| s.object == index)
@@ -4090,7 +4092,7 @@ impl GpuSceneInstance {
             }
             let started = Instant::now();
             if let Some(img) =
-                crate::audio::gpu::text::rasterize(&td.font_data, text, td.point_size)
+                crate::engine::gpu::text::rasterize(&td.font_data, text, td.point_size)
             {
                 // The quad keeps its authored box; only the texture changes.
                 layer.frames[0] = self.renderer.upload_texture(&img);
@@ -4127,7 +4129,7 @@ impl GpuSceneInstance {
     /// the layers and meshes they move: those whose own object or any
     /// ancestor `moved`.
     fn apply_object_transforms(&mut self, moved: &[bool]) {
-        use crate::audio::model::resolve::Xform;
+        use crate::engine::model::resolve::Xform;
         let n = self.current_locals.len();
         let parent = self.transform_graph.parent.clone();
         // affected[i]: object i or an ancestor moved.
@@ -5497,7 +5499,7 @@ fn named_fbo_key(instance_idx: usize, fbo_name: &str) -> String {
 /// Fraction of the local day in [0,1) (the reference's g_Daytime).
 /// `g_Daytime`: fraction of the local day elapsed.
 fn daytime_fraction() -> f32 {
-    crate::audio::sim::script::local_time_of_day()
+    crate::engine::sim::script::local_time_of_day()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5832,7 +5834,7 @@ fn load_effect_instance(
         // washes over the whole layer instead of being confined to the mask
         // (e.g. nitro.frag's `#if MASK` block silently compiling out).
         let sampler_combos: Vec<Option<String>> =
-            crate::audio::gpu::shaders::uniform_meta::parse_uniform_metadata(&frag_glsl)
+            crate::engine::gpu::shaders::uniform_meta::parse_uniform_metadata(&frag_glsl)
                 .into_iter()
                 .filter(|m| m.uniform_type == "sampler2D")
                 .map(|m| m.combo)
@@ -6079,13 +6081,13 @@ pub fn gpu_scene_render_loop(
 struct LiveProps {
     dir: std::path::PathBuf,
     raw: serde_json::Value,
-    props: crate::audio::properties::SceneProperties,
+    props: crate::engine::properties::SceneProperties,
     resolved: serde_json::Value,
 }
 
 impl LiveProps {
     fn new(dir: &Path, raw: &serde_json::Value) -> Self {
-        let props = crate::audio::properties::SceneProperties::from_project_dir(dir);
+        let props = crate::engine::properties::SceneProperties::from_project_dir(dir);
         let mut resolved = raw.clone();
         props.resolve_scene_json(&mut resolved);
         Self {
@@ -6147,7 +6149,7 @@ fn insert_value_components(map: &mut ShaderVals, key: &str, value: &serde_json::
             .replace('_', "")
             .to_lowercase()
     };
-    let animated = crate::audio::model::json_to_animated(value);
+    let animated = crate::engine::model::json_to_animated(value);
     insert_animated_components(map, key, &alias(key), &animated);
 }
 
@@ -6155,7 +6157,7 @@ fn insert_animated_components(
     map: &mut ShaderVals,
     key: &str,
     alias: &str,
-    v: &crate::audio::model::AnimatedValue,
+    v: &crate::engine::model::AnimatedValue,
 ) {
     if let Some(f) = v.as_float() {
         map.insert(key.to_string(), f);
@@ -6180,7 +6182,7 @@ fn insert_animated_components(
     }
 }
 
-fn collect_effects(scene: &crate::audio::model::SceneModel) -> Vec<EffectInstanceDef> {
+fn collect_effects(scene: &crate::engine::model::SceneModel) -> Vec<EffectInstanceDef> {
     let alias = |k: &str| -> String {
         k.strip_prefix("ui_editor_properties_")
             .unwrap_or(k)
@@ -6526,11 +6528,11 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
 /// the object's scene.json origin, before alignment.
 fn gpu_layer_from(
     renderer: &GpuSceneRenderer,
-    l: &crate::audio::model::resolve::Layer,
+    l: &crate::engine::model::resolve::Layer,
     w: u32,
     h: u32,
     zoom: f32,
-    camera3d: Option<&crate::audio::sim::camera3d::PerspectiveCamera>,
+    camera3d: Option<&crate::engine::sim::camera3d::PerspectiveCamera>,
     authored_origin: [f64; 3],
 ) -> SceneLayerGpu {
     let all_frames: Vec<&RgbaImage> = std::iter::once(&l.image)
@@ -6662,7 +6664,7 @@ struct TimelineEntry {
     key: String,
     /// Base value, which transform keyframes are offsets from.
     base: Vec<f32>,
-    anim: crate::audio::sim::timeline::PropertyAnimation,
+    anim: crate::engine::sim::timeline::PropertyAnimation,
     /// Last value applied, to skip re-applying an idle animation.
     last: Option<Vec<f32>>,
 }
@@ -6670,9 +6672,9 @@ struct TimelineEntry {
 /// Collect every animated property from the raw scene.json objects.
 fn build_timelines(
     raw_scene: &serde_json::Value,
-    graph: &crate::audio::model::resolve::TransformGraph,
+    graph: &crate::engine::model::resolve::TransformGraph,
 ) -> Vec<TimelineEntry> {
-    use crate::audio::sim::timeline::PropertyAnimation;
+    use crate::engine::sim::timeline::PropertyAnimation;
     let mut out = Vec::new();
     let objects = raw_scene.get("objects").and_then(|o| o.as_array());
     for (i, raw) in objects.into_iter().flatten().enumerate() {
@@ -6714,7 +6716,7 @@ fn build_timelines(
                 .local
                 .get(i)
                 .copied()
-                .unwrap_or(crate::audio::model::resolve::Xform::IDENTITY);
+                .unwrap_or(crate::engine::model::resolve::Xform::IDENTITY);
             let base: Vec<f32> = match key.as_str() {
                 "origin" => local.t.iter().map(|v| *v as f32).collect(),
                 "scale" => local.s.iter().map(|v| *v as f32).collect(),
@@ -6738,13 +6740,13 @@ fn build_timelines(
 /// transform graph use), then one instance per scripted property.
 fn build_script_host(
     dir: &Path,
-    scene: &crate::audio::model::scene::Scene,
-    graph: &crate::audio::model::resolve::TransformGraph,
+    scene: &crate::engine::model::scene::Scene,
+    graph: &crate::engine::model::resolve::TransformGraph,
     canvas: [u32; 2],
     raw_scene: &serde_json::Value,
-) -> crate::audio::sim::script::ScriptHost {
-    use crate::audio::model::scene::{parse_value_f32, parse_value_vec3};
-    use crate::audio::sim::script::{ObjectInit, ScriptHost};
+) -> crate::engine::sim::script::ScriptHost {
+    use crate::engine::model::scene::{parse_value_f32, parse_value_vec3};
+    use crate::engine::sim::script::{ObjectInit, ScriptHost};
 
     let mut host = ScriptHost::new();
     if scene.objects.iter().all(|o| o.scripts().is_empty()) {
@@ -6764,7 +6766,7 @@ fn build_script_host(
     }
 
     let user_props: serde_json::Map<String, serde_json::Value> =
-        crate::audio::properties::SceneProperties::from_project_dir(dir)
+        crate::engine::properties::SceneProperties::from_project_dir(dir)
             .iter()
             .map(|p| (p.name.clone(), p.value.clone()))
             .collect();
@@ -6780,7 +6782,7 @@ fn build_script_host(
             .local
             .get(i)
             .copied()
-            .unwrap_or(crate::audio::model::resolve::Xform::IDENTITY);
+            .unwrap_or(crate::engine::model::resolve::Xform::IDENTITY);
         let text = obj.text.as_ref().and_then(|t| match t {
             serde_json::Value::String(s) => Some(s.clone()),
             serde_json::Value::Object(m) => {
@@ -6842,7 +6844,7 @@ fn build_script_host(
             ("volume", obj.volume.as_ref()),
         ];
         for (prop, value) in props {
-            if let Some((script, authored)) = crate::audio::sim::script::scripted(value) {
+            if let Some((script, authored)) = crate::engine::sim::script::scripted(value) {
                 host.attach(i, Some(prop), script, authored);
             }
         }
@@ -6878,7 +6880,7 @@ fn build_script_host(
             }
         }
         for (key, value) in extras {
-            if let Some((script, authored)) = crate::audio::sim::script::scripted(Some(value)) {
+            if let Some((script, authored)) = crate::engine::sim::script::scripted(Some(value)) {
                 let initial = value
                     .get("value")
                     .cloned()
@@ -6886,7 +6888,7 @@ fn build_script_host(
                 host.declare_property(
                     i,
                     &key,
-                    crate::audio::sim::script::value_kind(&initial),
+                    crate::engine::sim::script::value_kind(&initial),
                     &initial,
                 );
                 host.attach(i, Some(&key), script, authored);

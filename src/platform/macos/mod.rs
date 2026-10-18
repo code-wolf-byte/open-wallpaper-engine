@@ -33,7 +33,7 @@ use winit::window::{Window, WindowId};
 
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
 use super::GpuDevice;
-use crate::audio::gpu::renderer::GpuSceneInstance;
+use crate::engine::gpu::renderer::GpuSceneInstance;
 use crate::render::{ScreenContent, ScreenSettings, WallpaperContent};
 
 // ── Platform implementation ───────────────────────────────────────────────────

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use wp_engine::audio::model::scene::Scene;
-use wp_engine::audio::properties::{parse_property_arg, SceneProperties};
-use wp_engine::audio::sim::camera_dynamics::CameraDynamics;
+use wp_engine::engine::model::scene::Scene;
+use wp_engine::engine::properties::{parse_property_arg, SceneProperties};
+use wp_engine::engine::sim::camera_dynamics::CameraDynamics;
 
 fn props_from_project(project: serde_json::Value, overrides: &[(&str, &str)]) -> SceneProperties {
     // Build via a temp dir so the public loader path is exercised.
@@ -177,7 +177,7 @@ fn static_scene_has_inactive_dynamics() {
 
 // Regression test for the copybackground bug: objects flagged
 // `copybackground` still carry a real image and must load it (the reference
-// audio ignores the flag). Uses a real workshop scene when available.
+// engine ignores the flag). Uses a real workshop scene when available.
 #[test]
 fn copybackground_objects_load_their_image() {
     let dir = std::path::PathBuf::from(std::env::var("HOME").unwrap())
@@ -185,7 +185,7 @@ fn copybackground_objects_load_their_image() {
     if !dir.exists() {
         return; // fixture not installed on this machine
     }
-    let resolved = wp_engine::audio::ResolvedScene::from_directory(&dir).unwrap();
+    let resolved = wp_engine::engine::ResolvedScene::from_directory(&dir).unwrap();
     let layer = resolved
         .layers
         .iter()

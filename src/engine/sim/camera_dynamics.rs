@@ -5,7 +5,7 @@
 //! `camerashake{,amplitude,roughness,speed}`, `camerafade`, and
 //! `cameraparallax{,amount,delay,mouseinfluence}` (see WallpaperParser.cpp).
 
-use crate::audio::model::scene::{parse_value_bool, parse_value_f32, Scene};
+use crate::engine::model::scene::{parse_value_bool, parse_value_f32, Scene};
 
 /// How long the camera-fade ramp lasts after the scene starts, in seconds.
 const FADE_DURATION_SECS: f32 = 1.2;

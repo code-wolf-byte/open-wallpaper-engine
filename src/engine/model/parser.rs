@@ -6,7 +6,7 @@
 //   camera is Option<Camera>, must use as_ref()
 use super::dynamic_value::{AnimatedValue, DynamicValue};
 use super::objects::{EffectModel, ObjectModel, PassModel, SceneModel};
-use crate::audio::model::scene;
+use crate::engine::model::scene;
 use anyhow::Result;
 use std::collections::HashMap;
 

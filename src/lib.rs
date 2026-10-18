@@ -1,7 +1,7 @@
 pub mod application;
-pub mod audio;
 #[cfg(target_os = "linux")]
 pub mod daemon;
+pub mod engine;
 pub mod formats;
 pub mod logging;
 pub mod platform;
