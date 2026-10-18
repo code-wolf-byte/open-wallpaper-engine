@@ -116,7 +116,7 @@ pub struct WpApp {
     pending_apply: Option<mpsc::Receiver<ApplyResult>>,
     /// Cached speaker list for the audio picker, built on first use —
     /// enumerating shells out to `pactl`, so not every frame.
-    audio_devices: Option<Vec<crate::platform::audio::CaptureOption>>,
+    audio_devices: Option<Vec<crate::services::audio_devices::CaptureOption>>,
     /// Index into `audio_devices`; 0 is "Automatic".
     audio_choice: usize,
 
@@ -557,7 +557,7 @@ impl WpApp {
         let (tx, rx) = mpsc::channel();
 
         std::thread::spawn(move || {
-            let device = crate::platform::audio::preferred_device();
+            let device = crate::services::audio_devices::preferred_device();
             let result = daemon::request_or_spawn(&Request::SetAudioDevice { device })
                 .and_then(|_| daemon::request(&Request::Apply(spec)))
                 .map(|_| (None, display_title))
