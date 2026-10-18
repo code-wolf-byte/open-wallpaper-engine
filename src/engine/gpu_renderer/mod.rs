@@ -4080,7 +4080,9 @@ impl GpuSceneInstance {
                 continue;
             }
             let started = Instant::now();
-            if let Some(img) = crate::engine::text::rasterize(&td.font_data, text, td.point_size) {
+            if let Some(img) =
+                crate::engine::gpu::text::rasterize(&td.font_data, text, td.point_size)
+            {
                 // The quad keeps its authored box; only the texture changes.
                 layer.frames[0] = self.renderer.upload_texture(&img);
                 td.last_text = text.clone();
