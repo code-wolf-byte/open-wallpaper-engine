@@ -41,7 +41,7 @@ use wayland_client::{
 };
 // Manually dispatched (no smithay-client-toolkit delegate exists for this
 // protocol) — playback-pause's fullscreen/maximized-app detection, see
-// `engine::playback_gate` (Ghidra report Follow-up (ff)).
+// `services::playback_gate` (Ghidra report Follow-up (ff)).
 use wayland_protocols_wlr::foreign_toplevel::v1::client::{
     zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
     zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
@@ -247,7 +247,7 @@ struct WallpaperState {
     queue: wgpu::Queue,
     display_ptr: *mut c_void,
     allow_gpu_surface: bool,
-    // ── Playback-pause (engine::playback_gate, Ghidra report Follow-up (ff)) ──
+    // ── Playback-pause (services::playback_gate, Ghidra report Follow-up (ff)) ──
     /// `None` when the compositor doesn't advertise `zwlr_layer_shell_v1`'s
     /// sibling `zwlr_foreign_toplevel_manager_v1` at all — GNOME/Mutter
     /// notably don't (it's a wlroots-ecosystem protocol: Sway/Hyprland/river
@@ -407,7 +407,7 @@ impl WallpaperState {
         if self.surfaces[idx].width == 0 || self.surfaces[idx].height == 0 {
             return;
         }
-        // Playback policy (`engine::playback_gate`): when it halts
+        // Playback policy (`services::playback_gate`): when it halts
         // rendering, skip the draw and — just as importantly — don't
         // request another frame callback, so the surface holds its last
         // frame and the compositor stops nudging us every vblank.
@@ -766,7 +766,7 @@ fn wallpaper_loop(
         .insert(event_loop.handle())
         .map_err(|e| anyhow!("WaylandSource insert failed: {e}"))?;
 
-    // Playback-pause watchdog (`engine::playback_gate`, Ghidra report
+    // Playback-pause watchdog (`services::playback_gate`, Ghidra report
     // Follow-up (ff)): `draw_at` stops requesting new frame callbacks once
     // paused (see its own doc comment), so nothing would ever notice the
     // pause clearing without this independent timer.
@@ -1339,7 +1339,7 @@ delegate_registry!(WallpaperState);
 
 // ── Playback-pause: zwlr_foreign_toplevel_management (manual dispatch — no
 // smithay-client-toolkit delegate exists for this protocol) ───────────────────
-// See `engine::playback_gate`'s module doc (Ghidra report Follow-up (ff)).
+// See `services::playback_gate`'s module doc (Ghidra report Follow-up (ff)).
 
 impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for WallpaperState {
     fn event(
