@@ -28,7 +28,7 @@ use crate::engine::particle;
 use crate::engine::scene::{parse_value_bool, parse_value_f32};
 use crate::platform::GpuDevice;
 
-const SHADER_SRC: &str = include_str!("../gpu/shaders/gpu_shaders.wgsl");
+const SHADER_SRC: &str = include_str!("gpu_shaders.wgsl");
 
 /// Per-layer ping-pong buffer key in the FBO pool (each layer's effect chain
 /// gets its own pair, sized to that layer's object size).
@@ -2329,7 +2329,7 @@ impl GpuSceneInstance {
     }
 
     fn build(mut renderer: GpuSceneRenderer, dir: &Path) -> Result<Self> {
-        let resolved = super::render::ResolvedScene::from_directory(dir)?;
+        let resolved = crate::engine::render::ResolvedScene::from_directory(dir)?;
         // The unparsed scene.json: scripts and timelines read fields the
         // typed model drops.
         let raw_scene: serde_json::Value = crate::engine::assets::AssetStore::from_directory(dir)
@@ -2739,7 +2739,8 @@ impl GpuSceneInstance {
                     else {
                         return None;
                     };
-                    let image = super::render::resolve_static_texture(Some(dir), None, path)?;
+                    let image =
+                        crate::engine::render::resolve_static_texture(Some(dir), None, path)?;
                     let vp = crate::engine::gpu::shadow::spot_light_view_proj(
                         *origin,
                         *direction,

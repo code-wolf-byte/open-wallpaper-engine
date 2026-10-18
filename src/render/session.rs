@@ -14,7 +14,7 @@ use anyhow::Result;
 
 use super::web::{WebInputEvent, WebOptions};
 use super::{FrameSource, RenderSettings, WallpaperContent};
-use crate::engine::gpu_renderer::GpuSceneInstance;
+use crate::engine::gpu::renderer::GpuSceneInstance;
 use crate::engine::media::{MediaWatcher, PlaybackState as MediaState};
 use crate::engine::playback_gate::{self, PlaybackAction, PlaybackPolicy, PlaybackState};
 use crate::platform::power::{self, LockWatcher};

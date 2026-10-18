@@ -52,7 +52,7 @@ impl FrameSource {
 
                 thread::spawn(move || {
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::engine::gpu_renderer::gpu_scene_render_loop(&dir, &tx, target_fps)
+                        crate::engine::gpu::renderer::gpu_scene_render_loop(&dir, &tx, target_fps)
                     }));
                     match r {
                         Ok(Ok(())) => {}
