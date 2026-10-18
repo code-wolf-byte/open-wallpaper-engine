@@ -1,8 +1,8 @@
 use anyhow::Result;
 use std::path::Path;
 
-use super::assets::AssetStore;
-use super::material::{EffectDefinition, Model};
+use crate::engine::assets::AssetStore;
+use crate::engine::material::{EffectDefinition, Model};
 use crate::engine::model::scene::{Scene, SceneObject};
 
 pub struct SceneGraph {
@@ -305,7 +305,10 @@ impl SceneGraphStats {
     }
 }
 
-fn collect_material_stats(material: &super::material::Material, stats: &mut SceneGraphStats) {
+fn collect_material_stats(
+    material: &crate::engine::material::Material,
+    stats: &mut SceneGraphStats,
+) {
     stats.material_passes += material.passes.len();
 
     for pass in &material.passes {

@@ -3,3 +3,4 @@
 
 pub mod animated;
 pub mod effect;
+pub mod graph;

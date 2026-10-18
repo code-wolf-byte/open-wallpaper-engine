@@ -8,7 +8,6 @@ pub mod assets;
 pub mod audio;
 pub mod cpu;
 pub mod gpu;
-pub mod graph;
 pub mod material;
 #[cfg(target_os = "linux")]
 pub mod media;
@@ -20,11 +19,11 @@ pub mod sim;
 pub mod tex;
 
 // Convenience re-exports.
+pub use crate::engine::cpu::graph::SceneGraph;
 pub use crate::engine::gpu::fbo::{RenderTarget, RenderTargetPool};
 pub use crate::engine::model::resolve::ResolvedScene;
 pub use crate::engine::model::scene::Scene;
 pub use crate::engine::sim::camera_dynamics::{CameraDynamics, CameraFrameDynamics};
-pub use graph::SceneGraph;
 pub use pkg::Package;
 pub use properties::SceneProperties;
 pub use tex::TexFile;
