@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::engine::model::scene::{Scene, SceneObject};
-use crate::engine::properties::SceneProperties;
 use crate::engine::sim::particle;
 use crate::formats::pkg::Package;
 use crate::formats::tex::TexFile;
+use crate::workshop::properties::SceneProperties;
 
 /// Parse scene.json, first resolving `{"user": ...}` references against the
 /// wallpaper's project.json properties (plus any `--set-property` overrides).
