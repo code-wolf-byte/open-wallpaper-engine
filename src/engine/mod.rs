@@ -21,7 +21,6 @@ pub mod playback_gate;
 pub mod properties;
 pub mod render;
 pub mod scene;
-pub mod script;
 pub mod sim;
 pub mod tex;
 
