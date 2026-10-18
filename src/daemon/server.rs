@@ -277,7 +277,7 @@ pub(super) fn handle_request(req: Request, state: &Mutex<State>) -> Response {
                     for name in &names {
                         let (dir, name) = (dir.clone(), name.clone());
                         s.property_edits
-                            .push(crate::render::settings::PropertyEdit { dir, name });
+                            .push(crate::content::settings::PropertyEdit { dir, name });
                     }
                 }
             }
