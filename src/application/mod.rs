@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use crate::content::{ScreenContent, ScreenSettings, WallpaperContent};
 use crate::platform::{self, WallpaperHandle};
-use crate::render::{ScreenContent, ScreenSettings, WallpaperContent};
 
 pub mod application_context;
 pub use application_context::ApplicationContext;
