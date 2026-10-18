@@ -508,7 +508,7 @@ impl WpApp {
         display_title: String,
         properties: HashMap<String, String>,
     ) {
-        crate::engine::properties::set_global_overrides(properties);
+        crate::workshop::properties::set_global_overrides(properties);
         let old_renderer = self.renderer.take();
         let settings = Arc::clone(&self.settings);
         let (tx, rx) = mpsc::channel();
