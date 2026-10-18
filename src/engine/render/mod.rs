@@ -47,7 +47,7 @@ pub struct ResolvedScene {
 /// a flat quad — spheres, skyboxes and cylinders can't be billboarded.
 pub struct Mesh3dLayer {
     pub name: String,
-    pub mesh: crate::engine::mesh3d::Mesh3d,
+    pub mesh: crate::engine::model::mesh3d::Mesh3d,
     /// Resolved from the material path embedded in the `.mdl` header.
     pub texture: RgbaImage,
     /// World-space transform (WE scene units; the mesh's own space is ≈ unit).
@@ -1570,7 +1570,7 @@ fn mesh3d_layer_from_object(
     // has non-ASCII names too) — so retry lowercased on any miss.
     let bytes = read_asset_bytes(dir, pkg, path)
         .or_else(|| read_asset_bytes(dir, pkg, &path.to_lowercase()))?;
-    let mesh = crate::engine::mesh3d::parse(&bytes)?;
+    let mesh = crate::engine::model::mesh3d::parse(&bytes)?;
     let resolve_tex = |p: &str| {
         dir.and_then(|d| load_texture_from_dir(d, p).ok())
             .or_else(|| pkg.and_then(|p2| load_texture_from_pkg(p2, p).ok()))
