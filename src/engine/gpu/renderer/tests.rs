@@ -381,7 +381,7 @@ mod hit_tests {
         };
         let dir = crate::workshop::find_item_dir(&target, None)
             .unwrap_or_else(|| std::path::PathBuf::from(&target));
-        let resolved = crate::engine::render::ResolvedScene::from_directory(&dir).unwrap();
+        let resolved = crate::engine::model::resolve::ResolvedScene::from_directory(&dir).unwrap();
         let raw_scene: serde_json::Value = crate::engine::assets::AssetStore::from_directory(&dir)
             .ok()
             .and_then(|a| a.scene_json().ok())
