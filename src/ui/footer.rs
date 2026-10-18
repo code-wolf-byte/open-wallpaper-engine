@@ -20,13 +20,13 @@ impl WpApp {
                             .clicked()
                         {
                             ui.close();
-                            if let Some(p) = config::pick_path(true) {
+                            if let Some(p) = pick_path(true) {
                                 self.open_path(PathBuf::from(p));
                             }
                         }
                         if ui.button("Open video, image or web page…").clicked() {
                             ui.close();
-                            if let Some(p) = config::pick_path(false) {
+                            if let Some(p) = pick_path(false) {
                                 self.open_path(PathBuf::from(p));
                             }
                         }

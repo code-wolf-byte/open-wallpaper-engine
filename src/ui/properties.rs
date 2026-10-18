@@ -2,7 +2,7 @@
 //! in Wallpaper Engine's order and wording, edited live and saved to
 //! settings.json.
 
-use super::config::pick_path;
+use super::pick_path;
 use super::{WpApp, DANGER, TEXT_MUTED};
 use crate::workshop::properties::SceneProperty;
 use serde_json::Value;
