@@ -19,16 +19,15 @@ pub mod pkg;
 pub mod playback_gate;
 pub mod properties;
 pub mod render;
-pub mod scene;
 pub mod sim;
 pub mod tex;
 
 // Convenience re-exports.
 pub use crate::engine::gpu::fbo::{RenderTarget, RenderTargetPool};
+pub use crate::engine::model::scene::Scene;
 pub use crate::engine::sim::camera_dynamics::{CameraDynamics, CameraFrameDynamics};
 pub use graph::SceneGraph;
 pub use pkg::Package;
 pub use properties::SceneProperties;
 pub use render::ResolvedScene;
-pub use scene::Scene;
 pub use tex::TexFile;
