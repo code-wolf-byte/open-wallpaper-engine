@@ -1,7 +1,7 @@
 //! What every wallpaper output does whatever way it reaches the screen,
 //! shared by the Wayland and X11 backends: building an output's renderer,
 //! applying live user-property edits, and deciding from the playback rules
-//! (`engine::playback_gate`) whether to run, mute, pause or stop. The
+//! (`services::playback_gate`) whether to run, mute, pause or stop. The
 //! backends keep only what is theirs: querying window states and getting
 //! pixels onto the screen.
 
