@@ -18,7 +18,7 @@ fn gpu_shaders_wgsl_parses_and_validates() {
 }
 
 fn quad3d_test_camera() -> crate::engine::sim::camera3d::PerspectiveCamera {
-    let scene: crate::engine::scene::Scene = serde_json::from_str(
+    let scene: crate::engine::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0", "up": "0 1 0"},
             "general": {"orthogonalprojection": null, "fov": 60.0}}"#,
     )
@@ -90,7 +90,7 @@ fn project_quad_corners_none_when_behind_camera() {
 #[test]
 fn mesh3d_lighting_bytes_are_uniform_sized_and_match_const() {
     assert_eq!(MESH3D_LIGHTING_BYTES_LEN % 16, 0);
-    let scene: crate::engine::scene::Scene = serde_json::from_str(
+    let scene: crate::engine::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
     )
     .unwrap();
@@ -119,7 +119,7 @@ fn mesh3d_lighting_bytes_are_uniform_sized_and_match_const() {
 /// see `MESH3D_LIGHTING_BYTES_LEN`'s own layout doc).
 #[test]
 fn mesh3d_lighting_bytes_encodes_cookie_flag_and_matrix() {
-    let scene: crate::engine::scene::Scene = serde_json::from_str(
+    let scene: crate::engine::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
     )
     .unwrap();
@@ -155,13 +155,13 @@ fn mesh3d_lighting_bytes_encodes_cookie_flag_and_matrix() {
 /// `mesh3d_spot_factor` in the shader doesn't read it as "not a spot".
 #[test]
 fn mesh3d_lighting_bytes_encodes_spot_direction() {
-    let cam_scene: crate::engine::scene::Scene = serde_json::from_str(
+    let cam_scene: crate::engine::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
     )
     .unwrap();
     let cam = crate::engine::sim::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
 
-    let scene: crate::engine::scene::Scene = serde_json::from_str(
+    let scene: crate::engine::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"},
             "general": {"orthogonalprojection": null},
             "objects": [
@@ -204,13 +204,13 @@ fn mesh3d_lighting_bytes_encodes_spot_direction() {
 /// view-space direction in xyz, and still engage the lit branch.
 #[test]
 fn mesh3d_lighting_bytes_encodes_directional_sentinel_and_direction() {
-    let cam_scene: crate::engine::scene::Scene = serde_json::from_str(
+    let cam_scene: crate::engine::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
     )
     .unwrap();
     let cam = crate::engine::sim::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
 
-    let scene: crate::engine::scene::Scene = serde_json::from_str(
+    let scene: crate::engine::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"},
             "general": {"orthogonalprojection": null},
             "objects": [
@@ -252,13 +252,13 @@ fn mesh3d_lighting_bytes_encodes_directional_sentinel_and_direction() {
 /// not be unit-length like a spot's.
 #[test]
 fn mesh3d_lighting_bytes_encodes_tube_sentinel_and_endpoints() {
-    let cam_scene: crate::engine::scene::Scene = serde_json::from_str(
+    let cam_scene: crate::engine::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
     )
     .unwrap();
     let cam = crate::engine::sim::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
 
-    let scene: crate::engine::scene::Scene = serde_json::from_str(
+    let scene: crate::engine::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"},
             "general": {"orthogonalprojection": null},
             "objects": [
