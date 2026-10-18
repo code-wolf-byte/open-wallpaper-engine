@@ -3,3 +3,4 @@
 //! `scene.pkg`, and the WE install's shared assets.
 
 pub mod pkg;
+pub mod tex;
