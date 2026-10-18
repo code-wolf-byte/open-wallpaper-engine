@@ -61,7 +61,7 @@ impl Scene {
     pub fn lights(
         &self,
     ) -> Vec<(
-        crate::engine::lighting::Light,
+        crate::engine::gpu::lighting::Light,
         bool,
         Option<(f32, f32)>,
         Option<String>,
@@ -96,7 +96,7 @@ impl Scene {
                 let is_spot =
                     matches!(o.light_type(), LightType::Spot) || o.spot_cone_degrees().is_some();
                 let light = if matches!(o.light_type(), LightType::Directional) {
-                    crate::engine::lighting::Light::Directional {
+                    crate::engine::gpu::lighting::Light::Directional {
                         direction: direction(),
                         color,
                         intensity,
@@ -119,7 +119,7 @@ impl Scene {
                     let outer = o.spot_cone_degrees().map(|(_, o)| o).unwrap_or(30.0);
                     let exponent =
                         (2.0 / (1.0 - outer.to_radians().cos()).max(1e-4)).clamp(1.0, 64.0);
-                    crate::engine::lighting::Light::Spot {
+                    crate::engine::gpu::lighting::Light::Spot {
                         origin,
                         direction: direction(),
                         exponent,
@@ -130,14 +130,14 @@ impl Scene {
                     }
                 } else if matches!(o.light_type(), LightType::Tube) {
                     let (origin_a, origin_b) = o.tube_endpoints();
-                    crate::engine::lighting::Light::Tube {
+                    crate::engine::gpu::lighting::Light::Tube {
                         origin_a,
                         origin_b,
                         color,
                         intensity,
                     }
                 } else {
-                    crate::engine::lighting::Light::Point {
+                    crate::engine::gpu::lighting::Light::Point {
                         origin,
                         color,
                         intensity,
@@ -309,8 +309,8 @@ impl General {
     /// Returns `None` when both distance and height fog density are 0 / unset
     /// (fog off). The caller (render.rs / gpu_renderer.rs) should only run
     /// the fog pass when this returns `Some`.
-    pub fn fog(&self) -> Option<crate::engine::lighting::Fog> {
-        use crate::engine::lighting::Fog;
+    pub fn fog(&self) -> Option<crate::engine::gpu::lighting::Fog> {
+        use crate::engine::gpu::lighting::Fog;
         let d = self
             .fog_distance
             .as_ref()
@@ -1211,7 +1211,7 @@ mod tests {
         let lights = scene.lights();
         assert_eq!(lights.len(), 1);
         match &lights[0].0 {
-            crate::engine::lighting::Light::Spot {
+            crate::engine::gpu::lighting::Light::Spot {
                 origin,
                 intensity,
                 exponent,
@@ -1241,7 +1241,7 @@ mod tests {
         assert_eq!(lights.len(), 1);
         assert!(matches!(
             lights[0].0,
-            crate::engine::lighting::Light::Point { .. }
+            crate::engine::gpu::lighting::Light::Point { .. }
         ));
     }
 
@@ -1257,7 +1257,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             scene.lights()[0].0,
-            crate::engine::lighting::Light::Point { .. }
+            crate::engine::gpu::lighting::Light::Point { .. }
         ));
     }
 
@@ -1277,7 +1277,7 @@ mod tests {
         let lights = scene.lights();
         assert_eq!(lights.len(), 1);
         match &lights[0].0 {
-            crate::engine::lighting::Light::Directional {
+            crate::engine::gpu::lighting::Light::Directional {
                 direction,
                 intensity,
                 ..
@@ -1300,7 +1300,7 @@ mod tests {
                 .unwrap();
         assert!(matches!(
             scene.lights()[0].0,
-            crate::engine::lighting::Light::Spot { .. }
+            crate::engine::gpu::lighting::Light::Spot { .. }
         ));
     }
 
@@ -1320,11 +1320,11 @@ mod tests {
         assert_eq!(lights.len(), 2);
         assert!(matches!(
             lights[0].0,
-            crate::engine::lighting::Light::Point { .. }
+            crate::engine::gpu::lighting::Light::Point { .. }
         ));
         assert!(matches!(
             lights[1].0,
-            crate::engine::lighting::Light::Point { .. }
+            crate::engine::gpu::lighting::Light::Point { .. }
         ));
     }
 
@@ -1410,7 +1410,7 @@ mod tests {
         let lights = scene.lights();
         assert_eq!(lights.len(), 1);
         match &lights[0].0 {
-            crate::engine::lighting::Light::Tube {
+            crate::engine::gpu::lighting::Light::Tube {
                 origin_a,
                 origin_b,
                 intensity,
@@ -1432,7 +1432,7 @@ mod tests {
             Scene::from_json(r#"{"objects": [{"id": 1, "light": "ltube", "origin": "5 0 0"}]}"#)
                 .unwrap();
         match &scene.lights()[0].0 {
-            crate::engine::lighting::Light::Tube {
+            crate::engine::gpu::lighting::Light::Tube {
                 origin_a, origin_b, ..
             } => {
                 assert_eq!(origin_a, origin_b);
