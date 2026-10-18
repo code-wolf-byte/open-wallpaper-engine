@@ -247,15 +247,23 @@ impl AudioResponse {
         })
     }
 
-    /// Rate multiplier for one 16-band spectrum (L/R averaged).
-    // ponytail: WE's runtime consumer of this struct isn't decompiled (its
-    // caller overflows the Ghidra bridge); mean-of-bands -> pow(exponent) ->
-    // lerp(bounds) is reconstructed from the parsed fields, and `mode` is
-    // treated only as an on-switch. Revisit if the consumer is recovered.
+    /// Rate multiplier for one 16-band spectrum (L/R averaged). Per WE's
+    /// emitter docs the emitter is "only active when audio is playing" and
+    /// `bounds` are the volume levels where the response starts and stops,
+    /// so silence -> 0 and the rate ramps from `bounds[0]` to `bounds[1]`.
+    // ponytail: WE's runtime consumer isn't decompiled; the exponent-then-
+    // bounds order follows the docs' wording, and `mode` (left/right/center)
+    // is treated only as an on-switch. Revisit if the consumer is recovered.
     fn gain(&self, bands16: &[f32; 16]) -> f32 {
         let s = &bands16[self.bands[0]..=self.bands[1]];
-        let level = (s.iter().sum::<f32>() / s.len() as f32).clamp(0.0, 1.0);
-        lerp_f32(self.bounds[0], self.bounds[1], level.powf(self.exponent))
+        let level = (s.iter().sum::<f32>() / s.len() as f32)
+            .clamp(0.0, 1.0)
+            .powf(self.exponent);
+        let [lo, hi] = self.bounds;
+        if hi <= lo {
+            return if level >= lo { 1.0 } else { 0.0 };
+        }
+        ((level - lo) / (hi - lo)).clamp(0.0, 1.0)
     }
 }
 
@@ -4855,7 +4863,7 @@ mod tests {
     }
 
     /// Audio response: WE's parser defaults, band clamp/swap, and the gain
-    /// range follows `bounds` over the selected bands only.
+    /// ramp runs between the `bounds` volume levels over the selected bands.
     #[test]
     fn audio_response_defaults_bands_and_bounds() {
         let em = |j: &str| serde_json::from_str::<Emitter>(j).unwrap();
@@ -4869,11 +4877,13 @@ mod tests {
         .unwrap();
         assert_eq!(r.bands, [6, 15]);
         let mut bands = [0.0; 16];
-        assert_eq!(r.gain(&bands), 0.2);
+        assert_eq!(r.gain(&bands), 0.0); // silence: emitter inactive
         bands[0] = 1.0; // outside 6..=15: no effect
-        assert_eq!(r.gain(&bands), 0.2);
+        assert_eq!(r.gain(&bands), 0.0);
+        bands[6..].fill(0.85);
+        assert!((r.gain(&bands) - 0.5).abs() < 1e-6); // (0.85-0.2)/(1.5-0.2)
         bands[6..].fill(1.0);
-        assert!((r.gain(&bands) - 1.5).abs() < 1e-6);
+        assert!((r.gain(&bands) - 0.8 / 1.3).abs() < 1e-6);
     }
 
     /// `boids` cohesion pulls two distant particles toward each other.
