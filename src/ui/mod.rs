@@ -6,11 +6,11 @@
 //! wallpaper applies it to the chosen display straight away; Cancel puts
 //! back what was showing (and saved) when the window opened.
 
+use crate::content::RenderSettings;
 use crate::platform::{RenderQuality, WallpaperHandle};
-use crate::render::RenderSettings;
 use crate::workshop::{self, Wallpaper, WallpaperType};
 #[cfg(not(target_os = "linux"))]
-use crate::{platform::display::detect_platform, render::WallpaperContent};
+use crate::{content::WallpaperContent, platform::display::detect_platform};
 use egui::{pos2, vec2, Align, Color32, CornerRadius, FontId, Layout, Rect, Sense, Stroke};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -315,7 +315,7 @@ impl WpApp {
             close_after_apply: false,
             status,
             settings: Arc::new(Mutex::new(RenderSettings {
-                fps: saved.fps.unwrap_or(crate::render::settings::DEFAULT_FPS),
+                fps: saved.fps.unwrap_or(crate::content::settings::DEFAULT_FPS),
                 scaling: saved.scaling.unwrap_or_default(),
                 ..Default::default()
             })),
@@ -519,8 +519,8 @@ impl WpApp {
             }
             let result = detect_platform()
                 .spawn_wallpaper(
-                    crate::render::ScreenContent::single(content),
-                    crate::render::ScreenSettings::single(settings),
+                    crate::content::ScreenContent::single(content),
+                    crate::content::ScreenSettings::single(settings),
                 )
                 .map(|handle| (Some(handle), display_title.clone()))
                 .map_err(|e| format!("{e:#}"));
@@ -1256,9 +1256,9 @@ impl WpApp {
                 let mut layout = self.saved.layout.unwrap_or_default();
                 let before = layout;
                 for (l, text) in [
-                    (crate::render::ScreenLayout::PerScreen, "Separate"),
-                    (crate::render::ScreenLayout::Span, "Stretch"),
-                    (crate::render::ScreenLayout::Clone, "Clone"),
+                    (crate::content::ScreenLayout::PerScreen, "Separate"),
+                    (crate::content::ScreenLayout::Span, "Stretch"),
+                    (crate::content::ScreenLayout::Clone, "Clone"),
                 ] {
                     ui.selectable_value(&mut layout, l, text);
                 }
@@ -1507,7 +1507,7 @@ fn can_apply(w: &Wallpaper) -> Result<(), &'static str> {
     match w.wallpaper_type() {
         WallpaperType::Scene | WallpaperType::Preset => Ok(()),
         WallpaperType::Application => Err("Application wallpapers only run on Windows"),
-        WallpaperType::Web if !crate::render::web::is_supported() => {
+        WallpaperType::Web if !crate::content::web::is_supported() => {
             Err("Web wallpapers need a build with --features web")
         }
         _ if file_ok() => Ok(()),
