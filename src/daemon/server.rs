@@ -393,7 +393,14 @@ mod tests {
         );
 
         drop(first);
-        InstanceLock::acquire(&path).expect("lock is free again once dropped");
+        // A process another test spawns at this moment briefly shares our
+        // open file (fork to exec) and with it the lock, so allow a moment.
+        let again = (0..100).find_map(|_| {
+            InstanceLock::acquire(&path)
+                .inspect_err(|_| std::thread::sleep(std::time::Duration::from_millis(10)))
+                .ok()
+        });
+        assert!(again.is_some(), "lock is free again once dropped");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
