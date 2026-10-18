@@ -17,13 +17,13 @@ fn gpu_shaders_wgsl_parses_and_validates() {
     .expect("gpu_shaders.wgsl failed validation");
 }
 
-fn quad3d_test_camera() -> crate::engine::sim::camera3d::PerspectiveCamera {
-    let scene: crate::engine::model::scene::Scene = serde_json::from_str(
+fn quad3d_test_camera() -> crate::audio::sim::camera3d::PerspectiveCamera {
+    let scene: crate::audio::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0", "up": "0 1 0"},
             "general": {"orthogonalprojection": null, "fov": 60.0}}"#,
     )
     .unwrap();
-    crate::engine::sim::camera3d::PerspectiveCamera::from_scene(&scene, 1.0).unwrap()
+    crate::audio::sim::camera3d::PerspectiveCamera::from_scene(&scene, 1.0).unwrap()
 }
 
 /// A camera-facing quad (no rotation, centered on the view axis) must
@@ -90,11 +90,11 @@ fn project_quad_corners_none_when_behind_camera() {
 #[test]
 fn mesh3d_lighting_bytes_are_uniform_sized_and_match_const() {
     assert_eq!(MESH3D_LIGHTING_BYTES_LEN % 16, 0);
-    let scene: crate::engine::model::scene::Scene = serde_json::from_str(
+    let scene: crate::audio::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
     )
     .unwrap();
-    let cam = crate::engine::sim::camera3d::PerspectiveCamera::from_scene(&scene, 1.0).unwrap();
+    let cam = crate::audio::sim::camera3d::PerspectiveCamera::from_scene(&scene, 1.0).unwrap();
 
     // The common case: no shadow-casting lights at all.
     let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[], None);
@@ -105,7 +105,7 @@ fn mesh3d_lighting_bytes_are_uniform_sized_and_match_const() {
     // slots are actually in use.
     let shadow_slots = vec![Some(0)];
     let shadow_slot_data = vec![(
-        crate::engine::sim::camera3d::identity(),
+        crate::audio::sim::camera3d::identity(),
         [0.0, 0.0, 1.0, 1.0],
     )];
     let bytes = mesh3d_lighting_bytes(&scene, &cam, &shadow_slots, &shadow_slot_data, None);
@@ -119,13 +119,13 @@ fn mesh3d_lighting_bytes_are_uniform_sized_and_match_const() {
 /// see `MESH3D_LIGHTING_BYTES_LEN`'s own layout doc).
 #[test]
 fn mesh3d_lighting_bytes_encodes_cookie_flag_and_matrix() {
-    let scene: crate::engine::model::scene::Scene = serde_json::from_str(
+    let scene: crate::audio::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
     )
     .unwrap();
-    let cam = crate::engine::sim::camera3d::PerspectiveCamera::from_scene(&scene, 1.0).unwrap();
+    let cam = crate::audio::sim::camera3d::PerspectiveCamera::from_scene(&scene, 1.0).unwrap();
 
-    let mut vp = crate::engine::sim::camera3d::identity();
+    let mut vp = crate::audio::sim::camera3d::identity();
     vp[3][0] = 42.0; // an arbitrary, recognizable value to round-trip
     let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[], Some((2, vp)));
 
@@ -155,13 +155,13 @@ fn mesh3d_lighting_bytes_encodes_cookie_flag_and_matrix() {
 /// `mesh3d_spot_factor` in the shader doesn't read it as "not a spot".
 #[test]
 fn mesh3d_lighting_bytes_encodes_spot_direction() {
-    let cam_scene: crate::engine::model::scene::Scene = serde_json::from_str(
+    let cam_scene: crate::audio::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
     )
     .unwrap();
-    let cam = crate::engine::sim::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
+    let cam = crate::audio::sim::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
 
-    let scene: crate::engine::model::scene::Scene = serde_json::from_str(
+    let scene: crate::audio::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"},
             "general": {"orthogonalprojection": null},
             "objects": [
@@ -204,13 +204,13 @@ fn mesh3d_lighting_bytes_encodes_spot_direction() {
 /// view-space direction in xyz, and still engage the lit branch.
 #[test]
 fn mesh3d_lighting_bytes_encodes_directional_sentinel_and_direction() {
-    let cam_scene: crate::engine::model::scene::Scene = serde_json::from_str(
+    let cam_scene: crate::audio::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
     )
     .unwrap();
-    let cam = crate::engine::sim::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
+    let cam = crate::audio::sim::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
 
-    let scene: crate::engine::model::scene::Scene = serde_json::from_str(
+    let scene: crate::audio::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"},
             "general": {"orthogonalprojection": null},
             "objects": [
@@ -252,13 +252,13 @@ fn mesh3d_lighting_bytes_encodes_directional_sentinel_and_direction() {
 /// not be unit-length like a spot's.
 #[test]
 fn mesh3d_lighting_bytes_encodes_tube_sentinel_and_endpoints() {
-    let cam_scene: crate::engine::model::scene::Scene = serde_json::from_str(
+    let cam_scene: crate::audio::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
     )
     .unwrap();
-    let cam = crate::engine::sim::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
+    let cam = crate::audio::sim::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
 
-    let scene: crate::engine::model::scene::Scene = serde_json::from_str(
+    let scene: crate::audio::model::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"},
             "general": {"orthogonalprojection": null},
             "objects": [
@@ -381,7 +381,7 @@ mod hit_tests {
         };
         let dir = crate::workshop::find_item_dir(&target, None)
             .unwrap_or_else(|| std::path::PathBuf::from(&target));
-        let resolved = crate::engine::model::resolve::ResolvedScene::from_directory(&dir).unwrap();
+        let resolved = crate::audio::model::resolve::ResolvedScene::from_directory(&dir).unwrap();
         let raw_scene: serde_json::Value = crate::formats::assets::AssetStore::from_directory(&dir)
             .ok()
             .and_then(|a| a.scene_json().ok())

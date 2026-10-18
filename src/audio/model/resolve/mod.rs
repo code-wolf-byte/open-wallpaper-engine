@@ -3,9 +3,9 @@ use image::RgbaImage;
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::engine::model::scene::{Scene, SceneObject};
-use crate::engine::properties::SceneProperties;
-use crate::engine::sim::particle;
+use crate::audio::model::scene::{Scene, SceneObject};
+use crate::audio::properties::SceneProperties;
+use crate::audio::sim::particle;
 use crate::formats::pkg::Package;
 use crate::formats::tex::TexFile;
 
@@ -47,7 +47,7 @@ pub struct ResolvedScene {
 /// a flat quad — spheres, skyboxes and cylinders can't be billboarded.
 pub struct Mesh3dLayer {
     pub name: String,
-    pub mesh: crate::engine::model::mesh3d::Mesh3d,
+    pub mesh: crate::audio::model::mesh3d::Mesh3d,
     /// Resolved from the material path embedded in the `.mdl` header.
     pub texture: RgbaImage,
     /// World-space transform (WE scene units; the mesh's own space is ≈ unit).
@@ -179,7 +179,7 @@ pub struct Layer {
     pub clamp_uvs: bool,
     /// Animated puppet runtime (mesh + skeleton + MDLA animations) — the
     /// live GPU path re-poses and re-rasterizes `image` from this.
-    pub puppet: Option<std::sync::Arc<crate::engine::sim::puppet::PuppetRuntime>>,
+    pub puppet: Option<std::sync::Arc<crate::audio::sim::puppet::PuppetRuntime>>,
     /// Embedded-video stream (mp4 inside the .tex) — the live GPU path
     /// re-uploads decoded frames from this; `image` is the first frame.
     pub video: Option<std::sync::Arc<std::sync::Mutex<VideoLayerStream>>>,
@@ -212,7 +212,7 @@ struct LoadedImage {
     /// Present when the model is an animated puppet (mesh + skeleton +
     /// MDLA animations): `image` holds the rest pose, and the live GPU
     /// path re-poses/re-rasterizes from this over time.
-    puppet: Option<std::sync::Arc<crate::engine::sim::puppet::PuppetRuntime>>,
+    puppet: Option<std::sync::Arc<crate::audio::sim::puppet::PuppetRuntime>>,
     /// Present for embedded-video textures: `image` holds the first frame,
     /// and the live GPU path re-uploads frames from this stream over time.
     video: Option<std::sync::Arc<std::sync::Mutex<VideoLayerStream>>>,
@@ -761,7 +761,7 @@ impl ResolvedScene {
                 dst[1] as f32 / 255.0,
                 dst[2] as f32 / 255.0,
             ];
-            let out = crate::engine::gpu::blend::apply_blending(
+            let out = crate::audio::gpu::blend::apply_blending(
                 layer.blend_mode,
                 dest_rgb,
                 src_rgb,
@@ -814,8 +814,8 @@ impl ResolvedScene {
 /// WE `parallaxDepth` is always a vec2 (independent x/y depth), but a bare
 /// number in scene.json means "same depth on both axes".
 fn parse_parallax_depth(v: &serde_json::Value) -> [f64; 2] {
-    use crate::engine::model::DynamicValue;
-    match crate::engine::model::json_to_animated(v).value {
+    use crate::audio::model::DynamicValue;
+    match crate::audio::model::json_to_animated(v).value {
         DynamicValue::Float(f) => [f as f64; 2],
         DynamicValue::Vec3([x, y, _]) => [x as f64, y as f64],
         _ => [0.0, 0.0],
@@ -871,13 +871,13 @@ fn select_spritesheet_frame(obj: &SceneObject, loaded: &mut LoadedImage) {
         .and_then(|v| v.get("script"))
         .and_then(|s| s.as_str())
         .and_then(|script| {
-            let init = crate::engine::sim::script::ObjectInit {
+            let init = crate::audio::sim::script::ObjectInit {
                 visible: true,
                 alpha: 1.0,
                 frame_count: loaded.sprite_frames.len() as u32,
                 ..Default::default()
             };
-            crate::engine::sim::script::evaluate_once("visible", script, &init, None).frame
+            crate::audio::sim::script::evaluate_once("visible", script, &init, None).frame
         })
         .unwrap_or(0)
         .min(loaded.sprite_frames.len() as u32 - 1);
@@ -965,14 +965,14 @@ fn layer_from_object(
         if let Some(rt) = std::sync::Arc::get_mut(rt) {
             let n = rt.model.animations.len();
             if n > 0 {
-                let layers: Vec<crate::engine::sim::puppet::AnimLayer> = entries
+                let layers: Vec<crate::audio::sim::puppet::AnimLayer> = entries
                     .iter()
                     .enumerate()
                     // `visible` is often a user-property binding
                     // (`{"user": "head", "value": false}`), not a bare bool.
                     .filter(|(_, e)| {
                         e.get("visible")
-                            .and_then(crate::engine::model::scene::parse_value_bool)
+                            .and_then(crate::audio::model::scene::parse_value_bool)
                             .unwrap_or(true)
                     })
                     .map(|(i, e)| {
@@ -996,7 +996,7 @@ fn layer_from_object(
                                     i.min(n - 1)
                                 }
                             });
-                        crate::engine::sim::puppet::AnimLayer {
+                        crate::audio::sim::puppet::AnimLayer {
                             anim_idx,
                             additive: e.get("additive").and_then(|v| v.as_bool()).unwrap_or(false),
                             blend: e.get("blend").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
@@ -1020,7 +1020,7 @@ fn layer_from_object(
     let angles_animated = obj
         .angles
         .as_ref()
-        .map(crate::engine::model::json_to_animated);
+        .map(crate::audio::model::json_to_animated);
     let angles3 = angles_animated
         .as_ref()
         .and_then(|v| v.as_vec3())
@@ -1030,7 +1030,7 @@ fn layer_from_object(
     let scale_animated = obj
         .scale
         .as_ref()
-        .map(crate::engine::model::json_to_animated);
+        .map(crate::audio::model::json_to_animated);
     let scale = scale_animated
         .as_ref()
         .and_then(|v| v.as_vec3())
@@ -1039,7 +1039,7 @@ fn layer_from_object(
     let alpha_animated = obj
         .alpha
         .as_ref()
-        .map(crate::engine::model::json_to_animated);
+        .map(crate::audio::model::json_to_animated);
     let alpha = alpha_animated
         .as_ref()
         .and_then(|v| v.as_float())
@@ -1047,13 +1047,13 @@ fn layer_from_object(
     let color = obj
         .color
         .as_ref()
-        .map(crate::engine::model::json_to_animated)
+        .map(crate::audio::model::json_to_animated)
         .and_then(|v| v.as_vec3())
         .unwrap_or([1.0, 1.0, 1.0]);
     let brightness = obj
         .brightness
         .as_ref()
-        .map(crate::engine::model::json_to_animated)
+        .map(crate::audio::model::json_to_animated)
         .and_then(|v| v.as_float())
         .unwrap_or(1.0);
     // ponytail: additive (colorBlendMode 9) image planes with a near-white base
@@ -1368,7 +1368,7 @@ fn text_layer_from_object(
         (Some(script), _) => {
             // One-shot load-time evaluation so the layer rasterizes real
             // content (and sizes itself correctly) from frame 0.
-            let init = crate::engine::sim::script::ObjectInit {
+            let init = crate::audio::sim::script::ObjectInit {
                 name: obj.name.clone(),
                 id: obj.id,
                 visible: true,
@@ -1376,7 +1376,7 @@ fn text_layer_from_object(
                 text: Some(static_str.clone()),
                 ..Default::default()
             };
-            crate::engine::sim::script::evaluate_once(
+            crate::audio::sim::script::evaluate_once(
                 "text",
                 script,
                 &init,
@@ -1403,7 +1403,7 @@ fn text_layer_from_object(
     let scale = obj
         .scale
         .as_ref()
-        .and_then(|v| crate::engine::model::json_to_animated(v).as_vec3())
+        .and_then(|v| crate::audio::model::json_to_animated(v).as_vec3())
         .unwrap_or([1.0, 1.0, 1.0]);
     // The on-screen text height is driven by the object's `size` BOX height,
     // not pointsize: `layer_from_object` scales the rasterized bitmap by the
@@ -1426,18 +1426,18 @@ fn text_layer_from_object(
         point_size * compensate
     }
     .clamp(1.0, 1024.0);
-    let font_data = crate::engine::gpu::text::resolve_font_data(obj.font.as_deref(), dir, pkg)?;
+    let font_data = crate::audio::gpu::text::resolve_font_data(obj.font.as_deref(), dir, pkg)?;
     // Word-wrap to `maxwidth` (scene px == bitmap px at our raster resolution)
     // and cap at `maxrows`, if authored.
     let gate = |v: &Option<serde_json::Value>| {
         v.as_ref()
-            .and_then(crate::engine::model::scene::parse_value_bool)
+            .and_then(crate::audio::model::scene::parse_value_bool)
             .unwrap_or(false)
     };
     let text_str = match obj
         .maxwidth
         .as_ref()
-        .and_then(crate::engine::model::scene::parse_value_f32)
+        .and_then(crate::audio::model::scene::parse_value_f32)
         .filter(|w| *w > 0.0)
         .filter(|_| gate(&obj.limitwidth))
     {
@@ -1445,11 +1445,11 @@ fn text_layer_from_object(
             let rows = obj
                 .maxrows
                 .as_ref()
-                .and_then(crate::engine::model::scene::parse_value_f32)
+                .and_then(crate::audio::model::scene::parse_value_f32)
                 .filter(|_| gate(&obj.limitrows))
                 .unwrap_or(0.0)
                 .max(0.0) as usize;
-            crate::engine::gpu::text::wrap_text(
+            crate::audio::gpu::text::wrap_text(
                 &font_data,
                 &text_str,
                 raster_px,
@@ -1460,7 +1460,7 @@ fn text_layer_from_object(
         }
         None => text_str,
     };
-    let image = crate::engine::gpu::text::rasterize(&font_data, &text_str, raster_px)?;
+    let image = crate::audio::gpu::text::rasterize(&font_data, &text_str, raster_px)?;
 
     // Opaque background box: bake the text color + bg color + padding into the
     // bitmap and neutralize the layer tint (color set to white below). `pad`
@@ -1478,18 +1478,18 @@ fn text_layer_from_object(
         let text_color = obj
             .color
             .as_ref()
-            .and_then(|v| crate::engine::model::scene::parse_value_vec3(v))
+            .and_then(|v| crate::audio::model::scene::parse_value_vec3(v))
             .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
             .unwrap_or([1.0, 1.0, 1.0]);
         let bright = obj
             .backgroundbrightness
             .as_ref()
-            .and_then(crate::engine::model::scene::parse_value_f32)
+            .and_then(crate::audio::model::scene::parse_value_f32)
             .unwrap_or(1.0);
         let bg = obj
             .backgroundcolor
             .as_ref()
-            .and_then(|v| crate::engine::model::scene::parse_value_vec3(v))
+            .and_then(|v| crate::audio::model::scene::parse_value_vec3(v))
             .map(|c| {
                 [
                     c[0] as f32 * bright,
@@ -1501,11 +1501,11 @@ fn text_layer_from_object(
         let pad = obj
             .padding
             .as_ref()
-            .and_then(crate::engine::model::scene::parse_value_f32)
+            .and_then(crate::audio::model::scene::parse_value_f32)
             .unwrap_or(0.0)
             .max(0.0) as u32;
         (
-            crate::engine::gpu::text::with_background(&image, text_color, bg, pad),
+            crate::audio::gpu::text::with_background(&image, text_color, bg, pad),
             true,
         )
     } else {
@@ -1570,7 +1570,7 @@ fn mesh3d_layer_from_object(
     // has non-ASCII names too) — so retry lowercased on any miss.
     let bytes = read_asset_bytes(dir, pkg, path)
         .or_else(|| read_asset_bytes(dir, pkg, &path.to_lowercase()))?;
-    let mesh = crate::engine::model::mesh3d::parse(&bytes)?;
+    let mesh = crate::audio::model::mesh3d::parse(&bytes)?;
     let resolve_tex = |p: &str| {
         dir.and_then(|d| load_texture_from_dir(d, p).ok())
             .or_else(|| pkg.and_then(|p2| load_texture_from_pkg(p2, p).ok()))
@@ -1605,12 +1605,12 @@ fn mesh3d_layer_from_object(
     let scale = obj
         .scale
         .as_ref()
-        .and_then(|v| crate::engine::model::json_to_animated(v).as_vec3())
+        .and_then(|v| crate::audio::model::json_to_animated(v).as_vec3())
         .unwrap_or([1.0, 1.0, 1.0]);
     let angles = obj
         .angles
         .as_ref()
-        .and_then(|v| crate::engine::model::json_to_animated(v).as_vec3())
+        .and_then(|v| crate::audio::model::json_to_animated(v).as_vec3())
         .unwrap_or([0.0, 0.0, 0.0]);
     let o = obj.parsed_origin();
 
@@ -1859,7 +1859,7 @@ pub(crate) fn resolve_static_texture(
 /// living only in the global assets install, never copied into the
 /// wallpaper's own directory/pkg — see [[wp_engine_project]] memory.
 fn read_from_global_assets(rel_path: &str) -> Option<Vec<u8>> {
-    let dir = crate::engine::gpu::shaders::loader::find_we_assets_dir()?;
+    let dir = crate::audio::gpu::shaders::loader::find_we_assets_dir()?;
     std::fs::read(dir.join(rel_path)).ok()
 }
 
@@ -1957,7 +1957,7 @@ fn pass_constant_color(pass: &serde_json::Value) -> Option<[u8; 3]> {
         .get("color")
         .or_else(|| consts.get("Color"))?
         .as_str()?;
-    let c = crate::engine::cpu::effect::parse_color(s);
+    let c = crate::audio::cpu::effect::parse_color(s);
     Some([
         (c[0].clamp(0.0, 1.0) * 255.0) as u8,
         (c[1].clamp(0.0, 1.0) * 255.0) as u8,
@@ -2116,7 +2116,7 @@ fn apply_puppet_mesh(
         tracing::warn!(target: "scene", "puppet mesh '{puppet_path}' not found — drawing raw atlas");
         return plain(atlas);
     };
-    let Some(model) = crate::engine::sim::puppet::parse_model(&mdl_bytes) else {
+    let Some(model) = crate::audio::sim::puppet::parse_model(&mdl_bytes) else {
         tracing::warn!(target: "scene", "puppet mesh '{puppet_path}' unparsable — drawing raw atlas");
         return plain(atlas);
     };
@@ -2131,7 +2131,7 @@ fn apply_puppet_mesh(
     // With a skeleton + animation, frame 0 of the animation IS the
     // assembled pose (skin = worldAnim * inverse(atlas-space bind)); the
     // raw mesh alone only reproduces the packed atlas layout.
-    let runtime = crate::engine::sim::puppet::PuppetRuntime {
+    let runtime = crate::audio::sim::puppet::PuppetRuntime {
         model,
         atlas,
         layers: Vec::new(),
@@ -2139,7 +2139,7 @@ fn apply_puppet_mesh(
     let assembled = if runtime.model.has_animation() {
         runtime.render_at(0.0, runtime.atlas.width(), runtime.atlas.height())
     } else {
-        crate::engine::sim::puppet::rasterize(
+        crate::audio::sim::puppet::rasterize(
             &runtime.model.mesh,
             &runtime.atlas,
             runtime.atlas.width(),
@@ -2279,14 +2279,14 @@ pub fn obj_local_xform(obj: &SceneObject) -> Xform {
     let r = obj
         .angles
         .as_ref()
-        .map(crate::engine::model::json_to_animated)
+        .map(crate::audio::model::json_to_animated)
         .and_then(|v| v.as_vec3())
         .map(|a| [a[0] as f64, a[1] as f64, a[2] as f64])
         .unwrap_or([0.0; 3]);
     let s = obj
         .scale
         .as_ref()
-        .and_then(crate::engine::model::scene::parse_value_vec3)
+        .and_then(crate::audio::model::scene::parse_value_vec3)
         .unwrap_or([1.0, 1.0, 1.0]);
     Xform { t, r, s }
 }
@@ -2305,7 +2305,7 @@ fn parent_index(
     if obj
         .disablepropagation
         .as_ref()
-        .and_then(crate::engine::model::scene::parse_value_bool)
+        .and_then(crate::audio::model::scene::parse_value_bool)
         .unwrap_or(false)
     {
         return None;

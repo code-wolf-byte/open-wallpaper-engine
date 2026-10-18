@@ -4,8 +4,8 @@
 //! `settings.json`, the same file `wp-engine config` writes.
 
 use super::{StatusMsg, WpApp, DANGER, TEXT_MUTED};
-use crate::engine::playback_gate::PlaybackAction;
-use crate::engine::properties::SceneProperty;
+use crate::audio::playback_gate::PlaybackAction;
+use crate::audio::properties::SceneProperty;
 use crate::platform::RenderQuality;
 use crate::render::ScaleMode;
 use crate::settings::{Playlist, WpSettings};
@@ -158,7 +158,7 @@ impl WpApp {
     /// Changes are saved at once and shown live where it is displayed.
     pub(super) fn render_properties(&mut self, ui: &mut egui::Ui, idx: usize) {
         if self.prop_editor.as_ref().map(|e| e.idx) != Some(idx) {
-            let props = crate::engine::properties::list_properties(&self.wallpapers[idx].path)
+            let props = crate::audio::properties::list_properties(&self.wallpapers[idx].path)
                 .unwrap_or_default();
             self.prop_editor = Some(PropertyEditor {
                 idx,
@@ -232,11 +232,11 @@ impl WpApp {
                 let raw = saved.get(&p.name)?;
                 Some((
                     p.name.clone(),
-                    crate::engine::properties::convert_override(p, raw),
+                    crate::audio::properties::convert_override(p, raw),
                 ))
             })
             .collect();
-        crate::engine::properties::visible_rows(props, &values)
+        crate::audio::properties::visible_rows(props, &values)
     }
 
     /// Draws the rows WE would show; returns whether a value was changed.

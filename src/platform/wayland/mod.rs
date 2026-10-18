@@ -48,7 +48,7 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
 };
 
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
-use crate::engine::playback_gate::PlaybackAction;
+use crate::audio::playback_gate::PlaybackAction;
 use crate::{
     platform,
     render::session::{
@@ -414,7 +414,7 @@ impl WallpaperState {
         // `tick_pause_watchdog` notices the condition clearing and restarts
         // the callback chain.
         let action = self.playback_action(Instant::now());
-        crate::engine::audio::set_muted(action >= PlaybackAction::Mute);
+        crate::audio::audio::set_muted(action >= PlaybackAction::Mute);
         if action.halts() {
             if !self.paused {
                 self.notify_web(crate::render::web::WebInputEvent::Paused(true));
@@ -434,7 +434,7 @@ impl WallpaperState {
                 let _ = tx.try_send(crate::render::web::WebInputEvent::Fps(fps));
             }
         }
-        crate::engine::audio::set_master_volume(self.settings.default.lock().unwrap().volume);
+        crate::audio::audio::set_master_volume(self.settings.default.lock().unwrap().volume);
         self.apply_property_edits(idx);
 
         // Frame-rate cap: a callback that arrives early waits on a timer.
@@ -1532,7 +1532,7 @@ impl WallpaperState {
     fn tick_pause_watchdog(&mut self) {
         let was_paused = self.paused;
         let action = self.playback_action(Instant::now());
-        crate::engine::audio::set_muted(action >= PlaybackAction::Mute);
+        crate::audio::audio::set_muted(action >= PlaybackAction::Mute);
         if !was_paused && action.halts() {
             self.notify_web(crate::render::web::WebInputEvent::Paused(true));
         }

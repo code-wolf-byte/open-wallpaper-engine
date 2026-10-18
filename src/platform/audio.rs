@@ -1,7 +1,7 @@
 //! Platform-specific capture-device selection for the audio-reactive path.
 //!
 //! Capture, FFT and the `g_AudioSpectrum*` uniforms are all cross-platform and
-//! live in [`crate::engine::audio`] on top of cpal. The one genuinely
+//! live in [`crate::audio::audio`] on top of cpal. The one genuinely
 //! OS-dependent decision is *which* device carries desktop output, because
 //! "record what the speakers are playing" is spelled differently everywhere:
 //!

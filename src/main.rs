@@ -4,11 +4,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use wp_engine::application::{ApplicationContext, WallpaperApplication};
 use wp_engine::workshop::{self, Wallpaper};
-use wp_engine::{engine, platform, ui};
+use wp_engine::{audio, platform, ui};
 
 #[derive(Parser)]
 #[command(
-    name = "wp-engine",
+    name = "wp-audio",
     about = "Wallpaper Engine client for Wayland",
     long_about = "Browse and apply Steam Workshop wallpapers on Wayland, X11, and macOS.\n\
                   Run without arguments to open the graphical interface."
@@ -141,7 +141,7 @@ enum Command {
         frames: usize,
     },
     /// Manage persisted settings: per-wallpaper property overrides, screen
-    /// assignments, and playlists (~/.config/wp-engine/settings.json)
+    /// assignments, and playlists (~/.config/wp-audio/settings.json)
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -166,7 +166,7 @@ enum Command {
         #[command(subcommand)]
         action: PlaylistAction,
     },
-    /// Start `wp-engine run` at login: on, off, or show the current state
+    /// Start `wp-audio run` at login: on, off, or show the current state
     Autostart {
         #[arg(value_parser = ["on", "off", "status"], default_value = "status")]
         state: String,
@@ -202,7 +202,7 @@ enum ConfigAction {
     SetScreen { screen: String, id: String },
     /// Remove a screen's saved wallpaper assignment
     UnsetScreen { screen: String },
-    /// Set the fallback wallpaper `wp-engine run` uses with no screen assigned
+    /// Set the fallback wallpaper `wp-audio run` uses with no screen assigned
     SetDefault { id: String },
     /// Persist a render-quality override for a wallpaper: Ultra, High, Medium, or Low
     SetQuality { id: String, quality: String },
@@ -228,7 +228,7 @@ enum ConfigAction {
         #[arg(long, value_delimiter = ',')]
         times: Vec<String>,
     },
-    /// Make `wp-engine run` play this playlist (omit NAME to clear)
+    /// Make `wp-audio run` play this playlist (omit NAME to clear)
     SetActivePlaylist { name: Option<String> },
     /// Remove a playlist
     RemovePlaylist { name: String },
@@ -260,7 +260,7 @@ fn main() {
     wp_engine::logging::init(cli.verbose);
     #[cfg(target_os = "linux")]
     wp_engine::daemon::set_spawn_verbosity(cli.verbose);
-    tracing::debug!(target: "cli", verbosity = cli.verbose, "wp-engine starting");
+    tracing::debug!(target: "cli", verbosity = cli.verbose, "wp-audio starting");
 
     let result = match cli.command {
         // No subcommand → open GUI
@@ -332,14 +332,14 @@ fn main() {
 fn run_ui() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("wp-engine")
+            .with_title("wp-audio")
             .with_inner_size([1100.0, 700.0])
             .with_min_inner_size([800.0, 500.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "wp-engine",
+        "wp-audio",
         options,
         Box::new(|cc| Ok(Box::new(ui::WpApp::new(cc)))),
     )
@@ -476,7 +476,7 @@ fn apply_saved_settings(
     if save {
         let mut saved_anything = false;
         for arg in cli_properties {
-            let (name, value) = engine::properties::parse_property_arg(arg);
+            let (name, value) = audio::properties::parse_property_arg(arg);
             settings.set_property(id_or_path, &name, &value);
             saved_anything = true;
         }
@@ -500,7 +500,7 @@ fn apply_saved_settings(
 
 fn cmd_list_properties(id: &str) -> Result<()> {
     let w = workshop::find_by_id(id).ok_or_else(|| anyhow!("workshop item '{id}' not found"))?;
-    let all_props = engine::properties::list_properties(&w.path)?;
+    let all_props = audio::properties::list_properties(&w.path)?;
     if all_props.is_empty() {
         println!(
             "\"{}\" declares no user-configurable properties.",
@@ -548,7 +548,7 @@ fn cmd_list_properties(id: &str) -> Result<()> {
             decorative.len()
         );
     }
-    println!("\nOverride with: wp-engine set {id} --set-property NAME=VALUE");
+    println!("\nOverride with: wp-audio set {id} --set-property NAME=VALUE");
     Ok(())
 }
 
@@ -573,7 +573,7 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
         ConfigAction::SetProperty { id, properties } => {
             let mut names = Vec::new();
             for arg in &properties {
-                let (name, value) = engine::properties::parse_property_arg(arg);
+                let (name, value) = audio::properties::parse_property_arg(arg);
                 println!("{id}: {name} = {value}");
                 settings.set_property(&id, &name, &value);
                 names.push(name);
@@ -666,14 +666,14 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
                 if !settings.playlists.contains_key(n) {
                     return Err(anyhow!("no playlist named '{n}'"));
                 }
-                println!("`wp-engine run` plays playlist '{n}'");
+                println!("`wp-audio run` plays playlist '{n}'");
             } else {
                 println!("No active playlist");
             }
             settings.active_playlist = name;
         }
         ConfigAction::SetPlayback { condition, action } => {
-            let a = wp_engine::engine::playback_gate::PlaybackAction::parse(&action).ok_or_else(
+            let a = wp_engine::audio::playback_gate::PlaybackAction::parse(&action).ok_or_else(
                 || anyhow!("invalid action '{action}' (expected run, mute, pause or stop)"),
             )?;
             if !settings.playback.set(&condition, a) {
@@ -764,7 +764,7 @@ fn resolve_scene_dir(id_or_path: &str) -> Result<PathBuf> {
     wp_engine::render::WallpaperContent::preset_base_dir(&dir)
 }
 
-/// Runs using persisted settings (`wp-engine config` to set them up first):
+/// Runs using persisted settings (`wp-audio config` to set them up first):
 /// every `screens` entry gets its own independent wallpaper *and* its own
 /// independent render quality on its own output (real per-screen rendering
 /// — see `render::ScreenContent`/`render::ScreenSettings`); any output with
@@ -772,7 +772,7 @@ fn resolve_scene_dir(id_or_path: &str) -> Result<PathBuf> {
 /// else `default_background`, else the first playlist's first item.
 ///
 /// Honest scope note: property overrides are still process-global (see
-/// `engine::properties`), so only the *default* background's saved
+/// `audio::properties`), so only the *default* background's saved
 /// overrides are applied — a per-screen wallpaper's own saved overrides
 /// aren't isolated from each other yet if two different screens' wallpapers
 /// happen to declare a property with the same name. With an active
@@ -801,8 +801,8 @@ fn cmd_run(foreground: bool) -> Result<()> {
         })
         .ok_or_else(|| {
             anyhow!(
-                "no saved wallpaper — use `wp-engine config set-screen`/`set-default`/\
-                 `set-playlist` first, or `wp-engine set <id>` directly"
+                "no saved wallpaper — use `wp-audio config set-screen`/`set-default`/\
+                 `set-playlist` first, or `wp-audio set <id>` directly"
             )
         })?
         .clone();
@@ -858,13 +858,13 @@ fn launch(context: ApplicationContext, title: Option<String>, foreground: bool) 
         use wp_engine::daemon::{self, ApplySpec, Request};
         if !foreground {
             daemon::request_or_spawn(&Request::Apply(ApplySpec::from_context(&context, title)))?;
-            println!("Wallpaper active (background daemon). `wp-engine stop` removes it.");
+            println!("Wallpaper active (background daemon). `wp-audio stop` removes it.");
             return Ok(());
         }
         if daemon::is_running() {
             eprintln!(
-                "warning: a wp-engine daemon is also running — both will draw the wallpaper \
-                 (`wp-engine stop` stops it)"
+                "warning: a wp-audio daemon is also running — both will draw the wallpaper \
+                 (`wp-audio stop` stops it)"
             );
         }
     }
@@ -1021,7 +1021,7 @@ fn cmd_set_file(
 }
 
 fn cmd_pkg_info(path: &std::path::Path, dump: Option<&std::path::Path>) -> Result<()> {
-    let pkg = engine::Package::from_file(path)?;
+    let pkg = audio::Package::from_file(path)?;
 
     println!("Files   : {}", pkg.len());
     println!("Empty   : {}", pkg.is_empty());
@@ -1070,7 +1070,7 @@ fn cmd_pkg_info(path: &std::path::Path, dump: Option<&std::path::Path>) -> Resul
 
 fn cmd_tex_info(path: &std::path::Path, save: Option<&std::path::Path>) -> Result<()> {
     let data = std::fs::read(path)?;
-    let tex = engine::TexFile::parse(&data)?;
+    let tex = audio::TexFile::parse(&data)?;
     println!("Format:       {:?}", tex.format());
     println!("Image size:   {}x{}", tex.image_width, tex.image_height);
     println!("Texture size: {}x{}", tex.texture_width, tex.texture_height);
@@ -1095,16 +1095,16 @@ fn cmd_render_scene(
 ) -> Result<()> {
     let overrides = properties
         .iter()
-        .map(|p| engine::properties::parse_property_arg(p))
+        .map(|p| audio::properties::parse_property_arg(p))
         .collect();
-    engine::properties::set_global_overrides(overrides);
+    audio::properties::set_global_overrides(overrides);
 
     let dir = resolve_scene_dir(id_or_path)?;
     println!("Loading scene from {}...", dir.display());
-    let graph = engine::SceneGraph::from_directory(&dir)?;
+    let graph = audio::SceneGraph::from_directory(&dir)?;
     println!("Scene graph: {}", graph.stats().summary());
 
-    let scene = engine::ResolvedScene::from_directory(&dir)?;
+    let scene = audio::ResolvedScene::from_directory(&dir)?;
     println!(
         "Rendering {}x{} with {} layers...",
         scene.width,
@@ -1143,10 +1143,10 @@ fn cmd_render_frame(
     seconds: f32,
     properties: Vec<String>,
 ) -> Result<()> {
-    engine::properties::set_global_overrides(
+    audio::properties::set_global_overrides(
         properties
             .iter()
-            .map(|p| engine::properties::parse_property_arg(p))
+            .map(|p| audio::properties::parse_property_arg(p))
             .collect(),
     );
     let path = resolve_id_or_path(id_or_path)?;
@@ -1183,7 +1183,7 @@ fn cmd_test_scene(id_or_path: &str, num_frames: usize) -> Result<()> {
     let (tx, rx) = sync_channel::<Arc<image::RgbaImage>>(2);
     let render_dir = dir.clone();
     let handle = std::thread::spawn(move || {
-        if let Err(e) = engine::gpu::renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
+        if let Err(e) = audio::gpu::renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
             tracing::error!(target: "render", "gpu scene error: {e}");
         }
     });
@@ -1286,7 +1286,7 @@ fn cmd_preview_scene(id_or_path: &str, width: u32, height: u32) -> Result<()> {
     let (tx, rx) = sync_channel::<Arc<image::RgbaImage>>(2);
     let render_dir = dir.clone();
     let handle = std::thread::spawn(move || {
-        if let Err(e) = engine::gpu::renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
+        if let Err(e) = audio::gpu::renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
             tracing::error!(target: "render", "gpu scene error: {e}");
         }
     });
@@ -1299,7 +1299,7 @@ fn cmd_preview_scene(id_or_path: &str, width: u32, height: u32) -> Result<()> {
     );
 
     let mut window = Window::new(
-        "wp-engine preview",
+        "wp-audio preview",
         width as usize,
         height as usize,
         WindowOptions::default(),

@@ -5,10 +5,10 @@ use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::engine::cpu::effect::SceneEffect;
-use crate::engine::model::resolve::ResolvedScene;
-use crate::engine::model::scene::SceneObject;
-use crate::engine::sim::particle::{
+use crate::audio::cpu::effect::SceneEffect;
+use crate::audio::model::resolve::ResolvedScene;
+use crate::audio::model::scene::SceneObject;
+use crate::audio::sim::particle::{
     InstanceOverride, ParticleConfig, ParticleSprite, ParticleSystem,
 };
 use crate::formats::assets::AssetStore;
@@ -74,7 +74,7 @@ impl SceneAnimState {
 
         if let Ok(assets) = AssetStore::from_directory(dir) {
             if let Ok(scene_json) = assets.scene_json() {
-                if let Ok(scene) = crate::engine::model::scene::Scene::from_json(&scene_json) {
+                if let Ok(scene) = crate::audio::model::scene::Scene::from_json(&scene_json) {
                     // Same iteration order `ResolvedScene` uses for `layers`
                     // (`scene.visible_objects()`), so `order_index` here is
                     // directly comparable to `Layer::order_index` above.

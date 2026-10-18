@@ -14,9 +14,9 @@ use anyhow::Result;
 
 use super::web::{WebInputEvent, WebOptions};
 use super::{FrameSource, RenderSettings, WallpaperContent};
-use crate::engine::gpu::renderer::GpuSceneInstance;
-use crate::engine::media::{MediaWatcher, PlaybackState as MediaState};
-use crate::engine::playback_gate::{self, PlaybackAction, PlaybackPolicy, PlaybackState};
+use crate::audio::gpu::renderer::GpuSceneInstance;
+use crate::audio::media::{MediaWatcher, PlaybackState as MediaState};
+use crate::audio::playback_gate::{self, PlaybackAction, PlaybackPolicy, PlaybackState};
 use crate::platform::power::{self, LockWatcher};
 
 /// How often the playback conditions are re-checked. Each check is real I/O

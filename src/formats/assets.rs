@@ -53,7 +53,7 @@ impl AssetStore {
             root: root.to_path_buf(),
             dependency,
             packages,
-            assets_dir: crate::engine::gpu::shaders::loader::find_we_assets_dir(),
+            assets_dir: crate::audio::gpu::shaders::loader::find_we_assets_dir(),
         })
     }
 

@@ -566,11 +566,11 @@ mod imp {
         let mut open: Vec<(Browser, Receiver<WebInputEvent>)> = Vec::new();
         let mut properties = String::new();
         let mut general = String::new();
-        let mut audio: Option<crate::engine::audio::AudioCapture> = None;
+        let mut audio: Option<crate::audio::audio::AudioCapture> = None;
         let mut last_audio_push = Instant::now();
         // MPRIS is a freedesktop.org/Linux-only surface — see `engine::media`.
         #[cfg(target_os = "linux")]
-        let mut media: Option<crate::engine::media::MediaWatcher> = None;
+        let mut media: Option<crate::audio::media::MediaWatcher> = None;
 
         loop {
             match rx.try_recv() {
@@ -593,7 +593,7 @@ mod imp {
                         None => tracing::error!(target: "web", "failed to create CEF browser"),
                     }
                     if wants_audio {
-                        audio = crate::engine::audio::AudioCapture::start();
+                        audio = crate::audio::audio::AudioCapture::start();
                         if audio.is_none() {
                             tracing::warn!(
                                 target: "web",
@@ -604,7 +604,7 @@ mod imp {
                     }
                     #[cfg(target_os = "linux")]
                     if wants_media {
-                        media = crate::engine::media::MediaWatcher::start();
+                        media = crate::audio::media::MediaWatcher::start();
                         if media.is_none() {
                             tracing::warn!(
                                 target: "web",
@@ -754,7 +754,7 @@ mod imp {
     /// WE hands the listener 128 values: 64 left-channel bands followed by 64
     /// right-channel bands — precisely `AudioSpectrum`'s `s64_*` pair, so no
     /// resampling is needed.
-    fn audio_push_script(spectrum: &crate::engine::audio::AudioSpectrum) -> String {
+    fn audio_push_script(spectrum: &crate::audio::audio::AudioSpectrum) -> String {
         let mut s = String::with_capacity(1024);
         s.push_str("window.__wpAudio&&window.__wpAudio([");
         for (i, v) in spectrum
@@ -782,7 +782,7 @@ mod imp {
     /// through in the same raw microseconds `MediaInfo` itself carries —
     /// see its own doc comment for why.
     #[cfg(target_os = "linux")]
-    fn media_push_script(info: &crate::engine::media::MediaInfo) -> String {
+    fn media_push_script(info: &crate::audio::media::MediaInfo) -> String {
         let json_str = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
         let art_url = info
             .art_url
@@ -912,7 +912,7 @@ mod imp {
             return String::new();
         };
 
-        let resolved = crate::engine::properties::SceneProperties::from_project_dir(dir);
+        let resolved = crate::audio::properties::SceneProperties::from_project_dir(dir);
         for (name, decl) in props.iter_mut() {
             if let Some(value) = resolved.get(name) {
                 decl["value"] = value.clone();

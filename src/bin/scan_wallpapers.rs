@@ -44,7 +44,7 @@ fn run_with_timeout(binary: &str, wp_path: &str, timeout: Duration) -> String {
 
     let mut child = match child {
         Ok(c) => c,
-        Err(e) => return format!("FAIL: failed to spawn wp-engine: {e}"),
+        Err(e) => return format!("FAIL: failed to spawn wp-audio: {e}"),
     };
 
     let deadline = Instant::now() + timeout;
@@ -181,12 +181,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| {
             let mut p = std::env::current_exe().unwrap();
             p.pop();
-            p.push("wp-engine");
+            p.push("wp-audio");
             p
         });
 
     if !wp_engine.exists() {
-        eprintln!("wp-engine binary not found at {}. Run `cargo build` first or pass the path as argv[1].", wp_engine.display());
+        eprintln!(
+            "wp-audio binary not found at {}. Run `cargo build` first or pass the path as argv[1].",
+            wp_engine.display()
+        );
         std::process::exit(1);
     }
 
