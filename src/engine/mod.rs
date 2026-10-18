@@ -29,7 +29,6 @@ pub mod scene;
 pub mod script;
 pub mod shaders;
 pub mod tex;
-pub mod text;
 pub mod timeline;
 
 // Convenience re-exports.
