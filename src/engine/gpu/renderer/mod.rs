@@ -5614,7 +5614,7 @@ fn load_effect_instance(
                         let candidates = [format!("materials/{n}.tex"), format!("{n}.tex")];
                         candidates.iter().find_map(|rel| {
                             let bytes = resolver.read(rel)?;
-                            crate::engine::tex::TexFile::parse(&bytes)
+                            crate::formats::tex::TexFile::parse(&bytes)
                                 .ok()?
                                 .to_rgba()
                                 .ok()
@@ -5628,7 +5628,7 @@ fn load_effect_instance(
                 let img = img.or_else(|| {
                     if effect_name == "pulse" && slot_i == 0 {
                         let bytes = resolver.read("materials/util/noise.tex")?;
-                        crate::engine::tex::TexFile::parse(&bytes)
+                        crate::formats::tex::TexFile::parse(&bytes)
                             .ok()?
                             .to_rgba()
                             .ok()
@@ -5981,7 +5981,7 @@ fn load_effect_instance(
             let candidates = [format!("materials/{path}.tex"), format!("{path}.tex")];
             let img = candidates.iter().find_map(|rel| {
                 let bytes = resolver.read(rel)?;
-                crate::engine::tex::TexFile::parse(&bytes)
+                crate::formats::tex::TexFile::parse(&bytes)
                     .ok()?
                     .to_rgba()
                     .ok()
