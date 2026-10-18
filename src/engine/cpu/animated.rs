@@ -5,13 +5,13 @@ use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::engine::assets::AssetStore;
 use crate::engine::cpu::effect::SceneEffect;
 use crate::engine::model::resolve::ResolvedScene;
 use crate::engine::model::scene::SceneObject;
 use crate::engine::sim::particle::{
     InstanceOverride, ParticleConfig, ParticleSprite, ParticleSystem,
 };
+use crate::formats::assets::AssetStore;
 use crate::formats::tex::TexFile;
 
 struct SceneAnimState {
