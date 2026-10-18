@@ -16,16 +16,14 @@ mod config;
 pub use config::*;
 
 mod operators;
-pub use operators::*;
+use operators::*;
 
 mod draw;
 pub use draw::*;
 
 mod build;
-pub use build::*;
 
 mod step;
-pub use step::*;
 
 /// Per-particle oscillator state for `oscillatealpha`/`oscillatesize`: a
 /// random frequency/scale/phase drawn once at spawn (CParticle.cpp captures
