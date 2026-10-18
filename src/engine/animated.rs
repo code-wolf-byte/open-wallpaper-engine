@@ -7,10 +7,12 @@ use std::time::{Duration, Instant};
 
 use super::assets::AssetStore;
 use super::effect::SceneEffect;
-use super::particle::{InstanceOverride, ParticleConfig, ParticleSprite, ParticleSystem};
 use super::render::ResolvedScene;
 use super::scene::SceneObject;
 use super::tex::TexFile;
+use crate::engine::sim::particle::{
+    InstanceOverride, ParticleConfig, ParticleSprite, ParticleSystem,
+};
 
 struct SceneAnimState {
     /// Paired with each layer's `order_index` (its position in
