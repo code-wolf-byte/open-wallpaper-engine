@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use super::assets::AssetStore;
 use super::effect::SceneEffect;
 use super::render::ResolvedScene;
-use super::scene::SceneObject;
 use super::tex::TexFile;
+use crate::engine::model::scene::SceneObject;
 use crate::engine::sim::particle::{
     InstanceOverride, ParticleConfig, ParticleSprite, ParticleSystem,
 };
@@ -74,7 +74,7 @@ impl SceneAnimState {
 
         if let Ok(assets) = AssetStore::from_directory(dir) {
             if let Ok(scene_json) = assets.scene_json() {
-                if let Ok(scene) = super::scene::Scene::from_json(&scene_json) {
+                if let Ok(scene) = crate::engine::model::scene::Scene::from_json(&scene_json) {
                     // Same iteration order `ResolvedScene` uses for `layers`
                     // (`scene.visible_objects()`), so `order_index` here is
                     // directly comparable to `Layer::order_index` above.
