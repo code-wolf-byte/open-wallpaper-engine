@@ -50,11 +50,11 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
 use crate::services::playback_gate::PlaybackAction;
 use crate::{
-    platform,
-    render::session::{
+    content::session::{
         pending_property_edits, ContentRenderer, PlaybackMonitor, WindowState, PAUSE_CHECK_INTERVAL,
     },
-    render::{FrameSource, RenderSettings, ScreenContent, ScreenSettings},
+    content::{FrameSource, RenderSettings, ScreenContent, ScreenSettings},
+    platform,
 };
 
 // ── Platform implementation ───────────────────────────────────────────────────
@@ -393,8 +393,8 @@ impl WallpaperState {
     /// otherwise its whole self.
     fn view_of(&self, idx: usize) -> ((u32, u32), [f32; 4]) {
         let s = &self.surfaces[idx];
-        let own = ((s.width, s.height), crate::render::settings::FULL_REGION);
-        if self.content.layout != crate::render::ScreenLayout::Span {
+        let own = ((s.width, s.height), crate::content::settings::FULL_REGION);
+        if self.content.layout != crate::content::ScreenLayout::Span {
             return own;
         }
         match s.rect {
@@ -417,13 +417,13 @@ impl WallpaperState {
         crate::services::audio::set_muted(action >= PlaybackAction::Mute);
         if action.halts() {
             if !self.paused {
-                self.notify_web(crate::render::web::WebInputEvent::Paused(true));
+                self.notify_web(crate::content::web::WebInputEvent::Paused(true));
             }
             self.paused = true;
             return;
         }
         if self.paused {
-            self.notify_web(crate::render::web::WebInputEvent::Paused(false));
+            self.notify_web(crate::content::web::WebInputEvent::Paused(false));
         }
         self.paused = false;
         // A changed frame-rate cap reaches web pages too.
@@ -431,7 +431,7 @@ impl WallpaperState {
         if self.surfaces[idx].web_fps != fps {
             self.surfaces[idx].web_fps = fps;
             if let Some(tx) = self.surfaces[idx].renderer.borrow().content.web_input() {
-                let _ = tx.try_send(crate::render::web::WebInputEvent::Fps(fps));
+                let _ = tx.try_send(crate::content::web::WebInputEvent::Fps(fps));
             }
         }
         crate::services::audio::set_master_volume(self.settings.default.lock().unwrap().volume);
@@ -590,7 +590,7 @@ impl WallpaperState {
         // Scenes fill the screen, as on the direct GPU path; the fit modes
         // are for video, image and web content.
         let mode = match &self.surfaces[idx].renderer.borrow().content {
-            ContentRenderer::Scene(_) => crate::render::ScaleMode::Fill,
+            ContentRenderer::Scene(_) => crate::content::ScaleMode::Fill,
             ContentRenderer::Frames(_) => scaling,
         };
         let (span, region) = self.view_of(idx);
@@ -861,14 +861,14 @@ impl OutputHandler for WallpaperState {
         let info = self.output_state.info(&output);
         let output_name = info.as_ref().and_then(|info| info.name.clone());
         // A web page renders at the output's native mode.
-        let web = crate::render::web::WebOptions {
+        let web = crate::content::web::WebOptions {
             size: info
                 .as_ref()
                 .and_then(|i| i.modes.iter().find(|m| m.current).map(|m| m.dimensions))
                 .map(|(w, h)| (w.max(1) as u32, h.max(1) as u32))
                 .unwrap_or((
-                    crate::render::web::WEB_WIDTH,
-                    crate::render::web::WEB_HEIGHT,
+                    crate::content::web::WEB_WIDTH,
+                    crate::content::web::WEB_HEIGHT,
                 )),
             fps: self
                 .settings
@@ -884,7 +884,7 @@ impl OutputHandler for WallpaperState {
             .is_some_and(|name| self.content.by_output.contains_key(name));
         // Span and clone: every output shows the first one's renderer.
         // ponytail: a spanned web page renders at the first output's size.
-        let existing = (self.content.layout != crate::render::ScreenLayout::PerScreen)
+        let existing = (self.content.layout != crate::content::ScreenLayout::PerScreen)
             .then(|| self.surfaces.first().map(|s| Rc::clone(&s.renderer)))
             .flatten();
         let renderer = match existing.map(Ok).unwrap_or_else(|| {
@@ -912,8 +912,8 @@ impl OutputHandler for WallpaperState {
             target: "wallpaper",
             "output {output_name:?}: {} wallpaper",
             match self.content.layout {
-                crate::render::ScreenLayout::PerScreen if per_screen => "per-screen",
-                crate::render::ScreenLayout::PerScreen => "default",
+                crate::content::ScreenLayout::PerScreen if per_screen => "per-screen",
+                crate::content::ScreenLayout::PerScreen => "default",
                 l => l.label(),
             }
         );
@@ -1207,13 +1207,13 @@ impl PointerHandler for WallpaperState {
                 ContentRenderer::Frames(fs) => {
                     let Some(tx) = fs.web_input() else { continue };
                     let event = match (button, wheel) {
-                        (None, Some((dx, dy))) => crate::render::web::WebInputEvent::Wheel {
+                        (None, Some((dx, dy))) => crate::content::web::WebInputEvent::Wheel {
                             x_norm: norm[0],
                             y_norm: norm[1],
                             dx,
                             dy,
                         },
-                        (None, None) => crate::render::web::WebInputEvent::MouseMove {
+                        (None, None) => crate::content::web::WebInputEvent::MouseMove {
                             x_norm: norm[0],
                             y_norm: norm[1],
                         },
@@ -1221,7 +1221,7 @@ impl PointerHandler for WallpaperState {
                             let Some(button) = web_mouse_button(code) else {
                                 continue;
                             };
-                            crate::render::web::WebInputEvent::MouseButton {
+                            crate::content::web::WebInputEvent::MouseButton {
                                 x_norm: norm[0],
                                 y_norm: norm[1],
                                 button,
@@ -1239,11 +1239,11 @@ impl PointerHandler for WallpaperState {
 /// Linux evdev button code → the two buttons `WebInputEvent` (and the C++
 /// reference) actually forward — `None` for anything else (middle click,
 /// side buttons), silently dropped rather than guessed at.
-fn web_mouse_button(code: u32) -> Option<crate::render::web::WebMouseButton> {
+fn web_mouse_button(code: u32) -> Option<crate::content::web::WebMouseButton> {
     match code {
-        BTN_LEFT => Some(crate::render::web::WebMouseButton::Left),
-        BTN_RIGHT => Some(crate::render::web::WebMouseButton::Right),
-        BTN_MIDDLE => Some(crate::render::web::WebMouseButton::Middle),
+        BTN_LEFT => Some(crate::content::web::WebMouseButton::Left),
+        BTN_RIGHT => Some(crate::content::web::WebMouseButton::Right),
+        BTN_MIDDLE => Some(crate::content::web::WebMouseButton::Middle),
         _ => None,
     }
 }
@@ -1447,7 +1447,7 @@ impl WallpaperState {
             tracing::info!(target: "wallpaper", "playback stopped; renderers released");
         } else if action != PlaybackAction::Stop && self.stopped {
             self.stopped = false;
-            let one_renderer = self.content.layout != crate::render::ScreenLayout::PerScreen;
+            let one_renderer = self.content.layout != crate::content::ScreenLayout::PerScreen;
             for i in 0..self.surfaces.len() {
                 self.surfaces[i].gpu_failed = false;
                 // Span and clone surfaces share surface 0's renderer.
@@ -1457,7 +1457,7 @@ impl WallpaperState {
                 let resolved = self
                     .content
                     .resolve(self.surfaces[i].output_name.as_deref());
-                let web = crate::render::web::WebOptions {
+                let web = crate::content::web::WebOptions {
                     size: (
                         self.surfaces[i].width.max(1),
                         self.surfaces[i].height.max(1),
@@ -1490,7 +1490,7 @@ impl WallpaperState {
         else {
             return;
         };
-        if idx > 0 && self.content.layout != crate::render::ScreenLayout::PerScreen {
+        if idx > 0 && self.content.layout != crate::content::ScreenLayout::PerScreen {
             return;
         }
         if s.renderer
@@ -1500,7 +1500,7 @@ impl WallpaperState {
         {
             return;
         }
-        let web = crate::render::web::WebOptions {
+        let web = crate::content::web::WebOptions {
             size: (s.width.max(1), s.height.max(1)),
             fps: s.settings.lock().unwrap().fps,
         };
@@ -1517,7 +1517,7 @@ impl WallpaperState {
     }
 
     /// Send `event` to every output showing a web wallpaper.
-    fn notify_web(&self, event: crate::render::web::WebInputEvent) {
+    fn notify_web(&self, event: crate::content::web::WebInputEvent) {
         for s in &self.surfaces {
             if let Some(tx) = s.renderer.borrow().content.web_input() {
                 let _ = tx.try_send(event.clone());
@@ -1534,10 +1534,10 @@ impl WallpaperState {
         let action = self.playback_action(Instant::now());
         crate::services::audio::set_muted(action >= PlaybackAction::Mute);
         if !was_paused && action.halts() {
-            self.notify_web(crate::render::web::WebInputEvent::Paused(true));
+            self.notify_web(crate::content::web::WebInputEvent::Paused(true));
         }
         if was_paused && !action.halts() {
-            self.notify_web(crate::render::web::WebInputEvent::Paused(false));
+            self.notify_web(crate::content::web::WebInputEvent::Paused(false));
             self.paused = false;
             for idx in 0..self.surfaces.len() {
                 if self.surfaces[idx].renderer.borrow().content.is_animated() {
@@ -1610,7 +1610,7 @@ mod tests {
     /// rather than a guessed-at mapping.
     #[test]
     fn web_mouse_button_maps_left_middle_and_right() {
-        use crate::render::web::WebMouseButton;
+        use crate::content::web::WebMouseButton;
         assert_eq!(web_mouse_button(BTN_LEFT), Some(WebMouseButton::Left));
         assert_eq!(web_mouse_button(BTN_RIGHT), Some(WebMouseButton::Right));
         assert_eq!(web_mouse_button(BTN_MIDDLE), Some(WebMouseButton::Middle));

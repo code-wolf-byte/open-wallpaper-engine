@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::application::ApplicationContext;
+use crate::content::RenderSettings;
 use crate::platform::RenderQuality;
-use crate::render::RenderSettings;
 
 /// Everything an [`ApplicationContext`] carries, in a serializable shape.
 /// Quality travels as its [`RenderQuality::label`] string.
@@ -29,7 +29,7 @@ pub struct ApplySpec {
     #[serde(default)]
     pub fps: Option<u32>,
     #[serde(default)]
-    pub scaling: Option<crate::render::ScaleMode>,
+    pub scaling: Option<crate::content::ScaleMode>,
     /// Per-screen quality, keyed like `screens`.
     #[serde(default)]
     pub screen_quality: HashMap<String, String>,

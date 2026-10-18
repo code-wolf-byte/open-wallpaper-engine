@@ -38,7 +38,7 @@ impl Default for WebOptions {
     fn default() -> Self {
         Self {
             size: (WEB_WIDTH, WEB_HEIGHT),
-            fps: crate::render::settings::DEFAULT_FPS,
+            fps: crate::content::settings::DEFAULT_FPS,
         }
     }
 }

@@ -1,11 +1,11 @@
 pub mod application;
+pub mod content;
 #[cfg(target_os = "linux")]
 pub mod daemon;
 pub mod engine;
 pub mod formats;
 pub mod logging;
 pub mod platform;
-pub mod render;
 pub mod schedule;
 pub mod services;
 pub mod settings;

@@ -35,11 +35,11 @@ use crate::services::playback_gate::PlaybackAction;
 use x11rb::wrapper::ConnectionExt as _;
 
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
-use crate::platform;
-use crate::render::session::{
+use crate::content::session::{
     pending_property_edits, ContentRenderer, PlaybackMonitor, WindowState, PAUSE_CHECK_INTERVAL,
 };
-use crate::render::{FrameSource, RenderSettings, ScreenContent, ScreenSettings};
+use crate::content::{FrameSource, RenderSettings, ScreenContent, ScreenSettings};
+use crate::platform;
 
 // ── Platform implementation ───────────────────────────────────────────────────
 
@@ -452,8 +452,8 @@ fn web_options(
     rect: OutputRect,
     settings: &ScreenSettings,
     name: Option<&str>,
-) -> crate::render::web::WebOptions {
-    crate::render::web::WebOptions {
+) -> crate::content::web::WebOptions {
+    crate::content::web::WebOptions {
         size: (rect.width as u32, rect.height as u32),
         fps: settings.resolve(name).lock().unwrap().fps,
     }
@@ -505,7 +505,7 @@ fn wallpaper_loop(
     // Span: one renderer over the whole root window, which already is the
     // bounding box of every monitor. ponytail: clone still runs one
     // renderer per monitor here; share one if the duplicate work matters.
-    let named_outputs = if content.layout == crate::render::ScreenLayout::Span {
+    let named_outputs = if content.layout == crate::content::ScreenLayout::Span {
         vec![NamedOutput {
             name: None,
             rect: OutputRect {
@@ -618,10 +618,10 @@ fn wallpaper_loop(
             let fps = output.settings.lock().unwrap().fps;
             if let Some(tx) = output.renderer.web_input() {
                 if paused != output.web_paused {
-                    let _ = tx.try_send(crate::render::web::WebInputEvent::Paused(paused));
+                    let _ = tx.try_send(crate::content::web::WebInputEvent::Paused(paused));
                 }
                 if fps != output.web_fps {
-                    let _ = tx.try_send(crate::render::web::WebInputEvent::Fps(fps));
+                    let _ = tx.try_send(crate::content::web::WebInputEvent::Fps(fps));
                 }
             }
             output.web_paused = paused;
@@ -683,7 +683,7 @@ fn wallpaper_loop(
                 // Scenes size themselves; the fit modes are for video, image
                 // and web content.
                 let mode = match &output.renderer {
-                    ContentRenderer::Scene(_) => crate::render::ScaleMode::Stretch,
+                    ContentRenderer::Scene(_) => crate::content::ScaleMode::Stretch,
                     ContentRenderer::Frames(_) => scaling,
                 };
                 let frame = output.renderer.next_frame()?;
@@ -783,7 +783,7 @@ fn wallpaper_loop(
                         // per-frame `CWeb::updateMouse` poll, not just
                         // Wayland's event model adapted here.
                         let Some(tx) = fs.web_input() else { continue };
-                        let _ = tx.try_send(crate::render::web::WebInputEvent::MouseMove {
+                        let _ = tx.try_send(crate::content::web::WebInputEvent::MouseMove {
                             x_norm: norm[0],
                             y_norm: norm[1],
                         });
@@ -793,19 +793,19 @@ fn wallpaper_loop(
                         let right_now = mask & u16::from(KeyButMask::BUTTON3) != 0;
                         if left_now != output.left_down {
                             output.left_down = left_now;
-                            let _ = tx.try_send(crate::render::web::WebInputEvent::MouseButton {
+                            let _ = tx.try_send(crate::content::web::WebInputEvent::MouseButton {
                                 x_norm: norm[0],
                                 y_norm: norm[1],
-                                button: crate::render::web::WebMouseButton::Left,
+                                button: crate::content::web::WebMouseButton::Left,
                                 pressed: left_now,
                             });
                         }
                         if right_now != output.right_down {
                             output.right_down = right_now;
-                            let _ = tx.try_send(crate::render::web::WebInputEvent::MouseButton {
+                            let _ = tx.try_send(crate::content::web::WebInputEvent::MouseButton {
                                 x_norm: norm[0],
                                 y_norm: norm[1],
-                                button: crate::render::web::WebMouseButton::Right,
+                                button: crate::content::web::WebMouseButton::Right,
                                 pressed: right_now,
                             });
                         }

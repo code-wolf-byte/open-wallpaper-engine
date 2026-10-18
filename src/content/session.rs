@@ -192,7 +192,7 @@ impl PlaybackMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render::settings::PropertyEdit;
+    use crate::content::settings::PropertyEdit;
 
     #[test]
     fn pending_edits_pick_this_wallpaper_and_advance() {

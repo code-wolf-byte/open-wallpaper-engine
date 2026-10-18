@@ -1715,7 +1715,7 @@ fn start_video_stream(bytes: &[u8]) -> Result<(RgbaImage, VideoLayerStream)> {
     ));
     std::fs::write(&tmp, bytes)
         .with_context(|| format!("writing embedded video temp file: {}", tmp.display()))?;
-    let first = match crate::render::ffmpeg::decode_first_frame(&tmp) {
+    let first = match crate::content::ffmpeg::decode_first_frame(&tmp) {
         Ok(img) => img,
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
@@ -1726,7 +1726,7 @@ fn start_video_stream(bytes: &[u8]) -> Result<(RgbaImage, VideoLayerStream)> {
     let decode_path = tmp.clone();
     std::thread::spawn(move || {
         // Exits when the receiver (VideoLayerStream) is dropped.
-        if let Err(e) = crate::render::ffmpeg::video_decode_loop(&decode_path, &tx) {
+        if let Err(e) = crate::content::ffmpeg::video_decode_loop(&decode_path, &tx) {
             eprintln!(
                 "embedded video decoder error for '{}': {e}",
                 decode_path.display()
@@ -1757,7 +1757,7 @@ fn load_texture_from_dir(dir: &Path, image_path: &str) -> Result<LoadedImage> {
 
     // Video file — extract first frame as static thumbnail
     if is_video_path(image_path) && full_path.exists() {
-        return crate::render::ffmpeg::decode_first_frame(&full_path).map(LoadedImage::single);
+        return crate::content::ffmpeg::decode_first_frame(&full_path).map(LoadedImage::single);
     }
 
     // Try as .tex first
@@ -1823,7 +1823,7 @@ fn load_texture_from_pkg(pkg: &Package, image_path: &str) -> Result<LoadedImage>
             ));
             std::fs::write(&tmp, data)
                 .with_context(|| format!("writing video temp file: {}", tmp.display()))?;
-            let result = crate::render::ffmpeg::decode_first_frame(&tmp);
+            let result = crate::content::ffmpeg::decode_first_frame(&tmp);
             let _ = std::fs::remove_file(&tmp);
             return result.map(LoadedImage::single);
         }

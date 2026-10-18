@@ -179,7 +179,7 @@ impl RenderSettings {
     }
 }
 
-/// Per-output `RenderSettings`: the twin of [`crate::render::ScreenContent`]
+/// Per-output `RenderSettings`: the twin of [`crate::content::ScreenContent`]
 /// for live-adjustable settings rather than content. Content became
 /// genuinely independent per output (different outputs can show different
 /// wallpapers); quality/volume should follow the same shape rather than
