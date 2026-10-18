@@ -1224,7 +1224,7 @@ impl RemapParams {
         max_life: f32,
     ) -> f32 {
         if self.input == RemapField::None || self.transform.is_noise() {
-            use crate::engine::noise::fbm_noise;
+            use crate::engine::sim::noise::fbm_noise;
             let s = self.input_scale;
             let (x, y, t) = ((p.x * s) as f64, (p.y * s) as f64, time as f64);
             let octaves = if self.transform == RemapTransform::Fbm {
@@ -2066,7 +2066,7 @@ impl ParticleSystem {
                         p.y * t.noise_scale,
                         0.0,
                     ];
-                    let curl = crate::engine::noise::curl_noise(noise_pos);
+                    let curl = crate::engine::sim::noise::curl_noise(noise_pos);
                     let len = vec3_length(curl);
                     if len > 0.0001 {
                         let s = t.speed / len * dt * self.speed_mult;
@@ -2622,7 +2622,7 @@ impl ParticleSystem {
                         spawn_y * 0.1 + time_shift + phase * 0.7,
                         time_shift + phase * 1.3,
                     ];
-                    let curl = crate::engine::noise::curl_noise(sample);
+                    let curl = crate::engine::sim::noise::curl_noise(sample);
                     let mut dir = vec3_normalize_or(curl, forward);
 
                     // `scale` < 2 limits how far the direction may deviate
