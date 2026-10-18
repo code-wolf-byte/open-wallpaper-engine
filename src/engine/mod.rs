@@ -28,7 +28,6 @@ pub mod render;
 pub mod scene;
 pub mod script;
 pub mod shaders;
-pub mod shadow;
 pub mod tex;
 pub mod text;
 pub mod timeline;
