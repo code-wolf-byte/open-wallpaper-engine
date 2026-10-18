@@ -478,7 +478,7 @@ impl WpApp {
         }
         let devices = self
             .audio_devices
-            .get_or_insert_with(crate::platform::audio::list_audio_outputs);
+            .get_or_insert_with(crate::services::audio_devices::list_audio_outputs);
         let current = devices
             .get(self.audio_choice)
             .map(|d| d.label.clone())
@@ -499,7 +499,7 @@ impl WpApp {
             });
         if let Some((i, device)) = changed {
             self.audio_choice = i;
-            crate::platform::audio::set_preferred_device(device);
+            crate::services::audio_devices::set_preferred_device(device);
             self.status = StatusMsg::ok("Audio source set — re-apply the wallpaper to use it");
         }
         ui.add_space(6.0);
