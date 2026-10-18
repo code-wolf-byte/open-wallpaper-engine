@@ -1890,7 +1890,7 @@ pub struct GpuSceneInstance {
     /// scan there's no equivalent "does this bundle reference it" signal to
     /// scan for across independent per-property scripts.
     #[cfg(target_os = "linux")]
-    media: Option<crate::engine::media::MediaWatcher>,
+    media: Option<crate::services::media::MediaWatcher>,
     /// True for genuine 3D scenes (`Scene::is_perspective`): layer rects were
     /// projected through a perspective camera and `render()` sorts image
     /// layers back-to-front by `SceneLayerGpu::depth` instead of scene order.
@@ -2901,7 +2901,7 @@ impl GpuSceneInstance {
             audio_capture,
             sounds,
             #[cfg(target_os = "linux")]
-            media: crate::engine::media::MediaWatcher::start(),
+            media: crate::services::media::MediaWatcher::start(),
             perspective: camera3d.is_some(),
             mesh3d,
             mesh3d_depth,
@@ -3534,7 +3534,7 @@ impl GpuSceneInstance {
         }
         #[cfg(target_os = "linux")]
         if let Some(info) = self.media.as_ref().and_then(|w| w.try_recv()) {
-            use crate::engine::media::PlaybackState;
+            use crate::services::media::PlaybackState;
             self.scripts.set_media(
                 info.available,
                 match info.playback_state {
