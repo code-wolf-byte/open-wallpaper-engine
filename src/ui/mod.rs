@@ -447,6 +447,55 @@ fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
+impl WpApp {
+    pub(super) fn save_settings(&mut self) {
+        if let Err(e) = self.saved.save() {
+            self.status = StatusMsg::err(format!("Saving settings failed: {e:#}"));
+        }
+    }
+
+    /// Send a one-off request to the daemon, starting it if needed.
+    #[cfg(target_os = "linux")]
+    pub(super) fn daemon_request(&mut self, req: crate::daemon::Request) {
+        std::thread::spawn(move || {
+            if let Err(e) = crate::daemon::request_or_spawn(&req) {
+                tracing::warn!(target: "app", "daemon request failed: {e:#}");
+            }
+        });
+    }
+
+    pub(super) fn title_of(&self, id: &str) -> String {
+        self.wallpapers
+            .iter()
+            .find(|w| w.workshop_id == id)
+            .map(|w| w.title().to_string())
+            .unwrap_or_else(|| id.to_string())
+    }
+}
+
+/// Ask the desktop for a file or folder via zenity or kdialog.
+// ponytail: shells out instead of a file-dialog crate; use the XDG portal
+// (zbus is already a dependency) if neither tool is common enough.
+pub(super) fn pick_path(directory: bool) -> Option<String> {
+    let zenity: &[&str] = if directory {
+        &["--file-selection", "--directory"]
+    } else {
+        &["--file-selection"]
+    };
+    let kdialog: &[&str] = if directory {
+        &["--getexistingdirectory"]
+    } else {
+        &["--getopenfilename"]
+    };
+    [("zenity", zenity), ("kdialog", kdialog)]
+        .iter()
+        .find_map(|(cmd, args)| {
+            let out = std::process::Command::new(cmd).args(*args).output().ok()?;
+            let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+            (out.status.success() && !path.is_empty()).then_some(path)
+        })
+}
+
 /// Wallpaper Engine's light and dark skins, following the system theme.
 fn setup_theme(ctx: &egui::Context) {
     for (theme, skin, mut v) in [
