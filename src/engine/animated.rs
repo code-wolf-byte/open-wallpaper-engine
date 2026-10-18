@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use super::assets::AssetStore;
 use super::effect::SceneEffect;
-use super::render::ResolvedScene;
 use super::tex::TexFile;
+use crate::engine::model::resolve::ResolvedScene;
 use crate::engine::model::scene::SceneObject;
 use crate::engine::sim::particle::{
     InstanceOverride, ParticleConfig, ParticleSprite, ParticleSystem,

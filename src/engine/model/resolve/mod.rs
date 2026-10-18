@@ -3,11 +3,11 @@ use image::RgbaImage;
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::pkg::Package;
-use super::properties::SceneProperties;
-use super::tex::TexFile;
 use crate::engine::model::scene::{Scene, SceneObject};
+use crate::engine::pkg::Package;
+use crate::engine::properties::SceneProperties;
 use crate::engine::sim::particle;
+use crate::engine::tex::TexFile;
 
 /// Parse scene.json, first resolving `{"user": ...}` references against the
 /// wallpaper's project.json properties (plus any `--set-property` overrides).
