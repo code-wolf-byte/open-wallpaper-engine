@@ -48,7 +48,7 @@ fn normalize(v: [f32; 3]) -> [f32; 3] {
 }
 
 /// Right-handed lookAt, identical to `glm::lookAt`. `pub(crate)` so
-/// `engine::shadow` can build light-space view matrices with the same math.
+/// `engine::gpu::shadow` can build light-space view matrices with the same math.
 pub(crate) fn look_at(eye: [f32; 3], center: [f32; 3], up: [f32; 3]) -> Mat4 {
     let f = normalize(sub(center, eye));
     let s = normalize(cross(f, up));
@@ -223,7 +223,7 @@ impl PerspectiveCamera {
 
 /// Remaps GL's clip-space z range ([-1,1]) to wgpu's ([0,1]) by
 /// premultiplying with the standard `diag(1,1,0.5,1)`-plus-translation fix
-/// matrix. `pub(crate)` so `engine::shadow` can build shadow-map
+/// matrix. `pub(crate)` so `engine::gpu::shadow` can build shadow-map
 /// view-projections in the same depth convention as the main camera.
 pub(crate) fn gl_to_wgpu_depth(m: &Mat4) -> Mat4 {
     let mut fix = identity();
