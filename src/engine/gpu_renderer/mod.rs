@@ -2134,10 +2134,10 @@ fn mesh3d_lighting_bytes(
     let has_renderable_light = lights.iter().any(|(l, ..)| {
         matches!(
             l,
-            crate::engine::lighting::Light::Point { .. }
-                | crate::engine::lighting::Light::Spot { .. }
-                | crate::engine::lighting::Light::Directional { .. }
-                | crate::engine::lighting::Light::Tube { .. }
+            crate::engine::gpu::lighting::Light::Point { .. }
+                | crate::engine::gpu::lighting::Light::Spot { .. }
+                | crate::engine::gpu::lighting::Light::Directional { .. }
+                | crate::engine::gpu::lighting::Light::Tube { .. }
         )
     });
     let cookie_light_flag = cookie.map(|(idx, _)| (idx + 1) as f32).unwrap_or(0.0);
@@ -2189,7 +2189,7 @@ fn mesh3d_lighting_bytes(
                 .unwrap_or(0.0)
         };
         match light {
-            crate::engine::lighting::Light::Point {
+            crate::engine::gpu::lighting::Light::Point {
                 origin,
                 color,
                 intensity,
@@ -2201,7 +2201,7 @@ fn mesh3d_lighting_bytes(
                 // spot_slot stays [0,0,0,0] — zero-length direction reads as
                 // "not a spot" in `mesh3d_spot_factor`.
             }
-            crate::engine::lighting::Light::Spot {
+            crate::engine::gpu::lighting::Light::Spot {
                 origin,
                 direction,
                 exponent,
@@ -2218,7 +2218,7 @@ fn mesh3d_lighting_bytes(
                 let vd = cam.to_view_direction(*direction);
                 *spot_slot = [vd[0], vd[1], vd[2], *exponent];
             }
-            crate::engine::lighting::Light::Directional {
+            crate::engine::gpu::lighting::Light::Directional {
                 direction,
                 color,
                 intensity,
@@ -2240,7 +2240,7 @@ fn mesh3d_lighting_bytes(
                 // spot_slot stays [0,0,0,0] — mesh3d_spot_factor's own
                 // "not a spot" check already no-ops for a directional light.
             }
-            crate::engine::lighting::Light::Tube {
+            crate::engine::gpu::lighting::Light::Tube {
                 origin_a,
                 origin_b,
                 color,
@@ -2722,7 +2722,7 @@ impl GpuSceneInstance {
         // plumbed into `build`, and every real `usecookie` occurrence in
         // this sandbox's cache is zero either way.
         let cookie_data = {
-            use crate::engine::lighting::Light;
+            use crate::engine::gpu::lighting::Light;
             let (center, radius) = crate::engine::shadow::scene_bounds(&resolved.mesh3d_layers);
             lights
                 .iter()
@@ -2937,7 +2937,7 @@ impl GpuSceneInstance {
         renderer: &GpuSceneRenderer,
         cam: &crate::engine::camera3d::PerspectiveCamera,
         lights: &[(
-            crate::engine::lighting::Light,
+            crate::engine::gpu::lighting::Light,
             bool,
             Option<(f32, f32)>,
             Option<String>,
@@ -2946,7 +2946,7 @@ impl GpuSceneInstance {
         shadow_slot_data: &[(crate::engine::camera3d::Mat4, [f32; 4])],
         shadow_atlas_view: &wgpu::TextureView,
     ) -> Option<wgpu::BindGroup> {
-        use crate::engine::lighting::Light;
+        use crate::engine::gpu::lighting::Light;
 
         let (idx, origin, color_intensity, density, exponent) = lights
             .iter()
@@ -3072,7 +3072,7 @@ impl GpuSceneInstance {
         renderer: &GpuSceneRenderer,
         mesh3d_layers: &[crate::engine::render::Mesh3dLayer],
         lights: &[(
-            crate::engine::lighting::Light,
+            crate::engine::gpu::lighting::Light,
             bool,
             Option<(f32, f32)>,
             Option<String>,
@@ -3082,7 +3082,7 @@ impl GpuSceneInstance {
         Vec<Option<usize>>,
         Vec<(crate::engine::camera3d::Mat4, [f32; 4])>,
     ) {
-        use crate::engine::lighting::Light;
+        use crate::engine::gpu::lighting::Light;
         use crate::engine::shadow;
 
         let mut shadow_slots: Vec<Option<usize>> = vec![None; lights.len()];
