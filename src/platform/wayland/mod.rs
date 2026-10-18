@@ -50,16 +50,12 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
 use crate::engine::playback_gate::PlaybackAction;
 use crate::{
-    engine::gpu_renderer::GpuSceneInstance,
     platform,
-    render::{FrameSource, RenderSettings, ScreenContent, ScreenSettings, WallpaperContent},
+    render::session::{
+        pending_property_edits, ContentRenderer, PlaybackMonitor, WindowState, PAUSE_CHECK_INTERVAL,
+    },
+    render::{FrameSource, RenderSettings, ScreenContent, ScreenSettings},
 };
-
-/// How often to re-check playback-pause conditions (battery, session lock,
-/// fullscreen/maximized app) — see `engine::playback_gate`. Real I/O (sysfs
-/// reads, a D-Bus call), so this stays well below frame rate rather than
-/// adding that cost to every tick — matches `platform::x11`'s own interval.
-const PAUSE_CHECK_INTERVAL: Duration = Duration::from_millis(750);
 
 // ── Platform implementation ───────────────────────────────────────────────────
 
@@ -117,55 +113,6 @@ fn spawn_wayland_wallpaper(
 }
 
 // ── Content renderer ──────────────────────────────────────────────────────────
-
-/// How the wallpaper content produces pixels.
-enum ContentRenderer {
-    /// CPU frames (static images, videos, and the scene fallback loop);
-    /// presented through SHM buffers.
-    Frames(FrameSource),
-    /// GPU-rendered scene sharing our device — presented directly into the
-    /// wgpu surface (no readback) when the compositor allows, with an RGBA
-    /// readback + SHM fallback otherwise.
-    Scene(Box<GpuSceneInstance>),
-}
-
-impl ContentRenderer {
-    fn is_animated(&self) -> bool {
-        match self {
-            ContentRenderer::Frames(fs) => fs.is_animated(),
-            ContentRenderer::Scene(_) => true,
-        }
-    }
-}
-
-/// Build the renderer for one output's resolved content. Scenes render on
-/// our own device so frames can be presented directly; everything else
-/// produces CPU frames. Split out of `wallpaper_loop` so `new_output` can
-/// call it per-output instead of once for the whole process — the core of
-/// per-screen wallpapers: each output gets its own independent
-/// `GpuSceneInstance`/`FrameSource`, not a shared one.
-fn build_content_renderer(
-    content: WallpaperContent,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    allow_gpu_surface: bool,
-    web: crate::render::web::WebOptions,
-) -> Result<ContentRenderer> {
-    Ok(match content {
-        WallpaperContent::Scene { dir } if allow_gpu_surface => {
-            match GpuSceneInstance::with_device(device, queue, &dir) {
-                Ok(instance) => ContentRenderer::Scene(Box::new(instance)),
-                Err(e) => {
-                    tracing::warn!(target: "wallpaper", "GPU scene init failed ({e}); using frame-loop fallback");
-                    ContentRenderer::Frames(FrameSource::from_content(WallpaperContent::Scene {
-                        dir,
-                    })?)
-                }
-            }
-        }
-        other => ContentRenderer::Frames(FrameSource::from_content_with(other, web)?),
-    })
-}
 
 /// A surface's renderer. Span and clone layouts give every surface the
 /// same one, so it renders once per frame and each surface presents its
@@ -317,18 +264,11 @@ struct WallpaperState {
     /// Per-toplevel state from `zwlr_foreign_toplevel_handle_v1` events,
     /// keyed by the handle's own object id.
     foreign_toplevels: HashMap<ObjectId, ForeignToplevelState>,
-    policy: crate::engine::playback_gate::PlaybackPolicy,
-    /// MPRIS watcher for the "another application is playing audio"
-    /// condition; only started when the policy acts on it.
-    media: Option<crate::engine::media::MediaWatcher>,
-    media_playing: bool,
+    playback: PlaybackMonitor,
     /// Renderers were released by a playback stop.
     stopped: bool,
     /// For scheduling frame-rate-capped draws.
     loop_handle: Option<calloop::LoopHandle<'static, WallpaperState>>,
-    lock_watcher: Option<platform::power::LockWatcher>,
-    playback_state: crate::engine::playback_gate::PlaybackState,
-    last_pause_check: Instant,
     /// Last known pause state, so the watchdog timer (`tick_pause_watchdog`)
     /// can tell "just resumed" apart from "still paused"/"still active" —
     /// see that method's doc for why detecting the *edge* matters here.
@@ -490,10 +430,8 @@ impl WallpaperState {
         let fps = self.surfaces[idx].settings.lock().unwrap().fps;
         if self.surfaces[idx].web_fps != fps {
             self.surfaces[idx].web_fps = fps;
-            if let ContentRenderer::Frames(fs) = &self.surfaces[idx].renderer.borrow().content {
-                if let Some(tx) = fs.web_input() {
-                    let _ = tx.try_send(crate::render::web::WebInputEvent::Fps(fps));
-                }
+            if let Some(tx) = self.surfaces[idx].renderer.borrow().content.web_input() {
+                let _ = tx.try_send(crate::render::web::WebInputEvent::Fps(fps));
             }
         }
         crate::engine::audio::set_master_volume(self.settings.default.lock().unwrap().volume);
@@ -781,7 +719,6 @@ fn wallpaper_loop(
         .bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 1..=3, ())
         .ok();
 
-    let policy = crate::engine::playback_gate::PlaybackPolicy::load();
     let mut state = WallpaperState {
         registry_state,
         output_state,
@@ -804,18 +741,9 @@ fn wallpaper_loop(
         allow_gpu_surface,
         foreign_toplevel_manager,
         foreign_toplevels: HashMap::new(),
-        policy,
-        media: if policy.watches_audio() {
-            crate::engine::media::MediaWatcher::start()
-        } else {
-            None
-        },
-        media_playing: false,
+        playback: PlaybackMonitor::new(),
         stopped: false,
         loop_handle: None,
-        lock_watcher: platform::power::LockWatcher::start(),
-        playback_state: crate::engine::playback_gate::PlaybackState::default(),
-        last_pause_check: Instant::now() - PAUSE_CHECK_INTERVAL,
         paused: false,
     };
 
@@ -960,7 +888,7 @@ impl OutputHandler for WallpaperState {
             .then(|| self.surfaces.first().map(|s| Rc::clone(&s.renderer)))
             .flatten();
         let renderer = match existing.map(Ok).unwrap_or_else(|| {
-            build_content_renderer(
+            ContentRenderer::build(
                 resolved,
                 self.device.clone(),
                 self.queue.clone(),
@@ -1481,48 +1409,28 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for WallpaperState {
     }
 }
 
-impl WallpaperState {
-    /// `(fullscreen, maximized)` — any currently-*activated* toplevel
-    /// reporting that state, mirroring `platform::x11`'s own "check the
-    /// active window" heuristic (not "some window somewhere is fullscreen,"
-    /// which could be a minimized/background one the user can't even see).
-    fn foreign_toplevel_pause_state(&self) -> (bool, bool) {
-        let fullscreen = self
-            .foreign_toplevels
-            .values()
-            .any(|t| t.activated && t.fullscreen);
-        let maximized = self
-            .foreign_toplevels
-            .values()
-            .any(|t| t.activated && t.maximized);
-        (fullscreen, maximized)
-    }
+/// Window state for the playback rules: fullscreen/maximized when an
+/// *activated* toplevel reports it, mirroring `platform::x11`'s own "check the
+/// active window" heuristic (not "some window somewhere is fullscreen,"
+/// which could be a minimized/background one the user can't even see).
+fn window_state<'a>(toplevels: impl Iterator<Item = &'a ForeignToplevelState>) -> WindowState {
+    toplevels
+        .filter(|t| t.activated)
+        .fold(WindowState::default(), |w, t| WindowState {
+            fullscreen: w.fullscreen || t.fullscreen,
+            maximized: w.maximized || t.maximized,
+            focused: true,
+        })
+}
 
+impl WallpaperState {
     /// Re-checks the playback conditions when `PAUSE_CHECK_INTERVAL` has
     /// elapsed and returns the action the policy calls for, releasing or
     /// rebuilding the renderers on a stop edge.
     fn playback_action(&mut self, now: Instant) -> PlaybackAction {
-        if now.duration_since(self.last_pause_check) >= PAUSE_CHECK_INTERVAL {
-            self.last_pause_check = now;
-            let (fullscreen_app, maximized_app) = self.foreign_toplevel_pause_state();
-            while let Some(info) = self.media.as_ref().and_then(|m| m.try_recv()) {
-                self.media_playing =
-                    info.playback_state == crate::engine::media::PlaybackState::Playing;
-            }
-            self.playback_state = crate::engine::playback_gate::PlaybackState {
-                on_battery: platform::power::is_on_battery(),
-                locked_or_sleeping: self
-                    .lock_watcher
-                    .as_mut()
-                    .map(|w| w.is_locked())
-                    .unwrap_or(false),
-                fullscreen_app,
-                maximized_app,
-                focused_app: self.foreign_toplevels.values().any(|t| t.activated),
-                other_audio: self.media_playing,
-            };
-        }
-        let action = crate::engine::playback_gate::decide(&self.policy, &self.playback_state);
+        let action = self
+            .playback
+            .action(now, || window_state(self.foreign_toplevels.values()));
         if action == PlaybackAction::Stop && !self.stopped {
             self.stopped = true;
             for s in &mut self.surfaces {
@@ -1556,7 +1464,7 @@ impl WallpaperState {
                     ),
                     fps: self.surfaces[i].settings.lock().unwrap().fps,
                 };
-                match build_content_renderer(
+                match ContentRenderer::build(
                     resolved,
                     self.device.clone(),
                     self.queue.clone(),
@@ -1577,60 +1485,42 @@ impl WallpaperState {
     /// and clone layouts surface 0 owns the shared renderer.
     fn apply_property_edits(&mut self, idx: usize) {
         let s = &mut self.surfaces[idx];
-        let total = s.settings.lock().unwrap().property_edits.len();
-        if total == s.props_seen {
-            return;
-        }
         let resolved = self.content.resolve(s.output_name.as_deref());
-        let Some(dir) = resolved.project_dir().map(std::path::Path::to_path_buf) else {
-            s.props_seen = total;
+        let Some((dir, names)) = pending_property_edits(&s.settings, &mut s.props_seen, &resolved)
+        else {
             return;
         };
-        let edits = s
-            .settings
-            .lock()
-            .unwrap()
-            .property_edits_since(&mut s.props_seen, &dir);
-        if edits.is_empty()
-            || (idx > 0 && self.content.layout != crate::render::ScreenLayout::PerScreen)
+        if idx > 0 && self.content.layout != crate::render::ScreenLayout::PerScreen {
+            return;
+        }
+        if s.renderer
+            .borrow_mut()
+            .content
+            .apply_properties(&dir, &names)
         {
             return;
         }
-        let rebuild = match &mut s.renderer.borrow_mut().content {
-            ContentRenderer::Scene(scene) => !scene.set_user_properties(&edits),
-            ContentRenderer::Frames(fs) => {
-                if let Some(tx) = fs.web_input() {
-                    let json = crate::render::web::user_properties_subset(&dir, &edits);
-                    let _ = tx.try_send(crate::render::web::WebInputEvent::Properties(json));
-                }
-                false
-            }
+        let web = crate::render::web::WebOptions {
+            size: (s.width.max(1), s.height.max(1)),
+            fps: s.settings.lock().unwrap().fps,
         };
-        if rebuild {
-            let web = crate::render::web::WebOptions {
-                size: (s.width.max(1), s.height.max(1)),
-                fps: s.settings.lock().unwrap().fps,
-            };
-            match build_content_renderer(
-                resolved,
-                self.device.clone(),
-                self.queue.clone(),
-                self.allow_gpu_surface,
-                web,
-            ) {
-                Ok(r) => s.renderer.borrow_mut().content = r,
-                Err(e) => tracing::error!(target: "wallpaper", "reloading output {idx}: {e}"),
-            }
+        match ContentRenderer::build(
+            resolved,
+            self.device.clone(),
+            self.queue.clone(),
+            self.allow_gpu_surface,
+            web,
+        ) {
+            Ok(r) => s.renderer.borrow_mut().content = r,
+            Err(e) => tracing::error!(target: "wallpaper", "reloading output {idx}: {e}"),
         }
     }
 
     /// Send `event` to every output showing a web wallpaper.
     fn notify_web(&self, event: crate::render::web::WebInputEvent) {
         for s in &self.surfaces {
-            if let ContentRenderer::Frames(fs) = &s.renderer.borrow().content {
-                if let Some(tx) = fs.web_input() {
-                    let _ = tx.try_send(event.clone());
-                }
+            if let Some(tx) = s.renderer.borrow().content.web_input() {
+                let _ = tx.try_send(event.clone());
             }
         }
     }
@@ -1662,7 +1552,28 @@ impl WallpaperState {
 
 #[cfg(test)]
 mod tests {
-    use super::{pointer_norm, span_region, web_mouse_button, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
+    use super::{
+        pointer_norm, span_region, web_mouse_button, window_state, ForeignToplevelState, BTN_LEFT,
+        BTN_MIDDLE, BTN_RIGHT,
+    };
+
+    /// Only the active window counts: a fullscreen window in the background
+    /// must not pause the wallpaper.
+    #[test]
+    fn window_state_follows_the_active_toplevel() {
+        let t = |activated, fullscreen, maximized| ForeignToplevelState {
+            activated,
+            fullscreen,
+            maximized,
+            pending: None,
+        };
+        let w = window_state([t(false, true, true), t(true, false, false)].iter());
+        assert!(w.focused && !w.fullscreen && !w.maximized);
+        let w = window_state([t(true, true, false)].iter());
+        assert!(w.focused && w.fullscreen && !w.maximized);
+        let w = window_state([t(false, true, true)].iter());
+        assert!(!w.focused && !w.fullscreen);
+    }
 
     #[test]
     fn span_regions_split_the_bounding_box() {
