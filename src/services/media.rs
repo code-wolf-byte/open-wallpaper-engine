@@ -265,7 +265,7 @@ mod tests {
     }
 
     /// Real-bus smoke test, not run by default (needs a live session bus —
-    /// `cargo test --lib -- --ignored engine::media`). Verifies the actual
+    /// `cargo test --lib -- --ignored services::media`). Verifies the actual
     /// D-Bus round trip (connect, ListNames, filter, poll) doesn't error,
     /// against whatever's really running — no MPRIS player was available to
     /// install in the sandbox this was written in, so this only proves the
