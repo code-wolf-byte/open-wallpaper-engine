@@ -673,7 +673,7 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
             settings.active_playlist = name;
         }
         ConfigAction::SetPlayback { condition, action } => {
-            let a = wp_engine::engine::playback_gate::PlaybackAction::parse(&action).ok_or_else(
+            let a = wp_engine::services::playback_gate::PlaybackAction::parse(&action).ok_or_else(
                 || anyhow!("invalid action '{action}' (expected run, mute, pause or stop)"),
             )?;
             if !settings.playback.set(&condition, a) {

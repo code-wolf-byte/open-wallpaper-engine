@@ -48,7 +48,7 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
 };
 
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
-use crate::engine::playback_gate::PlaybackAction;
+use crate::services::playback_gate::PlaybackAction;
 use crate::{
     platform,
     render::session::{

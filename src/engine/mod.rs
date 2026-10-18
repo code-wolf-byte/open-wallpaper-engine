@@ -7,7 +7,6 @@
 pub mod cpu;
 pub mod gpu;
 pub mod model;
-pub mod playback_gate;
 pub mod properties;
 pub mod sim;
 

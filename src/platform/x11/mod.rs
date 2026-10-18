@@ -31,7 +31,7 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::{shape, xfixes::ConnectionExt as _};
 use x11rb::rust_connection::RustConnection;
 
-use crate::engine::playback_gate::PlaybackAction;
+use crate::services::playback_gate::PlaybackAction;
 use x11rb::wrapper::ConnectionExt as _;
 
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
