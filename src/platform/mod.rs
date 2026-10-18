@@ -1,4 +1,3 @@
-pub mod audio;
 pub mod device;
 pub mod display;
 pub mod gpu;

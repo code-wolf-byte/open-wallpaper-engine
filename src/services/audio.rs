@@ -240,10 +240,10 @@ fn push_samples(
 /// Prefer a desktop-output monitor (loopback) input; else the default input.
 /// Device selection lives in the platform layer — "capture what the speakers
 /// are playing" is spelled differently on every OS. See
-/// [`crate::platform::audio`].
+/// [`crate::services::audio_devices`].
 fn pick_input_device(host: &cpal::Host) -> Option<cpal::Device> {
-    let (device, source) = crate::platform::audio::pick_capture_device(host)?;
-    if source != crate::platform::audio::CaptureSource::Loopback {
+    let (device, source) = crate::services::audio_devices::pick_capture_device(host)?;
+    if source != crate::services::audio_devices::CaptureSource::Loopback {
         tracing::info!(
             target: "audio",
             "no desktop-loopback device found; falling back to {source:?} —              the spectrum will follow that input, not desktop audio"

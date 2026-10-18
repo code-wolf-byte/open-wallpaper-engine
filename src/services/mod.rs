@@ -3,3 +3,4 @@
 //! them.
 
 pub mod audio;
+pub mod audio_devices;
