@@ -15,7 +15,6 @@ pub mod material;
 pub mod media;
 pub mod mesh3d;
 pub mod model;
-pub mod particle;
 pub mod pkg;
 pub mod playback_gate;
 pub mod properties;
