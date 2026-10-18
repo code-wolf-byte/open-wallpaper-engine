@@ -12,7 +12,8 @@ stage can be inspected on its own when a wallpaper renders wrongly.
 
 ```text
 src/
-  main.rs, bin/        the wp-engine CLI and the scan-wallpapers tool
+  main.rs, cli/        the wp-engine binary and its commands, one file per area
+  bin/                 the scan-wallpapers tool
   workshop/            finding Workshop items; project.json and user properties
   formats/             .pkg archives, .tex textures, the asset store
   engine/              the scene engine
@@ -25,8 +26,14 @@ src/
   services/            what wallpapers react to: audio, media, battery/lock, pause rules
   platform/            presentation: wayland/, x11/, macos/, GPU device, scaler
   daemon/, application/, settings.rs, schedule.rs   lifecycle and saved setup
-  ui/                  the desktop app
+  ui/                  the desktop app, one file per part of the window
 ```
+
+Large modules are folders whose `mod.rs` holds the types and says where the
+rest lives — for example `engine/gpu/renderer/` splits into `pipelines`,
+`build`, `live`, `draw`, `lights` and `params`, and `engine/sim/particle/`
+into `config`, `build`, `step`, `operators` and `draw`. Tests sit beside
+them in `tests.rs`.
 
 ## Pipeline
 
