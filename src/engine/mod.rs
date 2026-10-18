@@ -4,7 +4,6 @@
 //! backend-neutral [`graph::SceneGraph`] feeds the CPU compositor and
 //! diagnostics.
 
-pub mod assets;
 pub mod audio;
 pub mod cpu;
 pub mod gpu;

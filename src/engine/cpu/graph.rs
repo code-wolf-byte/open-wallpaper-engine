@@ -1,9 +1,9 @@
 use anyhow::Result;
 use std::path::Path;
 
-use crate::engine::assets::AssetStore;
 use crate::engine::cpu::material::{EffectDefinition, Model};
 use crate::engine::model::scene::{Scene, SceneObject};
+use crate::formats::assets::AssetStore;
 
 pub struct SceneGraph {
     pub assets: AssetStore,

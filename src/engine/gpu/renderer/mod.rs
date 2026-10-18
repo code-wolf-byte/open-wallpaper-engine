@@ -2333,7 +2333,7 @@ impl GpuSceneInstance {
         let resolved = crate::engine::model::resolve::ResolvedScene::from_directory(dir)?;
         // The unparsed scene.json: scripts and timelines read fields the
         // typed model drops.
-        let raw_scene: serde_json::Value = crate::engine::assets::AssetStore::from_directory(dir)
+        let raw_scene: serde_json::Value = crate::formats::assets::AssetStore::from_directory(dir)
             .ok()
             .and_then(|a| a.scene_json().ok())
             .and_then(|t| serde_json::from_str(&t).ok())
