@@ -5,14 +5,14 @@ use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::assets::AssetStore;
-use super::effect::SceneEffect;
-use super::tex::TexFile;
+use crate::engine::assets::AssetStore;
+use crate::engine::effect::SceneEffect;
 use crate::engine::model::resolve::ResolvedScene;
 use crate::engine::model::scene::SceneObject;
 use crate::engine::sim::particle::{
     InstanceOverride, ParticleConfig, ParticleSprite, ParticleSystem,
 };
+use crate::engine::tex::TexFile;
 
 struct SceneAnimState {
     /// Paired with each layer's `order_index` (its position in
