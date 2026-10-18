@@ -204,9 +204,11 @@ restores your saved `config` setup), or run `wp-engine daemon` as a service and
 `wp-engine run` after it. The daemon shows a tray icon with playlist controls
 and a shortcut back to the GUI; set `WP_ENGINE_NO_TRAY=1` to hide it.
 
-In the GUI, the details panel edits the selected wallpaper's properties and adds
-it to a playlist or a screen; **⚙ Settings** holds the frame-rate cap, scaling,
-multi-monitor layout, playback rules, screens, playlists and autostart.
+The GUI follows Wallpaper Engine's own browser. Clicking a wallpaper applies it
+to the display picked under **Displays** (all of them by default), the right-hand
+panel edits its properties, the bar under the grid builds and plays playlists,
+and **⚙ Settings** holds playback rules, quality, frame rate, audio and
+autostart. **Cancel** restores what was showing when the window opened.
 The daemon's socket and lock live in `$XDG_RUNTIME_DIR/wp-engine/`; a daemon
 started in the background logs to `$XDG_STATE_HOME/wp-engine/daemon.log`.
 
