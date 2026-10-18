@@ -179,7 +179,7 @@ pub struct Layer {
     pub clamp_uvs: bool,
     /// Animated puppet runtime (mesh + skeleton + MDLA animations) — the
     /// live GPU path re-poses and re-rasterizes `image` from this.
-    pub puppet: Option<std::sync::Arc<crate::engine::puppet::PuppetRuntime>>,
+    pub puppet: Option<std::sync::Arc<crate::engine::sim::puppet::PuppetRuntime>>,
     /// Embedded-video stream (mp4 inside the .tex) — the live GPU path
     /// re-uploads decoded frames from this; `image` is the first frame.
     pub video: Option<std::sync::Arc<std::sync::Mutex<VideoLayerStream>>>,
@@ -212,7 +212,7 @@ struct LoadedImage {
     /// Present when the model is an animated puppet (mesh + skeleton +
     /// MDLA animations): `image` holds the rest pose, and the live GPU
     /// path re-poses/re-rasterizes from this over time.
-    puppet: Option<std::sync::Arc<crate::engine::puppet::PuppetRuntime>>,
+    puppet: Option<std::sync::Arc<crate::engine::sim::puppet::PuppetRuntime>>,
     /// Present for embedded-video textures: `image` holds the first frame,
     /// and the live GPU path re-uploads frames from this stream over time.
     video: Option<std::sync::Arc<std::sync::Mutex<VideoLayerStream>>>,
@@ -965,7 +965,7 @@ fn layer_from_object(
         if let Some(rt) = std::sync::Arc::get_mut(rt) {
             let n = rt.model.animations.len();
             if n > 0 {
-                let layers: Vec<crate::engine::puppet::AnimLayer> = entries
+                let layers: Vec<crate::engine::sim::puppet::AnimLayer> = entries
                     .iter()
                     .enumerate()
                     // `visible` is often a user-property binding
@@ -996,7 +996,7 @@ fn layer_from_object(
                                     i.min(n - 1)
                                 }
                             });
-                        crate::engine::puppet::AnimLayer {
+                        crate::engine::sim::puppet::AnimLayer {
                             anim_idx,
                             additive: e.get("additive").and_then(|v| v.as_bool()).unwrap_or(false),
                             blend: e.get("blend").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
@@ -2111,7 +2111,7 @@ fn apply_puppet_mesh(
         tracing::warn!(target: "scene", "puppet mesh '{puppet_path}' not found — drawing raw atlas");
         return plain(atlas);
     };
-    let Some(model) = crate::engine::puppet::parse_model(&mdl_bytes) else {
+    let Some(model) = crate::engine::sim::puppet::parse_model(&mdl_bytes) else {
         tracing::warn!(target: "scene", "puppet mesh '{puppet_path}' unparsable — drawing raw atlas");
         return plain(atlas);
     };
@@ -2126,7 +2126,7 @@ fn apply_puppet_mesh(
     // With a skeleton + animation, frame 0 of the animation IS the
     // assembled pose (skin = worldAnim * inverse(atlas-space bind)); the
     // raw mesh alone only reproduces the packed atlas layout.
-    let runtime = crate::engine::puppet::PuppetRuntime {
+    let runtime = crate::engine::sim::puppet::PuppetRuntime {
         model,
         atlas,
         layers: Vec::new(),
@@ -2134,7 +2134,7 @@ fn apply_puppet_mesh(
     let assembled = if runtime.model.has_animation() {
         runtime.render_at(0.0, runtime.atlas.width(), runtime.atlas.height())
     } else {
-        crate::engine::puppet::rasterize(
+        crate::engine::sim::puppet::rasterize(
             &runtime.model.mesh,
             &runtime.atlas,
             runtime.atlas.width(),
