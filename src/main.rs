@@ -476,7 +476,7 @@ fn apply_saved_settings(
     if save {
         let mut saved_anything = false;
         for arg in cli_properties {
-            let (name, value) = engine::properties::parse_property_arg(arg);
+            let (name, value) = workshop::properties::parse_property_arg(arg);
             settings.set_property(id_or_path, &name, &value);
             saved_anything = true;
         }
@@ -500,7 +500,7 @@ fn apply_saved_settings(
 
 fn cmd_list_properties(id: &str) -> Result<()> {
     let w = workshop::find_by_id(id).ok_or_else(|| anyhow!("workshop item '{id}' not found"))?;
-    let all_props = engine::properties::list_properties(&w.path)?;
+    let all_props = workshop::properties::list_properties(&w.path)?;
     if all_props.is_empty() {
         println!(
             "\"{}\" declares no user-configurable properties.",
@@ -573,7 +573,7 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
         ConfigAction::SetProperty { id, properties } => {
             let mut names = Vec::new();
             for arg in &properties {
-                let (name, value) = engine::properties::parse_property_arg(arg);
+                let (name, value) = workshop::properties::parse_property_arg(arg);
                 println!("{id}: {name} = {value}");
                 settings.set_property(&id, &name, &value);
                 names.push(name);
@@ -772,7 +772,7 @@ fn resolve_scene_dir(id_or_path: &str) -> Result<PathBuf> {
 /// else `default_background`, else the first playlist's first item.
 ///
 /// Honest scope note: property overrides are still process-global (see
-/// `engine::properties`), so only the *default* background's saved
+/// `workshop::properties`), so only the *default* background's saved
 /// overrides are applied — a per-screen wallpaper's own saved overrides
 /// aren't isolated from each other yet if two different screens' wallpapers
 /// happen to declare a property with the same name. With an active
@@ -1095,9 +1095,9 @@ fn cmd_render_scene(
 ) -> Result<()> {
     let overrides = properties
         .iter()
-        .map(|p| engine::properties::parse_property_arg(p))
+        .map(|p| workshop::properties::parse_property_arg(p))
         .collect();
-    engine::properties::set_global_overrides(overrides);
+    workshop::properties::set_global_overrides(overrides);
 
     let dir = resolve_scene_dir(id_or_path)?;
     println!("Loading scene from {}...", dir.display());
@@ -1143,10 +1143,10 @@ fn cmd_render_frame(
     seconds: f32,
     properties: Vec<String>,
 ) -> Result<()> {
-    engine::properties::set_global_overrides(
+    workshop::properties::set_global_overrides(
         properties
             .iter()
-            .map(|p| engine::properties::parse_property_arg(p))
+            .map(|p| workshop::properties::parse_property_arg(p))
             .collect(),
     );
     let path = resolve_id_or_path(id_or_path)?;
