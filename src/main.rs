@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use wp_engine::application::{ApplicationContext, WallpaperApplication};
 use wp_engine::workshop::{self, Wallpaper};
-use wp_engine::{engine, platform, ui};
+use wp_engine::{engine, formats, platform, ui};
 
 #[derive(Parser)]
 #[command(
@@ -1021,7 +1021,7 @@ fn cmd_set_file(
 }
 
 fn cmd_pkg_info(path: &std::path::Path, dump: Option<&std::path::Path>) -> Result<()> {
-    let pkg = engine::Package::from_file(path)?;
+    let pkg = formats::pkg::Package::from_file(path)?;
 
     println!("Files   : {}", pkg.len());
     println!("Empty   : {}", pkg.is_empty());
@@ -1070,7 +1070,7 @@ fn cmd_pkg_info(path: &std::path::Path, dump: Option<&std::path::Path>) -> Resul
 
 fn cmd_tex_info(path: &std::path::Path, save: Option<&std::path::Path>) -> Result<()> {
     let data = std::fs::read(path)?;
-    let tex = engine::TexFile::parse(&data)?;
+    let tex = formats::tex::TexFile::parse(&data)?;
     println!("Format:       {:?}", tex.format());
     println!("Image size:   {}x{}", tex.image_width, tex.image_height);
     println!("Texture size: {}x{}", tex.texture_width, tex.texture_height);
