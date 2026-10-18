@@ -33,8 +33,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-mod config;
 mod properties;
+mod settings_window;
 
 // ── Layout ────────────────────────────────────────────────────────────────────
 
@@ -140,7 +140,7 @@ pub struct WpApp {
     saved: crate::settings::WpSettings,
     prop_editor: Option<properties::PropertyEditor>,
     show_settings: bool,
-    settings_tab: config::SettingsTab,
+    settings_tab: settings_window::SettingsTab,
     show_displays: bool,
     /// The display clicking a wallpaper applies to; `None` = all of them.
     target_screen: Option<String>,
@@ -302,7 +302,7 @@ impl WpApp {
             saved,
             prop_editor: None,
             show_settings: false,
-            settings_tab: config::SettingsTab::Performance,
+            settings_tab: settings_window::SettingsTab::Performance,
             show_displays: false,
             target_screen: None,
             outputs: None,
