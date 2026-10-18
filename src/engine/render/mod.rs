@@ -1421,7 +1421,7 @@ fn text_layer_from_object(
         point_size * compensate
     }
     .clamp(1.0, 1024.0);
-    let font_data = super::text::resolve_font_data(obj.font.as_deref(), dir, pkg)?;
+    let font_data = crate::engine::gpu::text::resolve_font_data(obj.font.as_deref(), dir, pkg)?;
     // Word-wrap to `maxwidth` (scene px == bitmap px at our raster resolution)
     // and cap at `maxrows`, if authored.
     let gate = |v: &Option<serde_json::Value>| {
@@ -1444,7 +1444,7 @@ fn text_layer_from_object(
                 .filter(|_| gate(&obj.limitrows))
                 .unwrap_or(0.0)
                 .max(0.0) as usize;
-            super::text::wrap_text(
+            crate::engine::gpu::text::wrap_text(
                 &font_data,
                 &text_str,
                 raster_px,
@@ -1455,7 +1455,7 @@ fn text_layer_from_object(
         }
         None => text_str,
     };
-    let image = super::text::rasterize(&font_data, &text_str, raster_px)?;
+    let image = crate::engine::gpu::text::rasterize(&font_data, &text_str, raster_px)?;
 
     // Opaque background box: bake the text color + bg color + padding into the
     // bitmap and neutralize the layer tint (color set to white below). `pad`
@@ -1500,7 +1500,7 @@ fn text_layer_from_object(
             .unwrap_or(0.0)
             .max(0.0) as u32;
         (
-            super::text::with_background(&image, text_color, bg, pad),
+            crate::engine::gpu::text::with_background(&image, text_color, bg, pad),
             true,
         )
     } else {
