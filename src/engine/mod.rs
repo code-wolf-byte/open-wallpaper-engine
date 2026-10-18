@@ -8,7 +8,6 @@ pub mod assets;
 pub mod audio;
 pub mod cpu;
 pub mod gpu;
-pub mod material;
 #[cfg(target_os = "linux")]
 pub mod media;
 pub mod model;
