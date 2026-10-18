@@ -1,12 +1,13 @@
-//! Saved-settings UI: the selected wallpaper's properties, playlist and
-//! screen assignment, and the settings window (frame rate, scaling,
-//! playback rules, playlists, screens, autostart). Everything here edits
+//! Saved-settings UI: the selected wallpaper's properties, the playlist
+//! bar's Configure popup, and the settings window (playback rules, frame
+//! rate, quality, scaling, audio, autostart). Everything here edits
 //! `settings.json`, the same file `wp-engine config` writes.
 
-use super::{StatusMsg, WpApp, TEXT_MUTED, TEXT_PRIMARY};
+use super::{StatusMsg, WpApp, DANGER, TEXT_MUTED};
 use crate::engine::playback_gate::PlaybackAction;
 use crate::engine::properties::SceneProperty;
-use crate::render::{ScaleMode, ScreenLayout};
+use crate::platform::RenderQuality;
+use crate::render::ScaleMode;
 use crate::settings::{Playlist, WpSettings};
 use serde_json::Value;
 
@@ -17,6 +18,19 @@ pub(super) struct PropertyEditor {
     pub props: Vec<SceneProperty>,
     /// Which rows their `condition` currently shows; refreshed on each edit.
     pub visible: Vec<bool>,
+}
+
+/// The settings window's tabs, after WE's own settings view.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum SettingsTab {
+    Performance,
+    General,
+    About,
+}
+
+/// A new playlist with the saved format's defaults.
+pub(super) fn empty_playlist() -> Playlist {
+    serde_json::from_str(r#"{"items":[]}"#).expect("playlist defaults")
 }
 
 const PLAYBACK_CONDITIONS: [(&str, &str); 6] = [
@@ -76,7 +90,7 @@ fn label(p: &SceneProperty) -> String {
 /// Ask the desktop for a file or folder via zenity or kdialog.
 // ponytail: shells out instead of a file-dialog crate; use the XDG portal
 // (zbus is already a dependency) if neither tool is common enough.
-fn pick_path(directory: bool) -> Option<String> {
+pub(super) fn pick_path(directory: bool) -> Option<String> {
     let zenity: &[&str] = if directory {
         &["--file-selection", "--directory"]
     } else {
@@ -114,7 +128,7 @@ fn parse_color(s: &str) -> [f32; 3] {
 }
 
 impl WpApp {
-    fn save_settings(&mut self) {
+    pub(super) fn save_settings(&mut self) {
         if let Err(e) = self.saved.save() {
             self.status = StatusMsg::err(format!("Saving settings failed: {e:#}"));
         }
@@ -122,7 +136,7 @@ impl WpApp {
 
     /// Send a one-off request to the daemon, starting it if needed.
     #[cfg(target_os = "linux")]
-    fn daemon_request(&mut self, req: crate::daemon::Request) {
+    pub(super) fn daemon_request(&mut self, req: crate::daemon::Request) {
         std::thread::spawn(move || {
             if let Err(e) = crate::daemon::request_or_spawn(&req) {
                 tracing::warn!(target: "app", "daemon request failed: {e:#}");
@@ -130,7 +144,7 @@ impl WpApp {
         });
     }
 
-    fn title_of(&self, id: &str) -> String {
+    pub(super) fn title_of(&self, id: &str) -> String {
         self.wallpapers
             .iter()
             .find(|w| w.workshop_id == id)
@@ -140,79 +154,8 @@ impl WpApp {
 
     // ── Detail panel ─────────────────────────────────────────────────────────
 
-    /// "Add to playlist" and "Use on screen" for the selected wallpaper.
-    pub(super) fn render_library_actions(&mut self, ui: &mut egui::Ui, idx: usize) {
-        let id = self.wallpapers[idx].workshop_id.clone();
-        ui.horizontal(|ui| {
-            ui.menu_button("➕ Playlist", |ui| {
-                let names: Vec<String> = self.saved.playlists.keys().cloned().collect();
-                for name in names {
-                    if ui.button(&name).clicked() {
-                        let items = &mut self.saved.playlists.get_mut(&name).unwrap().items;
-                        if !items.contains(&id) {
-                            items.push(id.clone());
-                        }
-                        self.save_settings();
-                        self.status = StatusMsg::ok(format!("Added to playlist '{name}'"));
-                        ui.close();
-                    }
-                }
-                ui.separator();
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.new_playlist)
-                        .hint_text("New playlist…")
-                        .desired_width(140.0),
-                );
-                let name = self.new_playlist.trim().to_string();
-                if ui
-                    .add_enabled(!name.is_empty(), egui::Button::new("Create"))
-                    .clicked()
-                {
-                    self.saved
-                        .playlists
-                        .entry(name.clone())
-                        .or_insert_with(|| Playlist {
-                            items: Vec::new(),
-                            delay_minutes: 60,
-                            mode: "timer".into(),
-                            order: "sequential".into(),
-                            times: Vec::new(),
-                        })
-                        .items
-                        .push(id.clone());
-                    self.new_playlist.clear();
-                    self.save_settings();
-                    self.status = StatusMsg::ok(format!("Created playlist '{name}'"));
-                    ui.close();
-                }
-            });
-            ui.menu_button("🖵 Use on screen", |ui| {
-                let outputs = self
-                    .outputs
-                    .get_or_insert_with(crate::platform::display::output_names)
-                    .clone();
-                if ui.button("All screens (default)").clicked() {
-                    self.saved.default_background = Some(id.clone());
-                    self.save_settings();
-                    self.status = StatusMsg::ok("Saved as the default wallpaper");
-                    ui.close();
-                }
-                for out in outputs {
-                    if ui.button(&out).clicked() {
-                        self.saved.screens.insert(out.clone(), id.clone());
-                        self.save_settings();
-                        self.status = StatusMsg::ok(format!(
-                            "Saved for {out} — \"Apply saved setup\" in Settings shows it"
-                        ));
-                        ui.close();
-                    }
-                }
-            });
-        });
-    }
-
-    /// The selected wallpaper's user properties. Changes are saved at once
-    /// and take effect the next time the wallpaper is applied.
+    /// The selected wallpaper's user properties, as WE's two-column list.
+    /// Changes are saved at once and shown live where it is displayed.
     pub(super) fn render_properties(&mut self, ui: &mut egui::Ui, idx: usize) {
         if self.prop_editor.as_ref().map(|e| e.idx) != Some(idx) {
             let props = crate::engine::properties::list_properties(&self.wallpapers[idx].path)
@@ -228,23 +171,54 @@ impl WpApp {
             editor.visible = self.visible_rows(idx, &editor.props);
         }
         let settable = editor.props.iter().filter(|p| p.is_settable()).count();
-        if settable > 0 {
-            egui::CollapsingHeader::new(
-                egui::RichText::new(format!("Properties ({settable})")).color(TEXT_PRIMARY),
-            )
-            .default_open(true)
-            .show(ui, |ui| {
-                if self.property_rows(ui, idx, &editor.props, &editor.visible) {
-                    editor.visible.clear();
-                }
-                ui.label(
-                    egui::RichText::new("Changes apply live while this wallpaper is showing.")
-                        .size(11.0)
-                        .color(TEXT_MUTED),
-                );
-            });
+        ui.horizontal(|ui| {
+            ui.heading("Properties");
+            if settable > 0 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(egui::RichText::new("Reset").color(DANGER))
+                        .on_hover_text("Back to the wallpaper's own defaults")
+                        .clicked()
+                    {
+                        self.reset_properties(idx, &editor.props);
+                        editor.visible.clear();
+                    }
+                });
+            }
+        });
+        ui.separator();
+        if settable == 0 {
+            ui.label(egui::RichText::new("This wallpaper has no properties.").color(TEXT_MUTED));
+        } else {
+            egui::Grid::new(("properties", idx))
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    if self.property_rows(ui, idx, &editor.props, &editor.visible) {
+                        editor.visible.clear();
+                    }
+                });
         }
         self.prop_editor = Some(editor);
+    }
+
+    /// Drop every saved override of wallpaper `idx`.
+    fn reset_properties(&mut self, idx: usize, props: &[SceneProperty]) {
+        let key = self.wallpapers[idx].workshop_id.clone();
+        let names: Vec<String> = props
+            .iter()
+            .filter(|p| self.saved.unset_property(&key, &p.name))
+            .map(|p| p.name.clone())
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        self.save_settings();
+        #[cfg(target_os = "linux")]
+        self.daemon.send(crate::daemon::Request::PropertiesChanged {
+            wallpaper: key,
+            names,
+        });
     }
 
     /// Each row's visibility under the current saved values.
@@ -282,11 +256,11 @@ impl WpApp {
                 if text.is_empty() || text.starts_with("ui_") {
                     ui.add_space(4.0);
                 } else if p.kind == "group" {
-                    ui.add_space(4.0);
                     ui.strong(text);
                 } else {
                     ui.label(egui::RichText::new(text).color(TEXT_MUTED));
                 }
+                ui.end_row();
                 continue;
             }
             let saved = self
@@ -297,26 +271,19 @@ impl WpApp {
                 .cloned();
             let current = saved.clone().unwrap_or_else(|| value_text(&p.value));
             let mut commit: Option<String> = None;
+            ui.label(label(p));
             ui.horizontal(|ui| {
-                if saved.is_some()
-                    && ui
-                        .small_button("↺")
-                        .on_hover_text("Reset to default")
-                        .clicked()
-                {
-                    commit = Some(String::new());
-                }
                 match p.kind.as_str() {
                     "bool" => {
                         let mut on = matches!(current.as_str(), "1" | "true");
-                        if ui.checkbox(&mut on, label(p)).changed() {
+                        if ui.checkbox(&mut on, "").changed() {
                             commit = Some(if on { "1" } else { "0" }.into());
                         }
                     }
                     "slider" => {
                         let mut v = current.parse::<f64>().unwrap_or(0.0);
                         let range = p.min.unwrap_or(0.0)..=p.max.unwrap_or(1.0);
-                        let mut slider = egui::Slider::new(&mut v, range).text(label(p));
+                        let mut slider = egui::Slider::new(&mut v, range);
                         if let Some(step) = p.step.filter(|s| *s > 0.0) {
                             slider = slider.step_by(step);
                         }
@@ -330,7 +297,6 @@ impl WpApp {
                         if ui.color_edit_button_rgb(&mut c).changed() {
                             commit = Some(format!("{} {} {}", c[0], c[1], c[2]));
                         }
-                        ui.label(label(p));
                     }
                     "combo" => {
                         let shown = p
@@ -348,7 +314,6 @@ impl WpApp {
                                     }
                                 }
                             });
-                        ui.label(label(p));
                     }
                     // textinput, file, directory, scenetexture: free text, with
                     // a picker for the path kinds.
@@ -362,11 +327,7 @@ impl WpApp {
                         let mut text = ui
                             .data_mut(|d| d.get_temp::<String>(id))
                             .unwrap_or_else(|| current.clone());
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut text)
-                                .desired_width(150.0)
-                                .hint_text(label(p)),
-                        );
+                        let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(150.0));
                         if r.lost_focus() && text != current {
                             commit = Some(text.clone());
                         }
@@ -375,10 +336,18 @@ impl WpApp {
                         } else {
                             ui.data_mut(|d| d.remove::<String>(id));
                         }
-                        ui.label(label(p));
                     }
                 }
+                if saved.is_some()
+                    && ui
+                        .small_button("↺")
+                        .on_hover_text("Reset to default")
+                        .clicked()
+                {
+                    commit = Some(String::new());
+                }
             });
+            ui.end_row();
             if let Some(value) = commit {
                 if value.is_empty() {
                     self.saved.unset_property(&key, &p.name);
@@ -404,22 +373,53 @@ impl WpApp {
         let mut open = self.show_settings;
         egui::Window::new("Settings")
             .open(&mut open)
-            .default_width(460.0)
+            .default_width(480.0)
             .vscroll(true)
             .show(ctx, |ui| {
-                self.general_settings(ui);
+                ui.horizontal(|ui| {
+                    for (tab, text) in [
+                        (SettingsTab::Performance, "Performance"),
+                        (SettingsTab::General, "General"),
+                        (SettingsTab::About, "About"),
+                    ] {
+                        ui.selectable_value(&mut self.settings_tab, tab, text);
+                    }
+                });
                 ui.separator();
-                self.playback_settings(ui);
-                ui.separator();
-                self.screen_settings(ui);
-                ui.separator();
-                self.playlist_settings(ui);
+                match self.settings_tab {
+                    SettingsTab::Performance => {
+                        self.playback_settings(ui);
+                        ui.separator();
+                        self.quality_settings(ui);
+                    }
+                    SettingsTab::General => self.general_settings(ui),
+                    SettingsTab::About => about(ui),
+                }
             });
         self.show_settings = open;
     }
 
-    fn general_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("General");
+    fn quality_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Quality");
+        let mut quality_changed = false;
+        {
+            let mut s = self.settings.lock().unwrap();
+            egui::ComboBox::from_label("Render quality")
+                .selected_text(s.quality.label())
+                .show_ui(ui, |ui| {
+                    for q in RenderQuality::ALL {
+                        quality_changed |=
+                            ui.selectable_value(&mut s.quality, q, q.label()).changed();
+                    }
+                });
+            #[cfg(target_os = "linux")]
+            if quality_changed {
+                self.daemon.send(crate::daemon::Request::SetQuality {
+                    quality: s.quality.label().to_string(),
+                });
+            }
+        }
+        let _ = quality_changed;
         let mut fps = self
             .saved
             .fps
@@ -434,7 +434,76 @@ impl WpApp {
         if r.drag_stopped() || (r.changed() && !r.dragged()) {
             self.save_settings();
         }
+    }
 
+    fn general_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("General");
+        let mut autostart = self.autostart;
+        if ui
+            .checkbox(&mut autostart, "Start with my session")
+            .on_hover_text("Runs `wp-engine run` at login (XDG autostart)")
+            .changed()
+        {
+            match crate::settings::set_autostart(autostart) {
+                Ok(()) => self.autostart = autostart,
+                Err(e) => self.status = StatusMsg::err(format!("Autostart: {e:#}")),
+            }
+        }
+        if ui
+            .button("▶ Apply saved setup")
+            .on_hover_text(
+                "What `wp-engine run` shows: the login playlist, else the saved displays",
+            )
+            .clicked()
+        {
+            self.run_saved_setup();
+        }
+        ui.add_space(6.0);
+        ui.heading("Audio");
+        {
+            let mut s = self.settings.lock().unwrap();
+            let volume_changed = ui
+                .add(
+                    egui::Slider::new(&mut s.volume, 0.0..=1.0)
+                        .text("Volume")
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                )
+                .changed();
+            #[cfg(target_os = "linux")]
+            if volume_changed {
+                self.daemon
+                    .send(crate::daemon::Request::SetVolume { volume: s.volume });
+            }
+            let _ = volume_changed;
+        }
+        let devices = self
+            .audio_devices
+            .get_or_insert_with(crate::platform::audio::list_audio_outputs);
+        let current = devices
+            .get(self.audio_choice)
+            .map(|d| d.label.clone())
+            .unwrap_or_else(|| "Automatic".to_string());
+        let mut changed = None;
+        egui::ComboBox::from_label("Audio-reactive wallpapers listen to")
+            .selected_text(current)
+            .width(240.0)
+            .show_ui(ui, |ui| {
+                for (i, d) in devices.iter().enumerate() {
+                    if ui
+                        .selectable_label(self.audio_choice == i, &d.label)
+                        .clicked()
+                    {
+                        changed = Some((i, d.device.clone()));
+                    }
+                }
+            });
+        if let Some((i, device)) = changed {
+            self.audio_choice = i;
+            crate::platform::audio::set_preferred_device(device);
+            self.status = StatusMsg::ok("Audio source set — re-apply the wallpaper to use it");
+        }
+        ui.add_space(6.0);
+        ui.heading("Display");
         let mut scaling = self.saved.scaling.unwrap_or_default();
         let before = scaling;
         egui::ComboBox::from_label("Video, image and web scaling")
@@ -450,37 +519,10 @@ impl WpApp {
             self.save_settings();
             self.status = StatusMsg::ok("Scaling saved — re-apply the wallpaper to use it");
         }
-
-        let mut layout = self.saved.layout.unwrap_or_default();
-        let before = layout;
-        egui::ComboBox::from_label("Multiple monitors")
-            .selected_text(layout.label())
-            .show_ui(ui, |ui| {
-                for l in ScreenLayout::ALL {
-                    ui.selectable_value(&mut layout, l, l.label());
-                }
-            });
-        if layout != before {
-            self.saved.layout = Some(layout);
-            self.save_settings();
-            self.status = StatusMsg::ok("Layout saved — re-apply the wallpaper to use it");
-        }
-
-        let mut autostart = self.autostart;
-        if ui
-            .checkbox(&mut autostart, "Start with my session")
-            .on_hover_text("Runs `wp-engine run` at login (XDG autostart)")
-            .changed()
-        {
-            match crate::settings::set_autostart(autostart) {
-                Ok(()) => self.autostart = autostart,
-                Err(e) => self.status = StatusMsg::err(format!("Autostart: {e:#}")),
-            }
-        }
     }
 
     fn playback_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("While…");
+        ui.heading("Playback");
         let mut changed = false;
         egui::Grid::new("playback_rules")
             .num_columns(2)
@@ -510,54 +552,6 @@ impl WpApp {
         );
     }
 
-    fn screen_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Screens");
-        let mut changed = false;
-        let default = self.saved.default_background.clone();
-        ui.horizontal(|ui| {
-            ui.label("Default:");
-            match &default {
-                Some(id) => {
-                    ui.label(self.title_of(id));
-                    if ui.small_button("✖").clicked() {
-                        self.saved.default_background = None;
-                        changed = true;
-                    }
-                }
-                None => {
-                    ui.label(egui::RichText::new("none").color(TEXT_MUTED));
-                }
-            }
-        });
-        let screens: Vec<(String, String)> = self
-            .saved
-            .screens
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (screen, id) in screens {
-            ui.horizontal(|ui| {
-                ui.label(format!("{screen}:"));
-                ui.label(self.title_of(&id));
-                if ui.small_button("✖").clicked() {
-                    self.saved.screens.remove(&screen);
-                    changed = true;
-                }
-            });
-        }
-        if changed {
-            self.save_settings();
-        }
-        ui.label(
-            egui::RichText::new("Assign wallpapers with \"Use on screen\" in the details panel.")
-                .size(11.0)
-                .color(TEXT_MUTED),
-        );
-        if ui.button("▶ Apply saved setup").clicked() {
-            self.run_saved_setup();
-        }
-    }
-
     /// What `wp-engine run` does: the active playlist, else the saved
     /// screens and default.
     fn run_saved_setup(&mut self) {
@@ -573,84 +567,60 @@ impl WpApp {
         }
     }
 
-    fn playlist_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Playlists");
-        if self.saved.playlists.is_empty() {
-            ui.label(
-                egui::RichText::new("Add wallpapers with \"➕ Playlist\" in the details panel.")
-                    .size(11.0)
-                    .color(TEXT_MUTED),
-            );
+    /// The playlist bar's Configure popup: rotation, order, timing,
+    /// whether it plays at login, and deleting it.
+    pub(super) fn playlist_config(&mut self, ui: &mut egui::Ui) {
+        let name = self.playlist.clone();
+        let Some(p) = self.saved.playlists.get(&name) else {
             return;
+        };
+        let titles: Vec<String> = p.items.iter().map(|id| self.title_of(id)).collect();
+        let mut changed = playlist_editor(
+            ui,
+            &name,
+            self.saved.playlists.get_mut(&name).unwrap(),
+            &titles,
+        );
+        ui.separator();
+        let mut at_login = self.saved.active_playlist.as_deref() == Some(name.as_str());
+        if ui
+            .checkbox(&mut at_login, "Play at login")
+            .on_hover_text("`wp-engine run` plays this playlist")
+            .changed()
+        {
+            self.saved.active_playlist = at_login.then(|| name.clone());
+            changed = true;
         }
-        #[cfg(target_os = "linux")]
-        ui.horizontal(|ui| {
-            use crate::daemon::Request;
-            if ui.button("⏮ Previous").clicked() {
-                self.daemon_request(Request::PreviousItem);
-            }
-            if ui.button("⏭ Next").clicked() {
-                self.daemon_request(Request::NextItem);
-            }
-            if ui.button("■ Stop rotating").clicked() {
-                self.daemon_request(Request::StopPlaylist);
-            }
-        });
-
-        let names: Vec<String> = self.saved.playlists.keys().cloned().collect();
-        let mut changed = false;
-        let mut delete = None;
-        for name in names {
-            let active = self.saved.active_playlist.as_deref() == Some(name.as_str());
-            egui::CollapsingHeader::new(if active {
-                format!("★ {name}")
-            } else {
-                name.clone()
-            })
-            .id_salt(("playlist", &name))
-            .default_open(active)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    #[cfg(target_os = "linux")]
-                    if ui.button("▶ Play").clicked() {
-                        self.daemon_request(crate::daemon::Request::PlayPlaylist {
-                            name: name.clone(),
-                        });
-                        self.active_title = Some(format!("playlist '{name}'"));
-                    }
-                    let mut is_active = active;
-                    if ui
-                        .checkbox(&mut is_active, "Play at login")
-                        .on_hover_text("`wp-engine run` plays this playlist")
-                        .changed()
-                    {
-                        self.saved.active_playlist = is_active.then(|| name.clone());
-                        changed = true;
-                    }
-                    if ui.button("🗑 Delete").clicked() {
-                        delete = Some(name.clone());
-                    }
-                });
-                let titles: Vec<String> = self.saved.playlists[&name]
-                    .items
-                    .iter()
-                    .map(|id| self.title_of(id))
-                    .collect();
-                let p = self.saved.playlists.get_mut(&name).unwrap();
-                changed |= playlist_editor(ui, &name, p, &titles);
-            });
-        }
-        if let Some(name) = delete {
+        if ui
+            .button(egui::RichText::new("🗑 Delete playlist").color(DANGER))
+            .clicked()
+        {
             self.saved.playlists.remove(&name);
             if self.saved.active_playlist.as_deref() == Some(name.as_str()) {
                 self.saved.active_playlist = None;
             }
             changed = true;
+            ui.close();
         }
         if changed {
             self.save_settings();
         }
     }
+}
+
+fn about(ui: &mut egui::Ui) {
+    ui.heading("wp-engine");
+    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+    ui.label("A Wallpaper Engine client for Linux and macOS.");
+    ui.hyperlink("https://github.com/code-wolf-byte/open-wallpaper-engine");
+    ui.label(
+        egui::RichText::new(
+            "Scene rendering builds on Almamu's linux-wallpaperengine. \
+             Wallpaper Engine is a product of Wallpaper Engine Team; this project is unaffiliated.",
+        )
+        .size(11.0)
+        .color(TEXT_MUTED),
+    );
 }
 
 fn playback_action(s: &WpSettings, key: &str) -> PlaybackAction {
