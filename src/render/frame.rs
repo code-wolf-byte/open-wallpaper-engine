@@ -25,7 +25,7 @@ pub enum FrameSource {
         /// same variant but have no page to receive input.
         web_input: Option<SyncSender<super::web::WebInputEvent>>,
         /// A video's soundtrack, playing while this source lives.
-        audio: Option<crate::engine::audio::StreamingAudio>,
+        audio: Option<crate::services::audio::StreamingAudio>,
     },
 }
 
@@ -106,7 +106,7 @@ impl FrameSource {
             }
             WallpaperContent::Video { path } => {
                 let (tx, rx) = sync_channel::<Arc<RgbaImage>>(2);
-                let audio = crate::engine::audio::StreamingAudio::start(&path);
+                let audio = crate::services::audio::StreamingAudio::start(&path);
 
                 thread::spawn(move || {
                     if let Err(e) = super::ffmpeg::video_decode_loop(&path, &tx) {
