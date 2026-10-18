@@ -20,7 +20,7 @@ pub enum FrameSource {
         /// Receive end of the bounded channel from the decoder thread.
         rx: Receiver<Arc<RgbaImage>>,
         /// `Some` only for a web wallpaper — lets the platform layer forward
-        /// mouse input into the embedded page (see `render::web::WebInputEvent`).
+        /// mouse input into the embedded page (see `content::web::WebInputEvent`).
         /// `None` for real video and CPU-scene-fallback, which share this
         /// same variant but have no page to receive input.
         web_input: Option<SyncSender<super::web::WebInputEvent>>,
