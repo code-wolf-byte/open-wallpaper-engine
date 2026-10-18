@@ -18,7 +18,7 @@ jobs:
       - name: Install system packages
         run: |
           pacman -Syu --noconfirm --needed base-devel git rustup clang pkgconf \
-            shaderc ffmpeg wayland libxkbcommon alsa-lib
+            shaderc ffmpeg wayland libxkbcommon alsa-lib ttf-dejavu
           rustup default stable
           rustup component add clippy rustfmt
       - uses: actions/checkout@v4

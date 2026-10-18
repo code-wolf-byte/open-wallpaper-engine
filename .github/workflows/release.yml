@@ -1,16 +1,24 @@
 name: Release
 
 # Pushing a tag like v0.2.0 builds both Linux archives with
-# scripts/release.sh and publishes them as a GitHub release.
+# scripts/release.sh and publishes them as a GitHub release. Run it by hand
+# (`gh workflow run release.yml -f tag=v0.2.0`) to rebuild an existing tag
+# with this workflow file rather than the tagged commit's.
 on:
   push:
     tags: ["v*"]
-
-permissions:
-  contents: write
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and publish, e.g. v0.2.0
+        required: true
 
 env:
   CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+permissions:
+  contents: write
 
 jobs:
   linux:
@@ -22,17 +30,19 @@ jobs:
       - name: Install system packages
         run: |
           pacman -Syu --noconfirm --needed base-devel git rustup clang pkgconf \
-            shaderc ffmpeg wayland libxkbcommon alsa-lib nss at-spi2-core libcups \
+            shaderc ffmpeg wayland libxkbcommon alsa-lib ttf-dejavu nss at-spi2-core libcups \
             nspr libx11 libxext libxfixes libxcomposite libxdamage libxrandr \
             mesa pango cairo expat dbus systemd-libs
           rustup default stable
           rustup component add clippy rustfmt
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
       - name: Check the tag matches Cargo.toml
         run: |
           version=$(cargo pkgid | sed 's/.*[#@]//')
-          [ "v$version" = "$GITHUB_REF_NAME" ] || {
-            echo "tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version" >&2
+          [ "v$version" = "$TAG" ] || {
+            echo "tag $TAG doesn't match Cargo.toml version $version" >&2
             exit 1
           }
       - name: Build the plain archive
@@ -41,6 +51,7 @@ jobs:
         run: scripts/release.sh --web --skip-checks
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
           files: |
             dist/*.tar.gz
             dist/*.sha256
