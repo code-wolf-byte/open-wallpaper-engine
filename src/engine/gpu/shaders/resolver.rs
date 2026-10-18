@@ -10,7 +10,7 @@
 //! the same relative path under (3).
 
 use super::loader;
-use crate::engine::pkg::Package;
+use crate::formats::pkg::Package;
 use std::path::{Path, PathBuf};
 
 pub struct AssetResolver {
