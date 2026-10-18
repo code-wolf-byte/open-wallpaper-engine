@@ -46,7 +46,7 @@ impl Default for WebOptions {
 /// Start rendering `html` and return its first frame, a stream of the rest,
 /// and a sender the caller can push mouse input into (see [`WebInputEvent`]).
 ///
-/// Mirrors `render::ffmpeg::video_decode_loop`'s contract: the receiver yields
+/// Mirrors `content::video::video_decode_loop`'s contract: the receiver yields
 /// frames until the sender is dropped, and blocking for the first frame means
 /// callers never present a blank surface.
 pub fn start_web_stream(
@@ -239,7 +239,7 @@ mod imp {
         wants_audio: bool,
         /// Whether this wallpaper calls `wallpaperMediaIntegration.listen`.
         /// Same reasoning as `wants_audio`: only then do we start the D-Bus
-        /// MPRIS watcher (`engine::media`).
+        /// MPRIS watcher (`services::media`).
         wants_media: bool,
         /// Mouse events the platform layer pushes in — drained once per
         /// message-loop tick and forwarded to CEF's `BrowserHost`. See
@@ -568,7 +568,7 @@ mod imp {
         let mut general = String::new();
         let mut audio: Option<crate::services::audio::AudioCapture> = None;
         let mut last_audio_push = Instant::now();
-        // MPRIS is a freedesktop.org/Linux-only surface — see `engine::media`.
+        // MPRIS is a freedesktop.org/Linux-only surface — see `services::media`.
         #[cfg(target_os = "linux")]
         let mut media: Option<crate::services::media::MediaWatcher> = None;
 
@@ -856,7 +856,7 @@ mod imp {
     /// 1. **Applying `--set-property`/saved overrides** — this used to send
     ///    the project.json defaults straight through, meaning web wallpapers
     ///    silently ignored every override scene wallpapers already got via
-    ///    `engine::properties::SceneProperties`. Same override source
+    ///    `workshop::properties::SceneProperties`. Same override source
     ///    (`global_overrides`), so `wp-engine set <web-wallpaper>
     ///    --set-property name=value` (and a saved `settings::WpSettings`
     ///    override) now actually reaches the page.
@@ -994,7 +994,7 @@ mod imp {
 
     /// Does this wallpaper call `wallpaperMediaIntegration.listen`? The
     /// answer decides whether we start the D-Bus MPRIS watcher
-    /// (`engine::media`) at all — same reasoning as `uses_audio_listener`.
+    /// (`services::media`) at all — same reasoning as `uses_audio_listener`.
     #[cfg(target_os = "linux")]
     fn uses_media_listener(dir: &Path) -> bool {
         scans_bundle_for(dir, b"wallpaperMediaIntegration")
