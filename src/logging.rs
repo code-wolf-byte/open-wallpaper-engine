@@ -11,7 +11,7 @@
 //!
 //! 1. `RUST_LOG` — if set, it wins outright and uses the full
 //!    [`EnvFilter`](tracing_subscriber::EnvFilter) syntax, e.g.
-//!    `RUST_LOG=wp_engine::engine::effect=trace,wp_engine=info`.
+//!    `RUST_LOG=wp_engine::engine::cpu::effect=trace,wp_engine=info`.
 //! 2. `-v` flags on the CLI — mapped to a level for the `wp_engine` crate,
 //!    with noisy dependencies (wgpu, naga, …) held back unless `-vvv`.
 //!
