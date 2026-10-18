@@ -5,6 +5,12 @@
 //! and an "Open Wallpaper" / OK / Cancel footer. As in WE, clicking a
 //! wallpaper applies it to the chosen display straight away; Cancel puts
 //! back what was showing (and saved) when the window opened.
+//!
+//! This file holds the app state, the frame loop and shared helpers; each
+//! part of the window has its own file: `browse` (tabs, search, filters,
+//! grid), `details` with `properties`, `playlist`, `displays`, `footer`,
+//! `settings_window`, plus `apply` (showing and reverting wallpapers) and
+//! `thumbnails`.
 
 use crate::content::RenderSettings;
 use crate::platform::{RenderQuality, WallpaperHandle};
