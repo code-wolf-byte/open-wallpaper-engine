@@ -8,7 +8,7 @@ pub struct RenderSettings {
     /// GPU render quality / source down-sample factor.
     pub quality: RenderQuality,
     /// Master volume in 0.0–1.0, applied to every wallpaper audio stream via
-    /// `engine::audio::set_master_volume` each frame.
+    /// `services::audio::set_master_volume` each frame.
     pub volume: f32,
     /// Frame-rate cap for animated content.
     pub fps: u32,
