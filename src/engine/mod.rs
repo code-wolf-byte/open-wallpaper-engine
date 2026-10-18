@@ -27,7 +27,6 @@ pub mod scene;
 pub mod script;
 pub mod sim;
 pub mod tex;
-pub mod timeline;
 
 // Convenience re-exports.
 pub use crate::engine::gpu::fbo::{RenderTarget, RenderTargetPool};

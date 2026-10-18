@@ -2,3 +2,4 @@
 //! camera motion and puppet animation.
 
 pub mod noise;
+pub mod timeline;
