@@ -290,7 +290,7 @@ pub(super) fn handle_request(req: Request, state: &Mutex<State>) -> Response {
             Response::Ok
         }
         Request::SetAudioDevice { device } => {
-            crate::platform::audio::set_preferred_device(device);
+            crate::services::audio_devices::set_preferred_device(device);
             Response::Ok
         }
         Request::PlayPlaylist { name } => {
