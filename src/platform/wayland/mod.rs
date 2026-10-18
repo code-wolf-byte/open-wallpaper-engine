@@ -7,7 +7,7 @@ use raw_window_handle::{
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
-    delegate_seat, delegate_shm,
+    delegate_seat, delegate_shm, delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -17,6 +17,10 @@ use smithay_client_toolkit::{
     },
     shell::wlr_layer::{
         Anchor, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure,
+    },
+    shell::xdg::{
+        window::{Window, WindowConfigure, WindowDecorations, WindowHandler},
+        XdgShell,
     },
     shell::WaylandSurface,
     shm::{slot::SlotPool, Shm, ShmHandler},
@@ -199,6 +203,29 @@ impl Shared {
 
 // ── Internal renderer state ───────────────────────────────────────────────────
 
+/// The Wayland role of an output's wallpaper surface: a background layer
+/// surface where `wlr-layer-shell` exists, otherwise a plain toplevel window
+/// titled after its output, which the bundled GNOME Shell extension
+/// (`extras/gnome-shell-extension`) hides and shows in the desktop background.
+enum Shell {
+    Layer(LayerSurface),
+    Window(Window),
+}
+
+/// App id the GNOME Shell extension recognizes wallpaper windows by; the
+/// title is `XDG_TITLE_PREFIX` + the output's connector name (e.g. "DP-1").
+const XDG_APP_ID: &str = "io.github.code_wolf_byte.wp_engine.wallpaper";
+const XDG_TITLE_PREFIX: &str = "wp-engine wallpaper @";
+
+impl Shell {
+    fn wl_surface(&self) -> &wl_surface::WlSurface {
+        match self {
+            Shell::Layer(l) => l.wl_surface(),
+            Shell::Window(w) => w.wl_surface(),
+        }
+    }
+}
+
 /// GPU presentation state for one output surface.
 struct SurfaceGpu {
     surface: wgpu::Surface<'static>,
@@ -207,12 +234,12 @@ struct SurfaceGpu {
 }
 
 struct WallpaperSurface {
-    /// wgpu surface — declared before `layer` so it drops before the
+    /// wgpu surface — declared before `shell` so it drops before the
     /// wl_surface it was created from.
     gpu: Option<SurfaceGpu>,
     /// `None` once GPU surface creation failed for this output (don't retry).
     gpu_failed: bool,
-    layer: LayerSurface,
+    shell: Shell,
     width: u32,
     height: u32,
     /// Previous frame's SHM pool — kept alive until compositor releases the buffer.
@@ -247,7 +274,10 @@ struct WallpaperState {
     seat_state: SeatState,
     compositor_state: CompositorState,
     shm: Shm,
-    layer_shell: LayerShell,
+    /// `None` on compositors without `wlr-layer-shell` (GNOME), which get
+    /// `xdg_shell` windows instead — see `Shell`.
+    layer_shell: Option<LayerShell>,
+    xdg_shell: Option<XdgShell>,
     /// Pointer for the first seat that advertises one — drives camera parallax
     /// and `g_PointerPosition`.
     pointer: Option<wl_pointer::WlPointer>,
@@ -372,7 +402,7 @@ impl WallpaperState {
     fn create_gpu_surface(&self, idx: usize) -> Result<SurfaceGpu> {
         let display =
             NonNull::new(self.display_ptr).ok_or_else(|| anyhow!("null wl_display pointer"))?;
-        let surface_ptr = self.surfaces[idx].layer.wl_surface().id().as_ptr() as *mut c_void;
+        let surface_ptr = self.surfaces[idx].shell.wl_surface().id().as_ptr() as *mut c_void;
         let surface_ptr =
             NonNull::new(surface_ptr).ok_or_else(|| anyhow!("null wl_surface pointer"))?;
 
@@ -507,7 +537,7 @@ impl WallpaperState {
         // Request the next frame callback before present() commits the surface.
         if self.surfaces[idx].renderer.borrow().content.is_animated() {
             if let Some(qh) = &self.qh {
-                let wl_surf = self.surfaces[idx].layer.wl_surface();
+                let wl_surf = self.surfaces[idx].shell.wl_surface();
                 wl_surf.frame(qh, wl_surf.clone());
             }
         }
@@ -649,7 +679,7 @@ impl WallpaperState {
 
         copy_frame_into_shm_canvas(canvas, &pixels, width as usize, height as usize, stride);
 
-        let wl_surf = self.surfaces[idx].layer.wl_surface();
+        let wl_surf = self.surfaces[idx].shell.wl_surface();
 
         // Request a wl_surface_frame callback before committing — only for
         // animated sources. The callback fires after the compositor presents
@@ -727,9 +757,21 @@ fn wallpaper_loop(
     let shm =
         Shm::bind(&globals, &qh).map_err(|_| anyhow!("compositor does not advertise wl_shm"))?;
     let output_state = OutputState::new(&globals, &qh);
-    let layer_shell = LayerShell::bind(&globals, &qh).map_err(|_| {
-        anyhow!("compositor does not support zwlr_layer_shell_v1 (wlr-layer-shell)")
-    })?;
+    let layer_shell = LayerShell::bind(&globals, &qh)
+        .ok()
+        .filter(|_| std::env::var_os("WP_ENGINE_XDG_WALLPAPER").is_none());
+    let xdg_shell = match layer_shell {
+        Some(_) => None,
+        None => {
+            tracing::info!(
+                target: "wallpaper",
+                "no wlr-layer-shell; using xdg-shell windows (GNOME needs the wp-engine Shell extension)"
+            );
+            Some(XdgShell::bind(&globals, &qh).map_err(|_| {
+                anyhow!("compositor supports neither wlr-layer-shell nor xdg-shell")
+            })?)
+        }
+    };
     let registry_state = RegistryState::new(&globals);
     let seat_state = SeatState::new(&globals, &qh);
     // Playback-pause's fullscreen/maximized detection — see the
@@ -747,6 +789,7 @@ fn wallpaper_loop(
         compositor_state,
         shm,
         layer_shell,
+        xdg_shell,
         pointer: None,
         surfaces: Vec::new(),
         content,
@@ -858,7 +901,7 @@ impl CompositorHandler for WallpaperState {
         let idx = self
             .surfaces
             .iter()
-            .position(|s| s.layer.wl_surface() == surface);
+            .position(|s| s.shell.wl_surface() == surface);
         if let Some(idx) = idx {
             self.qh = Some(qh.clone());
             if let ContentRenderer::Frames(fs) =
@@ -949,18 +992,39 @@ impl OutputHandler for WallpaperState {
         let rect = info.as_ref().and_then(output_rect);
 
         let wl_surface = self.compositor_state.create_surface(qh);
-        let layer = self.layer_shell.create_layer_surface(
-            qh,
-            wl_surface,
-            Layer::Background,
-            Some("wp-engine"),
-            Some(&output),
-        );
-
-        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_exclusive_zone(-1);
-        layer.set_size(0, 0);
-        layer.commit();
+        let shell = match (&self.layer_shell, &self.xdg_shell) {
+            (Some(layer_shell), _) => {
+                let layer = layer_shell.create_layer_surface(
+                    qh,
+                    wl_surface,
+                    Layer::Background,
+                    Some("wp-engine"),
+                    Some(&output),
+                );
+                layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+                layer.set_exclusive_zone(-1);
+                layer.set_size(0, 0);
+                layer.commit();
+                Shell::Layer(layer)
+            }
+            (None, Some(xdg)) => {
+                let window = xdg.create_window(wl_surface, WindowDecorations::None, qh);
+                window.set_app_id(XDG_APP_ID);
+                window.set_title(format!(
+                    "{XDG_TITLE_PREFIX}{}",
+                    output_name.as_deref().unwrap_or("")
+                ));
+                // A fixed output-sized window: the extension only clones it.
+                if let Some((_, _, w, h)) = rect {
+                    let size = Some((w.max(1) as u32, h.max(1) as u32));
+                    window.set_min_size(size);
+                    window.set_max_size(size);
+                }
+                window.commit();
+                Shell::Window(window)
+            }
+            (None, None) => unreachable!("wallpaper_loop binds one of the two shells"),
+        };
 
         let settings = self.settings.resolve(output_name.as_deref());
         let props_seen = settings.lock().unwrap().property_edits.len();
@@ -968,7 +1032,7 @@ impl OutputHandler for WallpaperState {
         self.surfaces.push(WallpaperSurface {
             gpu: None,
             gpu_failed: false,
-            layer,
+            shell,
             width: 0,
             height: 0,
             pool: None,
@@ -1014,12 +1078,48 @@ impl LayerShellHandler for WallpaperState {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        let idx = self.surfaces.iter().position(|s| s.layer == *layer);
+        let idx = self
+            .surfaces
+            .iter()
+            .position(|s| matches!(&s.shell, Shell::Layer(l) if l == layer));
         if let Some(idx) = idx {
             self.surfaces[idx].width = configure.new_size.0;
             self.surfaces[idx].height = configure.new_size.1;
             self.draw_at(idx);
         }
+    }
+}
+
+impl WindowHandler for WallpaperState {
+    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &Window) {}
+
+    fn configure(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        window: &Window,
+        configure: WindowConfigure,
+        _serial: u32,
+    ) {
+        let Some(idx) = self
+            .surfaces
+            .iter()
+            .position(|s| matches!(&s.shell, Shell::Window(w) if w == window))
+        else {
+            return;
+        };
+        // Always the output's own size: a floating toplevel may pick its size,
+        // and the compositor's suggestion is a work area, not the screen.
+        let (w, h) = match self.surfaces[idx].rect {
+            Some((_, _, w, h)) => (w.max(1) as u32, h.max(1) as u32),
+            None => (
+                configure.new_size.0.map_or(1920, |v| v.get()),
+                configure.new_size.1.map_or(1080, |v| v.get()),
+            ),
+        };
+        self.surfaces[idx].width = w;
+        self.surfaces[idx].height = h;
+        self.draw_at(idx);
     }
 }
 
@@ -1147,7 +1247,7 @@ impl PointerHandler for WallpaperState {
             let Some(idx) = self
                 .surfaces
                 .iter()
-                .position(|s| s.layer.wl_surface() == &event.surface)
+                .position(|s| s.shell.wl_surface() == &event.surface)
             else {
                 continue;
             };
@@ -1303,6 +1403,8 @@ delegate_compositor!(WallpaperState);
 delegate_output!(WallpaperState);
 delegate_shm!(WallpaperState);
 delegate_layer!(WallpaperState);
+delegate_xdg_shell!(WallpaperState);
+delegate_xdg_window!(WallpaperState);
 delegate_seat!(WallpaperState);
 delegate_pointer!(WallpaperState);
 delegate_registry!(WallpaperState);

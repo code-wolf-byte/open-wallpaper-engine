@@ -87,7 +87,8 @@ Presentation needs one of:
 
 | Platform | Requirement |
 | --- | --- |
-| Wayland | a compositor with `wlr-layer-shell` (Sway, Hyprland, river, labwc, wayfire, …) |
+| Wayland | a compositor with `wlr-layer-shell` (Sway, Hyprland, river, labwc, wayfire, KDE, COSMIC, …) |
+| GNOME (Wayland) | the bundled Shell extension — see [GNOME](#gnome) |
 | X11 | any window manager |
 | macOS | no extra requirement |
 
@@ -145,6 +146,22 @@ reuse an existing CEF distribution instead of downloading one.
 Leave the feature off unless you need web wallpapers — the default build touches
 none of this, and without it web wallpapers report that the binary lacks web
 support rather than failing obscurely.
+
+### GNOME
+
+GNOME doesn't implement `wlr-layer-shell`, so there wp-engine opens one plain
+window per monitor and a small GNOME Shell extension (GNOME 45+) moves it into
+the desktop background. Install and enable it once, then log out and back in:
+
+```bash
+cp -r extras/gnome-shell-extension/wp-engine@code-wolf-byte.github.io \
+  ~/.local/share/gnome-shell/extensions/
+gnome-extensions enable wp-engine@code-wolf-byte.github.io
+```
+
+Without the extension the wallpaper shows up as an ordinary window.
+`WP_ENGINE_XDG_WALLPAPER=1` forces this window mode on any compositor, for
+testing.
 
 ## Usage
 
@@ -352,8 +369,9 @@ cannot.
 
 ## Troubleshooting
 
-**Nothing appears on Wayland.** The compositor needs `wlr-layer-shell`. GNOME
-does not implement it; use the X11 path there with `WP_ENGINE_FORCE_X11=1`.
+**Nothing appears on Wayland.** The compositor needs `wlr-layer-shell`; on GNOME,
+install the [Shell extension](#gnome). A window titled "wp-engine wallpaper @…"
+means the extension isn't enabled.
 
 **A wallpaper renders wrongly.** Reach for the dumps before reading code:
 
@@ -371,6 +389,7 @@ does not implement it; use the X11 path there with `WP_ENGINE_FORCE_X11=1`.
   rather than trusting the log when bisecting.
 - `WP_ENGINE_FORCE_SHM=1` — force the CPU/SHM presentation path
 - `WP_ENGINE_FORCE_X11=1` — take the X11 path even under a Wayland session
+- `WP_ENGINE_XDG_WALLPAPER=1` — use the GNOME-style window instead of layer-shell
 
 **A web wallpaper says the binary lacks web support.** It was built without
 `--features web`; see [Installation](#installation).
