@@ -2,7 +2,7 @@ use image::RgbaImage;
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::engine::tex::TexFile;
+use crate::formats::tex::TexFile;
 
 pub fn load_utility_textures(assets_dir: &Path) -> HashMap<String, RgbaImage> {
     let mut textures = HashMap::new();
