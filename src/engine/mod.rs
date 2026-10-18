@@ -7,7 +7,6 @@
 pub mod animated;
 pub mod assets;
 pub mod audio;
-pub mod camera3d;
 pub mod effect;
 pub mod gpu;
 pub mod graph;

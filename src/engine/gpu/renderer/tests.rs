@@ -17,13 +17,13 @@ fn gpu_shaders_wgsl_parses_and_validates() {
     .expect("gpu_shaders.wgsl failed validation");
 }
 
-fn quad3d_test_camera() -> crate::engine::camera3d::PerspectiveCamera {
+fn quad3d_test_camera() -> crate::engine::sim::camera3d::PerspectiveCamera {
     let scene: crate::engine::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0", "up": "0 1 0"},
             "general": {"orthogonalprojection": null, "fov": 60.0}}"#,
     )
     .unwrap();
-    crate::engine::camera3d::PerspectiveCamera::from_scene(&scene, 1.0).unwrap()
+    crate::engine::sim::camera3d::PerspectiveCamera::from_scene(&scene, 1.0).unwrap()
 }
 
 /// A camera-facing quad (no rotation, centered on the view axis) must
@@ -94,7 +94,7 @@ fn mesh3d_lighting_bytes_are_uniform_sized_and_match_const() {
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
     )
     .unwrap();
-    let cam = crate::engine::camera3d::PerspectiveCamera::from_scene(&scene, 1.0).unwrap();
+    let cam = crate::engine::sim::camera3d::PerspectiveCamera::from_scene(&scene, 1.0).unwrap();
 
     // The common case: no shadow-casting lights at all.
     let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[], None);
@@ -104,7 +104,10 @@ fn mesh3d_lighting_bytes_are_uniform_sized_and_match_const() {
     // since the shadow arrays are fixed-size regardless of how many
     // slots are actually in use.
     let shadow_slots = vec![Some(0)];
-    let shadow_slot_data = vec![(crate::engine::camera3d::identity(), [0.0, 0.0, 1.0, 1.0])];
+    let shadow_slot_data = vec![(
+        crate::engine::sim::camera3d::identity(),
+        [0.0, 0.0, 1.0, 1.0],
+    )];
     let bytes = mesh3d_lighting_bytes(&scene, &cam, &shadow_slots, &shadow_slot_data, None);
     assert_eq!(bytes.len(), MESH3D_LIGHTING_BYTES_LEN);
 }
@@ -120,9 +123,9 @@ fn mesh3d_lighting_bytes_encodes_cookie_flag_and_matrix() {
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
     )
     .unwrap();
-    let cam = crate::engine::camera3d::PerspectiveCamera::from_scene(&scene, 1.0).unwrap();
+    let cam = crate::engine::sim::camera3d::PerspectiveCamera::from_scene(&scene, 1.0).unwrap();
 
-    let mut vp = crate::engine::camera3d::identity();
+    let mut vp = crate::engine::sim::camera3d::identity();
     vp[3][0] = 42.0; // an arbitrary, recognizable value to round-trip
     let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[], Some((2, vp)));
 
@@ -156,7 +159,7 @@ fn mesh3d_lighting_bytes_encodes_spot_direction() {
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
     )
     .unwrap();
-    let cam = crate::engine::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
+    let cam = crate::engine::sim::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
 
     let scene: crate::engine::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"},
@@ -205,7 +208,7 @@ fn mesh3d_lighting_bytes_encodes_directional_sentinel_and_direction() {
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
     )
     .unwrap();
-    let cam = crate::engine::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
+    let cam = crate::engine::sim::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
 
     let scene: crate::engine::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"},
@@ -253,7 +256,7 @@ fn mesh3d_lighting_bytes_encodes_tube_sentinel_and_endpoints() {
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
     )
     .unwrap();
-    let cam = crate::engine::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
+    let cam = crate::engine::sim::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
 
     let scene: crate::engine::scene::Scene = serde_json::from_str(
         r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"},

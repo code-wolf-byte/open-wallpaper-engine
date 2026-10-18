@@ -91,7 +91,8 @@ impl Scene {
                     .and_then(parse_value_vec3)
                     .map(|a| [a[0] as f32, a[1] as f32, a[2] as f32])
                     .unwrap_or([0.0; 3]);
-                let direction = || crate::engine::camera3d::rotate_euler([0.0, 0.0, -1.0], angles);
+                let direction =
+                    || crate::engine::sim::camera3d::rotate_euler([0.0, 0.0, -1.0], angles);
 
                 let is_spot =
                     matches!(o.light_type(), LightType::Spot) || o.spot_cone_degrees().is_some();
