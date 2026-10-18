@@ -2044,7 +2044,7 @@ const MESH3D_MAX_LIGHTS: usize = 8;
 /// Shadow-casting-light cap, mirrored from `engine::shadow::MAX_SHADOW_LIGHTS`
 /// — must also match `MESH3D_MAX_SHADOW_LIGHTS` in `gpu_shaders.wgsl` by
 /// hand, same caveat as `MESH3D_MAX_LIGHTS`.
-const MESH3D_MAX_SHADOW_LIGHTS: usize = crate::engine::shadow::MAX_SHADOW_LIGHTS;
+const MESH3D_MAX_SHADOW_LIGHTS: usize = crate::engine::gpu::shadow::MAX_SHADOW_LIGHTS;
 
 /// Byte length of the `Mesh3dLighting` uniform buffer: 5 leading `vec4`s
 /// (flags, ambient, fog_distance, fog_height, fog_extra), three
@@ -2723,7 +2723,8 @@ impl GpuSceneInstance {
         // this sandbox's cache is zero either way.
         let cookie_data = {
             use crate::engine::gpu::lighting::Light;
-            let (center, radius) = crate::engine::shadow::scene_bounds(&resolved.mesh3d_layers);
+            let (center, radius) =
+                crate::engine::gpu::shadow::scene_bounds(&resolved.mesh3d_layers);
             lights
                 .iter()
                 .enumerate()
@@ -2739,7 +2740,7 @@ impl GpuSceneInstance {
                         return None;
                     };
                     let image = super::render::resolve_static_texture(Some(dir), None, path)?;
-                    let vp = crate::engine::shadow::spot_light_view_proj(
+                    let vp = crate::engine::gpu::shadow::spot_light_view_proj(
                         *origin,
                         *direction,
                         *outer_cone_degrees,
@@ -3083,7 +3084,7 @@ impl GpuSceneInstance {
         Vec<(crate::engine::camera3d::Mat4, [f32; 4])>,
     ) {
         use crate::engine::gpu::lighting::Light;
-        use crate::engine::shadow;
+        use crate::engine::gpu::shadow;
 
         let mut shadow_slots: Vec<Option<usize>> = vec![None; lights.len()];
 
