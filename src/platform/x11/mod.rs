@@ -268,7 +268,7 @@ fn put_image_chunked(
 }
 
 // ── Fullscreen/maximized-app detection (playback-pause) ────────────────────────
-// EWMH's `_NET_ACTIVE_WINDOW` + `_NET_WM_STATE` — see `engine::playback_gate`'s
+// EWMH's `_NET_ACTIVE_WINDOW` + `_NET_WM_STATE` — see `services::playback_gate`'s
 // module doc (Ghidra report Follow-up (ff)) for where `playbackfullscreen`/
 // `playbackmaximized` come from.
 
@@ -577,7 +577,7 @@ fn wallpaper_loop(
     let prop_root = conn.intern_atom(false, b"_XROOTPMAP_ID")?.reply()?.atom;
     let prop_esetroot = conn.intern_atom(false, b"ESETROOT_PMAP_ID")?.reply()?.atom;
 
-    // Playback-pause conditions (`engine::playback_gate` — Ghidra report
+    // Playback-pause conditions (`services::playback_gate` — Ghidra report
     // Follow-up (ff)). `ewmh` degrades to "never fullscreen/maximized" on
     // any WM without `_NET_ACTIVE_WINDOW`/`_NET_WM_STATE` support (its own
     // `check`'s doc comment); battery/lock are checked on the same
