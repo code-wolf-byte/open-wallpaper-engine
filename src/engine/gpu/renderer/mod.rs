@@ -103,7 +103,7 @@ pub struct GpuSceneRenderer {
     /// scene inside it), while `"cullmode": "nocull"` materials — hollow
     /// shells meant to be seen from both sides — must keep every face.
     mesh3d_pipelines: [wgpu::RenderPipeline; 4],
-    // Shadow-caster depth pass: see `engine::shadow` and
+    // Shadow-caster depth pass: see `engine::gpu::shadow` and
     // `GpuSceneInstance::build_shadow_atlas`.
     shadow_pass_bgl: wgpu::BindGroupLayout,
     mesh3d_shadow_pipeline: wgpu::RenderPipeline,
@@ -508,7 +508,7 @@ impl GpuSceneRenderer {
                     count: None,
                 },
                 // Shared shadow atlas (one texture, every shadow-casting
-                // light's tile packed into it — see `engine::shadow`) plus
+                // light's tile packed into it — see `engine::gpu::shadow`) plus
                 // its comparison sampler, for `textureSampleCompareLevel` PCF
                 // lookups in `fs_mesh3d`.
                 wgpu::BindGroupLayoutEntry {
@@ -608,7 +608,7 @@ impl GpuSceneRenderer {
 
         // Shadow-caster depth pass: renders every mesh3d object's geometry,
         // position-only, into one tile of the shared shadow atlas (see
-        // `engine::shadow` and `GpuSceneInstance::build_shadow_atlas`). No
+        // `engine::gpu::shadow` and `GpuSceneInstance::build_shadow_atlas`). No
         // fragment stage — depth-only. No back-face culling: a caster should
         // block light through any face, not just the ones the main camera
         // would see.
@@ -1882,7 +1882,7 @@ pub struct GpuSceneInstance {
     /// Live playback streams for `sound` objects; kept alive for the scene's
     /// lifetime (dropping stops the audio).
     sounds: Vec<SceneSound>,
-    /// MPRIS "what's playing" watcher (`engine::media`) — Linux-only (see
+    /// MPRIS "what's playing" watcher (`services::media`) — Linux-only (see
     /// its own module doc). Started unconditionally rather than gated on
     /// whether any script actually reads `media.*` (matching
     /// `engine.runtime`'s own always-on treatment): the D-Bus connection is
@@ -2042,7 +2042,7 @@ struct Mesh3dGpu {
 /// constant across the Rust/WGSL boundary, so keep the two in sync by hand.
 const MESH3D_MAX_LIGHTS: usize = 8;
 
-/// Shadow-casting-light cap, mirrored from `engine::shadow::MAX_SHADOW_LIGHTS`
+/// Shadow-casting-light cap, mirrored from `engine::gpu::shadow::MAX_SHADOW_LIGHTS`
 /// — must also match `MESH3D_MAX_SHADOW_LIGHTS` in `gpu_shaders.wgsl` by
 /// hand, same caveat as `MESH3D_MAX_LIGHTS`.
 const MESH3D_MAX_SHADOW_LIGHTS: usize = crate::engine::gpu::shadow::MAX_SHADOW_LIGHTS;
@@ -2212,7 +2212,7 @@ fn mesh3d_lighting_bytes(
             } => {
                 let vp = cam.to_view_space(*origin);
                 // `build_shadow_atlas` now casts shadows from `Light::Spot`
-                // too (see `engine::shadow::spot_light_view_proj`), so
+                // too (see `engine::gpu::shadow::spot_light_view_proj`), so
                 // `shadow_w()` is real here, not always 0.0.
                 *pos_slot = [vp[0], vp[1], vp[2], shadow_w()];
                 *color_slot = [color[0], color[1], color[2], *intensity];
@@ -2483,7 +2483,7 @@ impl GpuSceneInstance {
         // Computed early (not just before `build_shadow_atlas` needs it, its
         // original spot) so the FBO-pool setup below can also gate
         // `_rt_VolumetricsBuffer`'s allocation on whether any light actually
-        // needs it — see `engine::scene::SceneObject::volumetrics_params`.
+        // needs it — see `engine::model::scene::SceneObject::volumetrics_params`.
         let lights = resolved.scene.lights();
         let has_volumetrics = lights.iter().any(|(_, _, v, _)| v.is_some());
 
@@ -2684,7 +2684,7 @@ impl GpuSceneInstance {
         let mesh_filter = std::env::var("WP_MESH_FILTER").ok();
         // Shadow atlas: one shared depth texture, packed with a tile per
         // shadow-casting `light` object — see `build_shadow_atlas` and
-        // `engine::shadow`. Built before the lighting uniform and the final
+        // `engine::gpu::shadow`. Built before the lighting uniform and the final
         // mesh3d draws because both need to bind its (by-then-final) view.
         // `lights` itself was computed earlier, alongside `has_volumetrics`.
         let (shadow_atlas_tex, shadow_slots, shadow_slot_data) = if camera3d.is_some() {
@@ -3063,7 +3063,7 @@ impl GpuSceneInstance {
     /// Render the shadow atlas once at scene setup (shadow-casting lights
     /// are treated as static, same precedent as mesh MVPs — see
     /// `build_mesh3d`'s own doc comment). For every `light` object with
-    /// `castshadow: true` (capped at `engine::shadow::MAX_SHADOW_LIGHTS`),
+    /// `castshadow: true` (capped at `engine::gpu::shadow::MAX_SHADOW_LIGHTS`),
     /// depth-renders every mesh3d object into that light's tile of one
     /// shared atlas texture — the architecture recovered from the original
     /// binary's `_rt_shadowAtlas` (see the Ghidra report's shadow-mapping
@@ -5056,7 +5056,7 @@ impl GpuSceneInstance {
     /// The pre-GPU-pipeline particle path: budgeted CPU rasterization into a
     /// bbox buffer, uploaded and composited as a stretched quad. Kept behind
     /// WP_PARTICLE_CPU=1 for A/B comparison; the CPU compositor paths
-    /// (render.rs/animated.rs) share the same underlying rasterizer.
+    /// (model::resolve/cpu::animated) share the same underlying rasterizer.
     fn draw_particle_layer_cpu_raster(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
