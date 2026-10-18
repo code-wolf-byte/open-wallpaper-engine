@@ -1,4 +1,4 @@
-//! Battery and session-lock detection for `engine::playback_gate`'s
+//! Battery and session-lock detection for `services::playback_gate`'s
 //! `on_battery`/`on_lock_or_sleep` conditions — see that module's doc for
 //! where these come from (the Ghidra report's Follow-up (ff)).
 
@@ -87,10 +87,10 @@ fn macos_on_battery() -> Option<bool> {
 }
 
 /// Owns the background polling thread; drop to stop it (mirrors
-/// `engine::media::MediaWatcher`'s exact lifetime/polling convention).
+/// `services::media::MediaWatcher`'s exact lifetime/polling convention).
 /// Linux-only — session lock state is a freedesktop.org logind convention
 /// with no macOS equivalent this codebase reaches for elsewhere either
-/// (see `engine::media`'s own "Linux-only" precedent).
+/// (see `services::media`'s own "Linux-only" precedent).
 #[cfg(target_os = "linux")]
 pub struct LockWatcher {
     rx: Receiver<bool>,
