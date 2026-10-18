@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::engine::assets::AssetStore;
-use crate::engine::material::{EffectDefinition, Model};
+use crate::engine::cpu::material::{EffectDefinition, Model};
 use crate::engine::model::scene::{Scene, SceneObject};
 
 pub struct SceneGraph {
@@ -306,7 +306,7 @@ impl SceneGraphStats {
 }
 
 fn collect_material_stats(
-    material: &crate::engine::material::Material,
+    material: &crate::engine::cpu::material::Material,
     stats: &mut SceneGraphStats,
 ) {
     stats.material_passes += material.passes.len();

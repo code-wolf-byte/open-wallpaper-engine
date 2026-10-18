@@ -3,7 +3,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-use super::assets::AssetStore;
+use crate::engine::assets::AssetStore;
 
 pub type TextureMap = BTreeMap<u32, String>;
 pub type ComboMap = BTreeMap<String, i32>;
