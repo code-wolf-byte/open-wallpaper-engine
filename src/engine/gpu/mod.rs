@@ -1,0 +1,4 @@
+//! How the scene is drawn on the GPU: render targets, blend modes, lighting,
+//! shadows and text rasterization.
+
+pub mod fbo;

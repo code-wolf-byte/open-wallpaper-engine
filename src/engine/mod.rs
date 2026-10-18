@@ -11,7 +11,7 @@ pub mod blend;
 pub mod camera3d;
 pub mod camera_dynamics;
 pub mod effect;
-pub mod fbo;
+pub mod gpu;
 pub mod gpu_renderer;
 pub mod graph;
 pub mod lighting;
@@ -36,8 +36,8 @@ pub mod text;
 pub mod timeline;
 
 // Convenience re-exports.
+pub use crate::engine::gpu::fbo::{RenderTarget, RenderTargetPool};
 pub use camera_dynamics::{CameraDynamics, CameraFrameDynamics};
-pub use fbo::{RenderTarget, RenderTargetPool};
 pub use graph::SceneGraph;
 pub use pkg::Package;
 pub use properties::SceneProperties;
