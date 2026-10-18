@@ -1,0 +1,47 @@
+name: Release
+
+# Pushing a tag like v0.2.0 builds both Linux archives with
+# scripts/release.sh and publishes them as a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    # Same toolchain as CI: Arch ships the FFmpeg and shaderc that
+    # ffmpeg-next 9 and shaderc-sys need.
+    container: archlinux:latest
+    steps:
+      - name: Install system packages
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rustup clang pkgconf \
+            shaderc ffmpeg wayland libxkbcommon alsa-lib nss at-spi2-core libcups \
+            nspr libx11 libxext libxfixes libxcomposite libxdamage libxrandr \
+            mesa pango cairo expat dbus systemd-libs
+          rustup default stable
+          rustup component add clippy rustfmt
+      - uses: actions/checkout@v4
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(cargo pkgid | sed 's/.*[#@]//')
+          [ "v$version" = "$GITHUB_REF_NAME" ] || {
+            echo "tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version" >&2
+            exit 1
+          }
+      - name: Build the plain archive
+        run: scripts/release.sh
+      - name: Build the web archive
+        run: scripts/release.sh --web --skip-checks
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true

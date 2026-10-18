@@ -616,7 +616,7 @@ fn about(ui: &mut egui::Ui) {
     ui.label(
         egui::RichText::new(
             "Scene rendering builds on Almamu's linux-wallpaperengine. \
-             Wallpaper Engine is a product of Wallpaper Engine Team; this project is unaffiliated.",
+             Wallpaper Engine is a product of Kristjan Skutta; this project is unaffiliated.",
         )
         .size(11.0)
         .color(TEXT_MUTED),

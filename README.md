@@ -15,6 +15,7 @@
 
 **Presents on**&nbsp;
 <img alt="Wayland via wlr-layer-shell" src="https://img.shields.io/badge/Wayland-layer--shell-FFBC00?style=flat-square">
+<img alt="GNOME via a Shell extension" src="https://img.shields.io/badge/GNOME-Shell_extension-4A86CF?style=flat-square&logo=gnome&logoColor=white">
 <img alt="X11 via desktop window or root pixmap" src="https://img.shields.io/badge/X11-desktop_window-F28834?style=flat-square">
 <img alt="macOS desktop window" src="https://img.shields.io/badge/macOS-desktop_window-333333?style=flat-square&logo=apple&logoColor=white">
 
@@ -72,7 +73,8 @@ great deal of the maths here is based on that project's work. See
 | **Audio reactive** | Desktop audio captured and FFT'd into the `g_AudioSpectrum*` uniforms, driving visualisers and particle emission |
 | **Scripting** | Wallpaper Engine's SceneScript property scripts, for live text, opacity, visibility, and transforms |
 | **Puppets and 3D** | `.mdl` skeletal meshes with skinning and animation layers, and perspective scenes |
-| **Native presentation** | Direct `wgpu::Surface` presentation on Wayland — no readback — with X11 and macOS paths and a CPU fallback everywhere |
+| **Native presentation** | Direct `wgpu::Surface` presentation on Wayland — no readback — plus GNOME (via a Shell extension), X11 desktops and bare window managers, macOS, and a CPU fallback everywhere |
+| **Desktop app** | A browser laid out like Wallpaper Engine's: click to apply per display, filters, playlists, live property editing, and a background daemon with a tray icon |
 
 ## Requirements
 
@@ -90,11 +92,23 @@ Presentation needs one of:
 | Wayland | a compositor with `wlr-layer-shell` (Sway, Hyprland, river, labwc, wayfire, KDE, COSMIC, …) |
 | GNOME (Wayland) | the bundled Shell extension — see [GNOME](#gnome) |
 | X11 | any window manager or desktop (KDE, Xfce, GNOME, Cinnamon, MATE, …) |
-| macOS | no extra requirement |
+| macOS | no extra requirement (scenes only, primary display — see [Known gaps](#project-status)) |
 
 Windows is out of scope — see [Project status](#project-status).
 
 ## Installation
+
+### Prebuilt archives
+
+[Releases](https://github.com/code-wolf-byte/open-wallpaper-engine/releases)
+carry `wp-engine-<version>-linux-x86_64.tar.gz` and a `-web` variant with the
+embedded Chromium for web wallpapers. Unpack anywhere and run `./wp-engine`;
+the web variant keeps its Chromium files beside the binary, so leave the folder
+together. The binary links shaderc and FFmpeg dynamically, so install those
+(below) — an archive needs the same major FFmpeg version it was built against.
+If yours differs, build from source.
+
+### From source
 
 Install the two native libraries first. Cargo links against them and cannot
 fetch them like crates:
@@ -266,6 +280,8 @@ wp-engine config set-active-playlist evening
 | Variable | Effect |
 | --- | --- |
 | `WP_ENGINE_FORCE_X11=1` | Take the X11 path even under a Wayland session |
+| `WP_ENGINE_X11_MODE=root\|window` | On X11, draw only on the root window, or in a desktop window too (the default where the window manager supports one) |
+| `WP_ENGINE_XDG_WALLPAPER=1` | Use the GNOME-style plain window instead of layer-shell |
 | `WP_ENGINE_FORCE_SHM=1` | Force the CPU/SHM presentation path |
 | `WP_ENGINE_SKIP_EFFECTS=a,b` | Disable named effects |
 | `WP_ENGINE_NO_TRAY=1` | Run the daemon without a tray icon |
@@ -328,7 +344,21 @@ built, and several are deliberately skipped as unreachable.
 <details>
 <summary><strong>Known gaps</strong></summary>
 
-- Workshop browsing and downloading
+- Workshop browsing and downloading — the GUI's Discover and Workshop tabs open
+  the Steam Workshop website; subscribe there (or in Steam) and the items show up
+- **macOS** is an early port: scene wallpapers only, on the primary display, no
+  background daemon, playlists or tray, settings and per-wallpaper properties
+  not yet applied, no cursor input, and audio-reactive wallpapers need a
+  loopback driver such as BlackHole
+- **GNOME** needs the bundled Shell extension, which has had little testing; the
+  overview shows GNOME's own wallpaper, and pausing behind fullscreen apps
+  doesn't work there (GNOME doesn't share window states)
+- **KDE and Xfce on X11**: the wallpaper window sits above the desktop's own
+  layer, so desktop icons are hidden (they still respond to clicks); on Wayland
+  KDE is unaffected
+- pausing behind fullscreen/maximized apps on Wayland needs
+  `wlr-foreign-toplevel-management` (Sway, Hyprland, river, …), so KDE Wayland
+  doesn't pause either
 - hardware video decoding
 - only one web wallpaper at a time; keyboard input isn't forwarded to web
   wallpapers, and X11 doesn't forward the scroll wheel or middle button
@@ -368,6 +398,21 @@ cargo test
 `cargo test` runs the unit suite. For rendering work, `test-scene` is the fastest
 signal — it drives the real GPU path headlessly, so it catches what unit tests
 cannot.
+
+### Releasing
+
+`scripts/release.sh` runs the checks, builds, and packs
+`dist/wp-engine-<version>-<os>-<arch>[-web].tar.gz` with a `.sha256`:
+
+```bash
+scripts/release.sh                          # package the current version
+scripts/release.sh --web                    # Linux: bundle Chromium for web wallpapers
+scripts/release.sh --version 0.2.0 --tag    # bump, commit "release: v0.2.0", tag v0.2.0
+```
+
+It never pushes; push the branch and tag, then attach both archives (and their
+`.sha256` files) to a GitHub release. Build on the oldest distribution you want
+to support, since the binary links that system's FFmpeg and shaderc.
 
 ## Troubleshooting
 
