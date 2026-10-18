@@ -1,13 +1,12 @@
-//! Saved-settings UI: the playlist bar's Configure popup and the settings
-//! window (playback rules, frame rate, quality, scaling, audio, autostart).
-//! Everything here edits `settings.json`, the same file `wp-engine config`
-//! writes.
+//! The settings window (playback rules, frame rate, quality, scaling, audio,
+//! autostart) and the GUI's shared settings helpers. Everything here edits
+//! `settings.json`, the same file `wp-engine config` writes.
 
-use super::{StatusMsg, WpApp, DANGER, TEXT_MUTED};
+use super::{StatusMsg, WpApp, TEXT_MUTED};
 use crate::content::ScaleMode;
 use crate::platform::RenderQuality;
 use crate::services::playback_gate::PlaybackAction;
-use crate::settings::{Playlist, WpSettings};
+use crate::settings::WpSettings;
 
 /// The settings window's tabs, after WE's own settings view.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -15,11 +14,6 @@ pub(super) enum SettingsTab {
     Performance,
     General,
     About,
-}
-
-/// A new playlist with the saved format's defaults.
-pub(super) fn empty_playlist() -> Playlist {
-    serde_json::from_str(r#"{"items":[]}"#).expect("playlist defaults")
 }
 
 const PLAYBACK_CONDITIONS: [(&str, &str); 6] = [
@@ -36,13 +30,6 @@ const SCALE_MODES: [ScaleMode; 4] = [
     ScaleMode::Fit,
     ScaleMode::Stretch,
     ScaleMode::Center,
-];
-
-const PLAYLIST_MODES: [(&str, &str); 4] = [
-    ("timer", "Every N minutes"),
-    ("daytime", "At times of day"),
-    ("dayofweek", "By day of week"),
-    ("login", "Next one each login"),
 ];
 
 /// Ask the desktop for a file or folder via zenity or kdialog.
@@ -294,46 +281,6 @@ impl WpApp {
             Err(e) => self.status = StatusMsg::err(format!("Couldn't run saved setup: {e}")),
         }
     }
-
-    /// The playlist bar's Configure popup: rotation, order, timing,
-    /// whether it plays at login, and deleting it.
-    pub(super) fn playlist_config(&mut self, ui: &mut egui::Ui) {
-        let name = self.playlist.clone();
-        let Some(p) = self.saved.playlists.get(&name) else {
-            return;
-        };
-        let titles: Vec<String> = p.items.iter().map(|id| self.title_of(id)).collect();
-        let mut changed = playlist_editor(
-            ui,
-            &name,
-            self.saved.playlists.get_mut(&name).unwrap(),
-            &titles,
-        );
-        ui.separator();
-        let mut at_login = self.saved.active_playlist.as_deref() == Some(name.as_str());
-        if ui
-            .checkbox(&mut at_login, "Play at login")
-            .on_hover_text("`wp-engine run` plays this playlist")
-            .changed()
-        {
-            self.saved.active_playlist = at_login.then(|| name.clone());
-            changed = true;
-        }
-        if ui
-            .button(egui::RichText::new("🗑 Delete playlist").color(DANGER))
-            .clicked()
-        {
-            self.saved.playlists.remove(&name);
-            if self.saved.active_playlist.as_deref() == Some(name.as_str()) {
-                self.saved.active_playlist = None;
-            }
-            changed = true;
-            ui.close();
-        }
-        if changed {
-            self.save_settings();
-        }
-    }
 }
 
 fn about(ui: &mut egui::Ui) {
@@ -361,75 +308,4 @@ fn playback_action(s: &WpSettings, key: &str) -> PlaybackAction {
         "battery" => p.on_battery,
         _ => p.locked,
     }
-}
-
-/// Mode, order, timing and items of one playlist. Returns whether it changed.
-fn playlist_editor(ui: &mut egui::Ui, name: &str, p: &mut Playlist, titles: &[String]) -> bool {
-    let before = p.clone();
-    egui::ComboBox::from_id_salt(("mode", name))
-        .selected_text(
-            PLAYLIST_MODES
-                .iter()
-                .find(|(m, _)| *m == p.mode)
-                .map_or(p.mode.as_str(), |(_, l)| l),
-        )
-        .show_ui(ui, |ui| {
-            for (m, l) in PLAYLIST_MODES {
-                ui.selectable_value(&mut p.mode, m.to_string(), l);
-            }
-        });
-    ui.horizontal(|ui| {
-        ui.selectable_value(&mut p.order, "sequential".into(), "In order");
-        ui.selectable_value(&mut p.order, "random".into(), "Shuffle");
-        if p.mode == "timer" {
-            ui.add(
-                egui::DragValue::new(&mut p.delay_minutes)
-                    .range(1..=10_080)
-                    .suffix(" min"),
-            );
-        }
-    });
-    let daytime = p.mode == "daytime";
-    if daytime {
-        p.times.resize(p.items.len(), String::new());
-    }
-    let mut remove = None;
-    let mut raise = None;
-    for (i, title) in titles.iter().enumerate() {
-        ui.horizontal(|ui| {
-            if ui.small_button("✖").clicked() {
-                remove = Some(i);
-            }
-            if i > 0 && ui.small_button("⬆").clicked() {
-                raise = Some(i);
-            }
-            if daytime {
-                let t = &mut p.times[i];
-                let bad = !t.is_empty() && crate::schedule::parse_time_of_day(t).is_none();
-                ui.add(
-                    egui::TextEdit::singleline(t)
-                        .desired_width(48.0)
-                        .hint_text("HH:MM")
-                        .text_color_opt(bad.then_some(egui::Color32::LIGHT_RED)),
-                );
-            } else if p.mode == "dayofweek" {
-                const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-                ui.label(DAYS[i % 7]);
-            }
-            ui.label(super::truncate(title, 48)).on_hover_text(title);
-        });
-    }
-    if let Some(i) = raise {
-        p.items.swap(i, i - 1);
-        if p.times.len() > i {
-            p.times.swap(i, i - 1);
-        }
-    }
-    if let Some(i) = remove {
-        p.items.remove(i);
-        if p.times.len() > i {
-            p.times.remove(i);
-        }
-    }
-    *p != before
 }
