@@ -36,6 +36,7 @@ pub mod shaders;
 pub mod shadow;
 pub mod tex;
 pub mod text;
+pub mod timeline;
 
 // Convenience re-exports.
 pub use camera::SceneCamera;

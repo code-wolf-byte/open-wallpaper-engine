@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main, beta]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    # Arch ships current FFmpeg and shaderc, which ffmpeg-next 9 and
+    # shaderc-sys need; Ubuntu's packages lag behind.
+    container: archlinux:latest
+    steps:
+      - name: Install system packages
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rustup clang pkgconf \
+            shaderc ffmpeg wayland libxkbcommon alsa-lib
+          rustup default stable
+          rustup component add clippy rustfmt
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('Cargo.lock') }}
+      - run: cargo fmt --check
+      - run: cargo build --locked
+      - run: cargo test --locked
+      - run: cargo clippy --locked

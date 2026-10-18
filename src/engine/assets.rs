@@ -13,6 +13,9 @@ use super::tex::TexFile;
 /// scene/gifscene PKGs are used as a fallback.
 pub struct AssetStore {
     root: PathBuf,
+    /// The directory of the workshop item named by `project.json`'s
+    /// `dependency`, searched after the wallpaper's own files.
+    dependency: Option<PathBuf>,
     packages: Vec<Package>,
     /// Global Wallpaper Engine assets install, checked only after the
     /// wallpaper's own loose files/packages come up empty. Built-in presets
@@ -33,19 +36,46 @@ impl AssetStore {
             }
         }
 
+        let dependency = crate::workshop::load_project(root)
+            .ok()
+            .and_then(|p| p.dependency)
+            .and_then(|id| crate::workshop::find_item_dir(&id, Some(root)));
+        if let Some(dep) = &dependency {
+            for name in ["scene.pkg", "gifscene.pkg"] {
+                let path = dep.join(name);
+                if path.exists() {
+                    packages.push(Package::from_file(&path)?);
+                }
+            }
+        }
+
         Ok(Self {
             root: root.to_path_buf(),
+            dependency,
             packages,
             assets_dir: super::shaders::loader::find_we_assets_dir(),
         })
     }
 
     pub fn read(&self, path: &str) -> Result<Vec<u8>> {
+        // `file`-type user properties (and preset files) carry absolute
+        // paths to files outside the wallpaper.
+        let as_given = Path::new(path);
+        if as_given.is_absolute() && as_given.is_file() {
+            return std::fs::read(as_given).with_context(|| format!("reading {path}"));
+        }
         let normalized = normalize_asset_path(path);
         let disk_path = self.root.join(&normalized);
         if disk_path.exists() {
             return std::fs::read(&disk_path)
                 .with_context(|| format!("reading {}", disk_path.display()));
+        }
+        if let Some(dep) = &self.dependency {
+            let dep_path = dep.join(&normalized);
+            if dep_path.exists() {
+                return std::fs::read(&dep_path)
+                    .with_context(|| format!("reading {}", dep_path.display()));
+            }
         }
 
         for package in &self.packages {

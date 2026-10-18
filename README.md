@@ -3,8 +3,8 @@
 <p>
   <a href="LICENSE"><img alt="License: GPL-3.0-only" src="https://img.shields.io/badge/license-GPL--3.0--only-blue?style=flat-square"></a>
   <img alt="Written in Rust, 2021 edition" src="https://img.shields.io/badge/Rust-2021_edition-CE422B?style=flat-square&logo=rust&logoColor=white">
-  <img alt="Top language" src="https://img.shields.io/github/languages/top/code-wolf-byte/wp-engine?style=flat-square">
-  <img alt="Last commit" src="https://img.shields.io/github/last-commit/code-wolf-byte/wp-engine?style=flat-square">
+  <img alt="Top language" src="https://img.shields.io/github/languages/top/code-wolf-byte/open-wallpaper-engine?style=flat-square">
+  <img alt="Last commit" src="https://img.shields.io/github/last-commit/code-wolf-byte/open-wallpaper-engine?style=flat-square">
 </p>
 
 **Renders**&nbsp;
@@ -112,8 +112,8 @@ brew install shaderc ffmpeg
 Then build:
 
 ```bash
-git clone https://github.com/code-wolf-byte/wp-engine
-cd wp-engine
+git clone https://github.com/code-wolf-byte/open-wallpaper-engine
+cd open-wallpaper-engine
 cargo build --release
 ```
 
@@ -182,8 +182,14 @@ all hand their wallpaper to a single background daemon, replacing whatever it
 was showing, so the wallpaper keeps running after the terminal or GUI window
 closes. Pass `--foreground` to `set`/`set-file`/`run` to render in the current
 process until Ctrl-C instead. To start the wallpaper with your session, run
-`wp-engine run` (it restores your saved `config` setup) from your compositor's
-autostart, or run `wp-engine daemon` as a service and `wp-engine run` after it.
+`wp-engine autostart on` (an XDG autostart entry for `wp-engine run`, which
+restores your saved `config` setup), or run `wp-engine daemon` as a service and
+`wp-engine run` after it. The daemon shows a tray icon with playlist controls
+and a shortcut back to the GUI; set `WP_ENGINE_NO_TRAY=1` to hide it.
+
+In the GUI, the details panel edits the selected wallpaper's properties and adds
+it to a playlist or a screen; **⚙ Settings** holds the frame-rate cap, scaling,
+multi-monitor layout, playback rules, screens, playlists and autostart.
 The daemon's socket and lock live in `$XDG_RUNTIME_DIR/wp-engine/`; a daemon
 started in the background logs to `$XDG_STATE_HOME/wp-engine/daemon.log`.
 
@@ -192,16 +198,20 @@ started in the background logs to `$XDG_STATE_HOME/wp-engine/daemon.log`.
 | `list` | List installed Workshop wallpapers |
 | `set <id>` | Apply a wallpaper by Workshop ID |
 | `set-file <path>` | Apply a scene directory, video, image, or HTML file |
+| `playlist play <name>` | Rotate through a saved playlist (`next`, `previous`, `stop`) |
+| `config …` | Saved settings: properties, screens, playlists, playback rules, FPS, scaling |
+| `autostart on\|off` | Start `wp-engine run` at login |
 | `run` | Apply the saved `config` setup (per-screen wallpapers, default) |
 | `status` | Show what the background daemon is displaying |
 | `stop` | Remove the wallpaper and stop the background daemon |
 | `daemon` | Run the daemon in the foreground (normally auto-started) |
 | `info <id>` | Show a Workshop item's metadata |
 | `list-properties <id>` | Show the properties a wallpaper exposes |
-| `probe` | List GPU adapters visible to the process |
+| `probe` | List GPU adapters and screen names |
 | `pkg-info <path>` | Inspect or extract a `.pkg` archive |
 | `tex-info <path>` | Inspect a `.tex` texture |
 | `render-scene <id>` | Render one frame to a PNG |
+| `render-frame <id>` | Render a video, image or web wallpaper's frame to a PNG |
 | `preview-scene <id>` | Preview an animated scene in a window |
 | `test-scene <id>` | Check that a scene animates, headless |
 
@@ -215,6 +225,23 @@ Wallpapers expose their own settings — colours, speeds, toggles. List them wit
 `wp-engine list-properties <id>` and override them with `--set-property
 NAME=VALUE`, which is applied before `scene.json` is parsed.
 
+### Playback, playlists and display
+
+```bash
+# Pause behind fullscreen apps, mute while another app plays audio
+wp-engine config set-playback fullscreen pause
+wp-engine config set-playback audio mute
+wp-engine config set-fps 60
+wp-engine config set-scaling fit          # fill, fit, stretch, center
+wp-engine config set-layout span          # per-screen, span, clone
+
+# A playlist that changes every 30 minutes, played by `wp-engine run`
+wp-engine config set-playlist evening 1275921440 2156479578 --delay 30
+wp-engine config set-active-playlist evening
+```
+
+`wp-engine config --help` lists every setting.
+
 ### Environment variables
 
 | Variable | Effect |
@@ -222,6 +249,8 @@ NAME=VALUE`, which is applied before `scene.json` is parsed.
 | `WP_ENGINE_FORCE_X11=1` | Take the X11 path even under a Wayland session |
 | `WP_ENGINE_FORCE_SHM=1` | Force the CPU/SHM presentation path |
 | `WP_ENGINE_SKIP_EFFECTS=a,b` | Disable named effects |
+| `WP_ENGINE_NO_TRAY=1` | Run the daemon without a tray icon |
+| `WP_ENGINE_PAUSE_ON_{FOCUS,MAXIMIZED,FULLSCREEN,AUDIO,BATTERY,LOCK}` | Override a playback rule (`run`/`mute`/`pause`/`stop`) |
 | `CEF_PATH` | Reuse an existing CEF distribution instead of downloading one |
 | `SHADERC_LIB_DIR` | Where to find shaderc, if not on the default search path |
 | `RUST_LOG` | Standard `tracing` filter; overrides `-v` |
@@ -252,13 +281,25 @@ built, and several are deliberately skipped as unreachable.
 - puppet `.mdl` mesh loading with bones, skinning, and animation layers
 - text objects: system + bundled fonts, wrapping, alignment, backgrounds
 - light and sound objects
-- SceneScript property scripting (text, alpha, visible, scale, origin, angles)
+- SceneScript: persistent per-object scripts with `init`/`update`, the
+  `thisLayer`/`thisScene`/`engine`/`input`/`shared` APIs, cursor events,
+  sounds, texture animations, effect and material access, created layers
+- property animations (keyframed timelines with events)
+- presets (Workshop items that restyle another wallpaper)
 - audio reactivity: desktop capture → FFT → `g_AudioSpectrum*` uniforms
 - camera shake / fade / parallax, driven by the real cursor
 - 3D perspective scenes with meshes
-- video wallpapers, and embedded-video `.tex` layers, streamed with FFmpeg
-- web (HTML) wallpapers via CEF, with the WE browser API bridge
-  (`wallpaperPropertyListener`, `wallpaperRegisterAudioListener`)
+- composition/fullscreen layers that sample the scene behind them
+  (water, refraction, CRT effects)
+- video wallpapers with audio, and embedded-video `.tex` layers, streamed with
+  FFmpeg; fill/fit/stretch/center scaling
+- web (HTML) wallpapers via CEF at the output's resolution, with the WE browser
+  API bridge (properties, audio, media integration, mouse input)
+- playback rules (run/mute/pause/stop while another app is focused, maximized,
+  fullscreen or playing audio, on battery, or while locked), FPS cap
+- playlists: timer, time of day, day of week, or once per login
+- multiple monitors: a wallpaper per screen, one spanned across all of them,
+  or one cloned onto each
 - presentation: Wayland layer-shell (direct `wgpu::Surface`, no readback),
   X11 root pixmap, macOS desktop window, CPU/SHM fallback everywhere
 - application lifecycle (`WallpaperApplication`, `--set-property`, signals)
@@ -268,13 +309,11 @@ built, and several are deliberately skipped as unreachable.
 <details>
 <summary><strong>Known gaps</strong></summary>
 
-- **screen-space backdrop capture** for refraction/distortion effects
-  (waterripple/waterflow): their hidden `g_Texture0` is meant to sample the scene
-  behind the layer, but we default it to the layer's own base texture, so water
-  effects distort themselves. Currently softened with a brightness band-aid.
-- MPRIS media integration, and the media/plugin halves of the web JS bridge
-- mouse/keyboard input forwarding into web wallpapers (they render, but do not
-  respond to the cursor); web wallpapers also render at a fixed 1080p
+- Workshop browsing and downloading
+- hardware video decoding
+- only one web wallpaper at a time; keyboard input isn't forwarded to web
+  wallpapers, and X11 doesn't forward the scroll wheel or middle button
+- playlist transitions (items switch with a hard cut)
 - per-object cameras (3 wallpapers in the local corpus)
 - normal-mapped lighting, shadows, volumetrics, GPU instancing, and a true depth
   buffer — all measured against the corpus and found to have zero or near-zero

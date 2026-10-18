@@ -21,9 +21,11 @@ use smithay_client_toolkit::{
     shell::WaylandSurface,
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::{mpsc::SyncSender, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -42,6 +44,7 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
 };
 
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
+use crate::engine::playback_gate::PlaybackAction;
 use crate::{
     engine::gpu_renderer::GpuSceneInstance,
     platform,
@@ -59,7 +62,11 @@ const PAUSE_CHECK_INTERVAL: Duration = Duration::from_millis(750);
 pub(super) struct WaylandPlatform;
 
 impl DisplayPlatform for WaylandPlatform {
-    fn spawn_wallpaper(&self, content: ScreenContent, settings: ScreenSettings) -> Result<WallpaperHandle> {
+    fn spawn_wallpaper(
+        &self,
+        content: ScreenContent,
+        settings: ScreenSettings,
+    ) -> Result<WallpaperHandle> {
         let wayland_handle = spawn_wayland_wallpaper(content, settings)?;
         Ok(WallpaperHandle::new(Box::new(wayland_handle)))
     }
@@ -83,7 +90,10 @@ impl WallpaperHandleInner for WaylandHandle {
     }
 }
 
-fn spawn_wayland_wallpaper(content: ScreenContent, settings: ScreenSettings) -> Result<WaylandHandle> {
+fn spawn_wayland_wallpaper(
+    content: ScreenContent,
+    settings: ScreenSettings,
+) -> Result<WaylandHandle> {
     let (signal_tx, signal_rx) = std::sync::mpsc::sync_channel::<LoopSignal>(0);
 
     let thread = thread::spawn(move || {
@@ -135,6 +145,7 @@ fn build_content_renderer(
     device: wgpu::Device,
     queue: wgpu::Queue,
     allow_gpu_surface: bool,
+    web: crate::render::web::WebOptions,
 ) -> Result<ContentRenderer> {
     Ok(match content {
         WallpaperContent::Scene { dir } if allow_gpu_surface => {
@@ -148,8 +159,42 @@ fn build_content_renderer(
                 }
             }
         }
-        other => ContentRenderer::Frames(FrameSource::from_content(other)?),
+        other => ContentRenderer::Frames(FrameSource::from_content_with(other, web)?),
     })
+}
+
+/// A surface's renderer. Span and clone layouts give every surface the
+/// same one, so it renders once per frame and each surface presents its
+/// part.
+struct Shared {
+    content: ContentRenderer,
+    /// When `content` last rendered a frame, and that frame read back for
+    /// the SHM path, so other surfaces sharing it within the same frame
+    /// reuse it.
+    rendered_at: Option<Instant>,
+    readback: Option<Arc<image::RgbaImage>>,
+}
+
+type SharedRenderer = Rc<RefCell<Shared>>;
+
+fn shared(content: ContentRenderer) -> SharedRenderer {
+    Rc::new(RefCell::new(Shared {
+        content,
+        rendered_at: None,
+        readback: None,
+    }))
+}
+
+impl Shared {
+    /// Whether to render a new frame now: always for a renderer of its own;
+    /// once per half frame interval for one shared by several surfaces.
+    fn due(&mut self, sharers: usize, interval: Duration) -> bool {
+        let due = sharers <= 1 || self.rendered_at.is_none_or(|t| t.elapsed() >= interval / 2);
+        if due {
+            self.rendered_at = Some(Instant::now());
+        }
+        due
+    }
 }
 
 // ── Internal renderer state ───────────────────────────────────────────────────
@@ -172,14 +217,28 @@ struct WallpaperSurface {
     height: u32,
     /// Previous frame's SHM pool — kept alive until compositor releases the buffer.
     pool: Option<SlotPool>,
-    /// This output's own independent content — resolved from `ScreenContent`
-    /// by output name at `new_output` time, so different outputs can show
-    /// different wallpapers instead of one renderer shared by every surface.
-    renderer: ContentRenderer,
+    /// This output's content — resolved from `ScreenContent` by output name
+    /// at `new_output` time, so different outputs can show different
+    /// wallpapers; one renderer shared by every surface in span and clone
+    /// layouts.
+    renderer: SharedRenderer,
+    output: wl_output::WlOutput,
+    /// The output's logical rectangle (x, y, w, h), for its share of a span.
+    rect: Option<(i32, i32, i32, i32)>,
     /// This output's own independent `RenderSettings` — resolved from
     /// `ScreenSettings` the same way `renderer` is, so a heavy scene on one
     /// monitor can't force every other monitor's quality down with it.
     settings: Arc<Mutex<RenderSettings>>,
+    /// The output's name, to rebuild `renderer` after a playback stop.
+    output_name: Option<String>,
+    /// When this surface last rendered, for the frame-rate cap, and whether
+    /// a capped draw is already scheduled.
+    last_draw: Option<Instant>,
+    draw_scheduled: bool,
+    /// Frame-rate cap last sent to a web page on this surface.
+    web_fps: u32,
+    /// How far into `settings.property_edits` this surface has applied.
+    props_seen: usize,
 }
 
 struct WallpaperState {
@@ -228,7 +287,15 @@ struct WallpaperState {
     /// Per-toplevel state from `zwlr_foreign_toplevel_handle_v1` events,
     /// keyed by the handle's own object id.
     foreign_toplevels: HashMap<ObjectId, ForeignToplevelState>,
-    pause_conditions: crate::engine::playback_gate::PauseConditions,
+    policy: crate::engine::playback_gate::PlaybackPolicy,
+    /// MPRIS watcher for the "another application is playing audio"
+    /// condition; only started when the policy acts on it.
+    media: Option<crate::engine::media::MediaWatcher>,
+    media_playing: bool,
+    /// Renderers were released by a playback stop.
+    stopped: bool,
+    /// For scheduling frame-rate-capped draws.
+    loop_handle: Option<calloop::LoopHandle<'static, WallpaperState>>,
     lock_watcher: Option<platform::power::LockWatcher>,
     playback_state: crate::engine::playback_gate::PlaybackState,
     last_pause_check: Instant,
@@ -257,7 +324,10 @@ impl WallpaperState {
     fn ensure_gpu_surface(&mut self, idx: usize) {
         if !self.allow_gpu_surface
             || self.surfaces[idx].gpu_failed
-            || !matches!(self.surfaces[idx].renderer, ContentRenderer::Scene(_))
+            || !matches!(
+                self.surfaces[idx].renderer.borrow().content,
+                ContentRenderer::Scene(_)
+            )
         {
             return;
         }
@@ -348,26 +418,81 @@ impl WallpaperState {
         })
     }
 
+    /// The canvas surface `idx` shows part of, and which part (normalized
+    /// `[x, y, w, h]`): its share of all outputs' bounding box in a span,
+    /// otherwise its whole self.
+    fn view_of(&self, idx: usize) -> ((u32, u32), [f32; 4]) {
+        let s = &self.surfaces[idx];
+        let own = ((s.width, s.height), crate::render::settings::FULL_REGION);
+        if self.content.layout != crate::render::ScreenLayout::Span {
+            return own;
+        }
+        match s.rect {
+            Some(rect) => span_region(rect, self.surfaces.iter().filter_map(|s| s.rect)),
+            None => own,
+        }
+    }
+
     fn draw_at(&mut self, idx: usize) {
-        eprintln!(
-            "DIAG draw_at idx={idx} w={} h={}",
-            self.surfaces[idx].width, self.surfaces[idx].height
-        );
         if self.surfaces[idx].width == 0 || self.surfaces[idx].height == 0 {
             return;
         }
-        // Playback-pause (`engine::playback_gate`): skip rendering entirely
-        // and — just as importantly — don't request another `wl_surface`
-        // frame callback either, so the surface simply holds its last
-        // presented frame and the compositor stops nudging us every vblank.
-        // `tick_pause_watchdog` is what notices the pause has cleared and
-        // kicks this back into motion (nothing else will, once the
-        // callback chain has stalled like this).
-        if self.should_pause(Instant::now()) {
+        // Playback policy (`engine::playback_gate`): when it halts
+        // rendering, skip the draw and — just as importantly — don't
+        // request another frame callback, so the surface holds its last
+        // frame and the compositor stops nudging us every vblank.
+        // `tick_pause_watchdog` notices the condition clearing and restarts
+        // the callback chain.
+        let action = self.playback_action(Instant::now());
+        crate::engine::audio::set_muted(action >= PlaybackAction::Mute);
+        if action.halts() {
+            if !self.paused {
+                self.notify_web(crate::render::web::WebInputEvent::Paused(true));
+            }
             self.paused = true;
             return;
         }
+        if self.paused {
+            self.notify_web(crate::render::web::WebInputEvent::Paused(false));
+        }
         self.paused = false;
+        // A changed frame-rate cap reaches web pages too.
+        let fps = self.surfaces[idx].settings.lock().unwrap().fps;
+        if self.surfaces[idx].web_fps != fps {
+            self.surfaces[idx].web_fps = fps;
+            if let ContentRenderer::Frames(fs) = &self.surfaces[idx].renderer.borrow().content {
+                if let Some(tx) = fs.web_input() {
+                    let _ = tx.try_send(crate::render::web::WebInputEvent::Fps(fps));
+                }
+            }
+        }
+        crate::engine::audio::set_master_volume(self.settings.default.lock().unwrap().volume);
+        self.apply_property_edits(idx);
+
+        // Frame-rate cap: a callback that arrives early waits on a timer.
+        let interval = self.surfaces[idx].settings.lock().unwrap().frame_interval();
+        if let Some(last) = self.surfaces[idx].last_draw {
+            let since = last.elapsed();
+            if since < interval {
+                if !self.surfaces[idx].draw_scheduled {
+                    if let Some(handle) = &self.loop_handle {
+                        self.surfaces[idx].draw_scheduled = true;
+                        let _ = handle.insert_source(
+                            calloop::timer::Timer::from_duration(interval - since),
+                            move |_, (), state: &mut WallpaperState| {
+                                if let Some(s) = state.surfaces.get_mut(idx) {
+                                    s.draw_scheduled = false;
+                                    state.draw_at(idx);
+                                }
+                                calloop::timer::TimeoutAction::Drop
+                            },
+                        );
+                    }
+                }
+                return;
+            }
+        }
+        self.surfaces[idx].last_draw = Some(Instant::now());
         self.ensure_gpu_surface(idx);
         if self.surfaces[idx].gpu.is_some() {
             self.draw_gpu(idx);
@@ -379,10 +504,8 @@ impl WallpaperState {
     /// Direct GPU presentation: render the scene straight into the acquired
     /// surface texture — no CPU readback, no SHM copy.
     fn draw_gpu(&mut self, idx: usize) {
-        let (width, height) = (self.surfaces[idx].width, self.surfaces[idx].height);
-
         // Request the next frame callback before present() commits the surface.
-        if self.surfaces[idx].renderer.is_animated() {
+        if self.surfaces[idx].renderer.borrow().content.is_animated() {
             if let Some(qh) = &self.qh {
                 let wl_surf = self.surfaces[idx].layer.wl_surface();
                 wl_surf.frame(qh, wl_surf.clone());
@@ -422,13 +545,22 @@ impl WallpaperState {
 
         let view = frame.texture.create_view(&Default::default());
         let format = self.surfaces[idx].gpu.as_ref().unwrap().format;
-        match &mut self.surfaces[idx].renderer {
+        let (canvas, region) = self.view_of(idx);
+        let interval = self.surfaces[idx].settings.lock().unwrap().frame_interval();
+        let sharers = Rc::strong_count(&self.surfaces[idx].renderer);
+        let mut r = self.surfaces[idx].renderer.borrow_mut();
+        let due = r.due(sharers, interval);
+        match &mut r.content {
             ContentRenderer::Scene(instance) => {
-                instance.render_to_view(&view, width, height, format);
+                if due {
+                    instance.render();
+                }
+                instance.present_region(&view, format, canvas, region);
             }
             // GPU surfaces are only created for scene renderers.
             ContentRenderer::Frames(_) => return,
         }
+        drop(r);
         frame.present();
     }
 
@@ -438,35 +570,27 @@ impl WallpaperState {
         let width = self.surfaces[idx].width;
         let height = self.surfaces[idx].height;
 
-        let frame: Arc<image::RgbaImage> = match &mut self.surfaces[idx].renderer {
-            ContentRenderer::Frames(fs) => Arc::clone(fs.current_frame()),
-            ContentRenderer::Scene(instance) => match instance.render_rgba() {
-                Ok(img) => Arc::new(img),
-                Err(e) => {
-                    tracing::error!(target: "wallpaper", "scene readback failed: {e}");
-                    return;
-                }
-            },
+        let interval = self.surfaces[idx].settings.lock().unwrap().frame_interval();
+        let sharers = Rc::strong_count(&self.surfaces[idx].renderer);
+        let frame: Arc<image::RgbaImage> = {
+            let mut r = self.surfaces[idx].renderer.borrow_mut();
+            let due = r.due(sharers, interval) || r.readback.is_none();
+            match &mut r.content {
+                ContentRenderer::Frames(fs) => Arc::clone(fs.current_frame()),
+                ContentRenderer::Scene(_) if !due => Arc::clone(r.readback.as_ref().unwrap()),
+                ContentRenderer::Scene(instance) => match instance.render_rgba() {
+                    Ok(img) => {
+                        let img = Arc::new(img);
+                        r.readback = Some(Arc::clone(&img));
+                        img
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "wallpaper", "scene readback failed: {e}");
+                        return;
+                    }
+                },
+            }
         };
-        {
-            let raw = frame.as_raw();
-            let (fw, fh) = (frame.width() as usize, frame.height() as usize);
-            let sample = |xf: f64, yf: f64| -> Option<[u8; 4]> {
-                let x = ((fw as f64) * xf) as usize;
-                let y = ((fh as f64) * yf) as usize;
-                let off = (y * fw + x) * 4;
-                raw.get(off..off + 4).map(|s| [s[0], s[1], s[2], s[3]])
-            };
-            eprintln!(
-                "DIAG draw_shm idx={idx} frame={fw}x{fh} corners tl={:?} tr={:?} bl={:?} br={:?} mid={:?}",
-                sample(0.05, 0.05),
-                sample(0.95, 0.05),
-                sample(0.05, 0.95),
-                sample(0.95, 0.95),
-                sample(0.5, 0.5),
-            );
-        }
-
         let row_bytes = width as usize * 4;
         let stride = row_bytes;
         let active_len = stride * height as usize;
@@ -491,10 +615,26 @@ impl WallpaperState {
             }
         };
 
-        let quality = self.surfaces[idx].settings.lock().unwrap().quality;
-        let pixels = self
-            .gpu_scaler
-            .scale(frame.as_ref(), width, height, quality);
+        let (quality, scaling) = {
+            let s = self.surfaces[idx].settings.lock().unwrap();
+            (s.quality, s.scaling)
+        };
+        // Scenes fill the screen, as on the direct GPU path; the fit modes
+        // are for video, image and web content.
+        let mode = match &self.surfaces[idx].renderer.borrow().content {
+            ContentRenderer::Scene(_) => crate::render::ScaleMode::Fill,
+            ContentRenderer::Frames(_) => scaling,
+        };
+        let (span, region) = self.view_of(idx);
+        let pixels = self.gpu_scaler.scale_region(
+            frame.as_ref(),
+            width,
+            height,
+            quality,
+            mode,
+            span,
+            region,
+        );
         if pixels.len() != active_len {
             tracing::error!(
                 target: "wallpaper",
@@ -515,7 +655,7 @@ impl WallpaperState {
         // animated sources. The callback fires after the compositor presents
         // this frame, at which point we advance to the next frame and draw again.
         // Static sources draw once on configure and never request more callbacks.
-        if self.surfaces[idx].renderer.is_animated() {
+        if self.surfaces[idx].renderer.borrow().content.is_animated() {
             if let Some(qh) = &self.qh {
                 wl_surf.frame(qh, wl_surf.clone());
             }
@@ -555,7 +695,11 @@ fn copy_frame_into_shm_canvas(
     }
 }
 
-fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, signal_tx: SyncSender<LoopSignal>) -> Result<()> {
+fn wallpaper_loop(
+    content: ScreenContent,
+    settings: ScreenSettings,
+    signal_tx: SyncSender<LoopSignal>,
+) -> Result<()> {
     // Open GPU device (prefer iGPU for background tasks; fall back to best).
     let gpu = platform::GpuDevice::open_low_power()
         .or_else(|_| platform::GpuDevice::open_best())
@@ -591,8 +735,11 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, signal_tx: S
     // Playback-pause's fullscreen/maximized detection — see the
     // `foreign_toplevel_manager` field doc for the "not every compositor
     // supports this" graceful-degradation note.
-    let foreign_toplevel_manager = globals.bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 1..=3, ()).ok();
+    let foreign_toplevel_manager = globals
+        .bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 1..=3, ())
+        .ok();
 
+    let policy = crate::engine::playback_gate::PlaybackPolicy::load();
     let mut state = WallpaperState {
         registry_state,
         output_state,
@@ -614,7 +761,15 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, signal_tx: S
         allow_gpu_surface,
         foreign_toplevel_manager,
         foreign_toplevels: HashMap::new(),
-        pause_conditions: crate::engine::playback_gate::PauseConditions::from_env(),
+        policy,
+        media: if policy.watches_audio() {
+            crate::engine::media::MediaWatcher::start()
+        } else {
+            None
+        },
+        media_playing: false,
+        stopped: false,
+        loop_handle: None,
         lock_watcher: platform::power::LockWatcher::start(),
         playback_state: crate::engine::playback_gate::PlaybackState::default(),
         last_pause_check: Instant::now() - PAUSE_CHECK_INTERVAL,
@@ -632,9 +787,10 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, signal_tx: S
         .map_err(|e| anyhow!("second Wayland roundtrip failed: {e}"))?;
 
     // Hand the queue to calloop.
-    let mut event_loop: calloop::EventLoop<WallpaperState> =
+    let mut event_loop: calloop::EventLoop<'static, WallpaperState> =
         calloop::EventLoop::try_new().map_err(|e| anyhow!("calloop init failed: {e}"))?;
 
+    state.loop_handle = Some(event_loop.handle());
     WaylandSource::new(conn, event_queue)
         .insert(event_loop.handle())
         .map_err(|e| anyhow!("WaylandSource insert failed: {e}"))?;
@@ -705,7 +861,9 @@ impl CompositorHandler for WallpaperState {
             .position(|s| s.layer.wl_surface() == surface);
         if let Some(idx) = idx {
             self.qh = Some(qh.clone());
-            if let ContentRenderer::Frames(fs) = &mut self.surfaces[idx].renderer {
+            if let ContentRenderer::Frames(fs) =
+                &mut self.surfaces[idx].renderer.borrow_mut().content
+            {
                 fs.try_advance();
             }
             self.draw_at(idx);
@@ -729,30 +887,66 @@ impl OutputHandler for WallpaperState {
         // output-info aggregation, `None` when the compositor never reports
         // one (no per-screen assignment can ever match; falls back to the
         // default wallpaper below, same as always).
-        let output_name = self.output_state.info(&output).and_then(|info| info.name);
+        let info = self.output_state.info(&output);
+        let output_name = info.as_ref().and_then(|info| info.name.clone());
+        // A web page renders at the output's native mode.
+        let web = crate::render::web::WebOptions {
+            size: info
+                .as_ref()
+                .and_then(|i| i.modes.iter().find(|m| m.current).map(|m| m.dimensions))
+                .map(|(w, h)| (w.max(1) as u32, h.max(1) as u32))
+                .unwrap_or((
+                    crate::render::web::WEB_WIDTH,
+                    crate::render::web::WEB_HEIGHT,
+                )),
+            fps: self
+                .settings
+                .resolve(output_name.as_deref())
+                .lock()
+                .unwrap()
+                .fps,
+        };
 
         let resolved = self.content.resolve(output_name.as_deref());
         let per_screen = output_name
             .as_deref()
             .is_some_and(|name| self.content.by_output.contains_key(name));
-        let renderer =
-            match build_content_renderer(resolved, self.device.clone(), self.queue.clone(), self.allow_gpu_surface) {
-                Ok(r) => r,
-                Err(e) => {
-                    // Don't take down every other (working) output over one
-                    // bad content path — log and leave this output blank.
-                    tracing::error!(
-                        target: "wallpaper",
-                        "failed to load wallpaper content for output {output_name:?}: {e} — leaving it blank"
-                    );
-                    return;
-                }
-            };
+        // Span and clone: every output shows the first one's renderer.
+        // ponytail: a spanned web page renders at the first output's size.
+        let existing = (self.content.layout != crate::render::ScreenLayout::PerScreen)
+            .then(|| self.surfaces.first().map(|s| Rc::clone(&s.renderer)))
+            .flatten();
+        let renderer = match existing.map(Ok).unwrap_or_else(|| {
+            build_content_renderer(
+                resolved,
+                self.device.clone(),
+                self.queue.clone(),
+                self.allow_gpu_surface,
+                web,
+            )
+            .map(shared)
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                // Don't take down every other (working) output over one
+                // bad content path — log and leave this output blank.
+                tracing::error!(
+                    target: "wallpaper",
+                    "failed to load wallpaper content for output {output_name:?}: {e} — leaving it blank"
+                );
+                return;
+            }
+        };
         tracing::info!(
             target: "wallpaper",
             "output {output_name:?}: {} wallpaper",
-            if per_screen { "per-screen" } else { "default" }
+            match self.content.layout {
+                crate::render::ScreenLayout::PerScreen if per_screen => "per-screen",
+                crate::render::ScreenLayout::PerScreen => "default",
+                l => l.label(),
+            }
         );
+        let rect = info.as_ref().and_then(output_rect);
 
         let wl_surface = self.compositor_state.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(
@@ -769,6 +963,7 @@ impl OutputHandler for WallpaperState {
         layer.commit();
 
         let settings = self.settings.resolve(output_name.as_deref());
+        let props_seen = settings.lock().unwrap().property_edits.len();
 
         self.surfaces.push(WallpaperSurface {
             gpu: None,
@@ -778,11 +973,32 @@ impl OutputHandler for WallpaperState {
             height: 0,
             pool: None,
             renderer,
+            output,
+            rect,
             settings,
+            output_name,
+            last_draw: None,
+            draw_scheduled: false,
+            web_fps: web.fps,
+            props_seen,
         });
     }
 
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        let rect = self
+            .output_state
+            .info(&output)
+            .as_ref()
+            .and_then(output_rect);
+        for s in self.surfaces.iter_mut().filter(|s| s.output == output) {
+            s.rect = rect;
+        }
+    }
 
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
@@ -856,10 +1072,46 @@ impl SeatHandler for WallpaperState {
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 }
 
+/// The bounding box of `all` output rectangles, and `rect`'s normalized
+/// `[x, y, w, h]` within it.
+fn span_region(
+    (x, y, w, h): (i32, i32, i32, i32),
+    all: impl Iterator<Item = (i32, i32, i32, i32)> + Clone,
+) -> ((u32, u32), [f32; 4]) {
+    let x0 = all.clone().map(|r| r.0).min().unwrap_or(x).min(x);
+    let y0 = all.clone().map(|r| r.1).min().unwrap_or(y).min(y);
+    let x1 = all
+        .clone()
+        .map(|r| r.0 + r.2)
+        .max()
+        .unwrap_or(x + w)
+        .max(x + w);
+    let y1 = all.map(|r| r.1 + r.3).max().unwrap_or(y + h).max(y + h);
+    let (bw, bh) = ((x1 - x0).max(1), (y1 - y0).max(1));
+    (
+        (bw as u32, bh as u32),
+        [
+            (x - x0) as f32 / bw as f32,
+            (y - y0) as f32 / bh as f32,
+            w as f32 / bw as f32,
+            h as f32 / bh as f32,
+        ],
+    )
+}
+
+/// An output's logical rectangle `(x, y, w, h)` in the compositor's global
+/// space.
+fn output_rect(info: &smithay_client_toolkit::output::OutputInfo) -> Option<(i32, i32, i32, i32)> {
+    let (x, y) = info.logical_position?;
+    let (w, h) = info.logical_size?;
+    Some((x, y, w, h))
+}
+
 /// Linux evdev button codes (`linux/input-event-codes.h`) — what
 /// `PointerEventKind::Press`/`Release`'s raw `button` field actually carries.
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
 
 impl PointerHandler for WallpaperState {
     fn pointer_frame(
@@ -877,10 +1129,19 @@ impl PointerHandler for WallpaperState {
             // and left/right click only (its own `// TODO: ANY OTHER MOUSE
             // EVENTS TO SEND?` confirms that's the real engine's actual
             // scope, not an approximation here).
-            let (button, pressed) = match event.kind {
+            let mut wheel: Option<(f32, f32)> = None;
+            let (button, pressed) = match &event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => (None, false),
-                PointerEventKind::Press { button, .. } => (Some(button), true),
-                PointerEventKind::Release { button, .. } => (Some(button), false),
+                PointerEventKind::Press { button, .. } => (Some(*button), true),
+                PointerEventKind::Release { button, .. } => (Some(*button), false),
+                PointerEventKind::Axis {
+                    horizontal,
+                    vertical,
+                    ..
+                } => {
+                    wheel = Some((horizontal.absolute as f32, vertical.absolute as f32));
+                    (None, false)
+                }
                 _ => continue,
             };
             let Some(idx) = self
@@ -895,23 +1156,40 @@ impl PointerHandler for WallpaperState {
                 continue;
             }
 
-            let norm = pointer_norm(event.position, surface.width, surface.height);
+            // Into the shared canvas when this output shows part of a span.
+            let n = pointer_norm(event.position, surface.width, surface.height);
+            let (_, r) = self.view_of(idx);
+            let norm = [r[0] + n[0] * r[2], r[1] + n[1] * r[3]];
 
-            match &mut self.surfaces[idx].renderer {
+            match &mut self.surfaces[idx].renderer.borrow_mut().content {
                 // ponytail: only tracks while the cursor is over our own
                 // layer surface. The reference additionally queries
                 // Hyprland's IPC socket for a global cursor when another
                 // window has it; add that (or the equivalent per-compositor
                 // call) if parallax-under-windows matters.
-                ContentRenderer::Scene(scene) => scene.set_mouse(norm),
+                ContentRenderer::Scene(scene) => {
+                    scene.set_mouse(norm);
+                    // Background layer surfaces only see the pointer when
+                    // nothing covers the desktop, so every press here is
+                    // a press on the wallpaper.
+                    if button == Some(BTN_LEFT) {
+                        scene.set_mouse_button(pressed);
+                    }
+                }
                 ContentRenderer::Frames(fs) => {
                     let Some(tx) = fs.web_input() else { continue };
-                    let event = match button {
-                        None => crate::render::web::WebInputEvent::MouseMove {
+                    let event = match (button, wheel) {
+                        (None, Some((dx, dy))) => crate::render::web::WebInputEvent::Wheel {
+                            x_norm: norm[0],
+                            y_norm: norm[1],
+                            dx,
+                            dy,
+                        },
+                        (None, None) => crate::render::web::WebInputEvent::MouseMove {
                             x_norm: norm[0],
                             y_norm: norm[1],
                         },
-                        Some(code) => {
+                        (Some(code), _) => {
                             let Some(button) = web_mouse_button(code) else {
                                 continue;
                             };
@@ -937,6 +1215,7 @@ fn web_mouse_button(code: u32) -> Option<crate::render::web::WebMouseButton> {
     match code {
         BTN_LEFT => Some(crate::render::web::WebMouseButton::Left),
         BTN_RIGHT => Some(crate::render::web::WebMouseButton::Right),
+        BTN_MIDDLE => Some(crate::render::web::WebMouseButton::Middle),
         _ => None,
     }
 }
@@ -963,6 +1242,61 @@ impl ProvidesRegistryState for WallpaperState {
         &mut self.registry_state
     }
     registry_handlers!(OutputState, SeatState);
+}
+
+/// Names of the outputs the compositor reports, for picking a screen to
+/// assign.
+pub fn output_names() -> Vec<String> {
+    struct Outputs {
+        registry: RegistryState,
+        outputs: OutputState,
+    }
+    impl OutputHandler for Outputs {
+        fn output_state(&mut self) -> &mut OutputState {
+            &mut self.outputs
+        }
+        fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+        fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        }
+        fn output_destroyed(
+            &mut self,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+            _: wl_output::WlOutput,
+        ) {
+        }
+    }
+    impl ProvidesRegistryState for Outputs {
+        fn registry(&mut self) -> &mut RegistryState {
+            &mut self.registry
+        }
+        registry_handlers!(OutputState);
+    }
+    delegate_output!(Outputs);
+    delegate_registry!(Outputs);
+
+    let Ok(conn) = Connection::connect_to_env() else {
+        return Vec::new();
+    };
+    let Ok((globals, mut queue)) = registry_queue_init::<Outputs>(&conn) else {
+        return Vec::new();
+    };
+    let qh = queue.handle();
+    let mut state = Outputs {
+        registry: RegistryState::new(&globals),
+        outputs: OutputState::new(&globals, &qh),
+    };
+    // Two round trips: one to bind the outputs, one for their info events.
+    for _ in 0..2 {
+        if queue.roundtrip(&mut state).is_err() {
+            return Vec::new();
+        }
+    }
+    state
+        .outputs
+        .outputs()
+        .filter_map(|o| state.outputs.info(&o)?.name)
+        .collect()
 }
 
 delegate_compositor!(WallpaperState);
@@ -1051,17 +1385,28 @@ impl WallpaperState {
     /// active window" heuristic (not "some window somewhere is fullscreen,"
     /// which could be a minimized/background one the user can't even see).
     fn foreign_toplevel_pause_state(&self) -> (bool, bool) {
-        let fullscreen = self.foreign_toplevels.values().any(|t| t.activated && t.fullscreen);
-        let maximized = self.foreign_toplevels.values().any(|t| t.activated && t.maximized);
+        let fullscreen = self
+            .foreign_toplevels
+            .values()
+            .any(|t| t.activated && t.fullscreen);
+        let maximized = self
+            .foreign_toplevels
+            .values()
+            .any(|t| t.activated && t.maximized);
         (fullscreen, maximized)
     }
 
-    /// Re-checks all playback-pause conditions when `PAUSE_CHECK_INTERVAL`
-    /// has elapsed, then returns whether rendering should pause right now.
-    fn should_pause(&mut self, now: Instant) -> bool {
+    /// Re-checks the playback conditions when `PAUSE_CHECK_INTERVAL` has
+    /// elapsed and returns the action the policy calls for, releasing or
+    /// rebuilding the renderers on a stop edge.
+    fn playback_action(&mut self, now: Instant) -> PlaybackAction {
         if now.duration_since(self.last_pause_check) >= PAUSE_CHECK_INTERVAL {
             self.last_pause_check = now;
             let (fullscreen_app, maximized_app) = self.foreign_toplevel_pause_state();
+            while let Some(info) = self.media.as_ref().and_then(|m| m.try_recv()) {
+                self.media_playing =
+                    info.playback_state == crate::engine::media::PlaybackState::Playing;
+            }
             self.playback_state = crate::engine::playback_gate::PlaybackState {
                 on_battery: platform::power::is_on_battery(),
                 locked_or_sleeping: self
@@ -1071,34 +1416,164 @@ impl WallpaperState {
                     .unwrap_or(false),
                 fullscreen_app,
                 maximized_app,
+                focused_app: self.foreign_toplevels.values().any(|t| t.activated),
+                other_audio: self.media_playing,
             };
         }
-        crate::engine::playback_gate::should_pause(&self.pause_conditions, &self.playback_state)
+        let action = crate::engine::playback_gate::decide(&self.policy, &self.playback_state);
+        if action == PlaybackAction::Stop && !self.stopped {
+            self.stopped = true;
+            for s in &mut self.surfaces {
+                let mut r = s.renderer.borrow_mut();
+                let still = match &r.content {
+                    ContentRenderer::Frames(fs) => Arc::clone(fs.current_frame()),
+                    ContentRenderer::Scene(_) => Arc::new(image::RgbaImage::new(1, 1)),
+                };
+                r.content = ContentRenderer::Frames(FrameSource::Static(still));
+                r.readback = None;
+                drop(r);
+                s.gpu = None;
+            }
+            tracing::info!(target: "wallpaper", "playback stopped; renderers released");
+        } else if action != PlaybackAction::Stop && self.stopped {
+            self.stopped = false;
+            let one_renderer = self.content.layout != crate::render::ScreenLayout::PerScreen;
+            for i in 0..self.surfaces.len() {
+                self.surfaces[i].gpu_failed = false;
+                // Span and clone surfaces share surface 0's renderer.
+                if one_renderer && i > 0 {
+                    continue;
+                }
+                let resolved = self
+                    .content
+                    .resolve(self.surfaces[i].output_name.as_deref());
+                let web = crate::render::web::WebOptions {
+                    size: (
+                        self.surfaces[i].width.max(1),
+                        self.surfaces[i].height.max(1),
+                    ),
+                    fps: self.surfaces[i].settings.lock().unwrap().fps,
+                };
+                match build_content_renderer(
+                    resolved,
+                    self.device.clone(),
+                    self.queue.clone(),
+                    self.allow_gpu_surface,
+                    web,
+                ) {
+                    Ok(r) => self.surfaces[i].renderer.borrow_mut().content = r,
+                    Err(e) => tracing::error!(target: "wallpaper", "resuming output {i}: {e}"),
+                }
+            }
+            tracing::info!(target: "wallpaper", "playback resumed");
+        }
+        action
+    }
+
+    /// Apply live user-property edits to surface `idx`'s renderer: scenes in
+    /// place (or rebuilt), web pages through `applyUserProperties`. In span
+    /// and clone layouts surface 0 owns the shared renderer.
+    fn apply_property_edits(&mut self, idx: usize) {
+        let s = &mut self.surfaces[idx];
+        let total = s.settings.lock().unwrap().property_edits.len();
+        if total == s.props_seen {
+            return;
+        }
+        let resolved = self.content.resolve(s.output_name.as_deref());
+        let Some(dir) = resolved.project_dir().map(std::path::Path::to_path_buf) else {
+            s.props_seen = total;
+            return;
+        };
+        let edits = s
+            .settings
+            .lock()
+            .unwrap()
+            .property_edits_since(&mut s.props_seen, &dir);
+        if edits.is_empty()
+            || (idx > 0 && self.content.layout != crate::render::ScreenLayout::PerScreen)
+        {
+            return;
+        }
+        let rebuild = match &mut s.renderer.borrow_mut().content {
+            ContentRenderer::Scene(scene) => !scene.set_user_properties(&edits),
+            ContentRenderer::Frames(fs) => {
+                if let Some(tx) = fs.web_input() {
+                    let json = crate::render::web::user_properties_subset(&dir, &edits);
+                    let _ = tx.try_send(crate::render::web::WebInputEvent::Properties(json));
+                }
+                false
+            }
+        };
+        if rebuild {
+            let web = crate::render::web::WebOptions {
+                size: (s.width.max(1), s.height.max(1)),
+                fps: s.settings.lock().unwrap().fps,
+            };
+            match build_content_renderer(
+                resolved,
+                self.device.clone(),
+                self.queue.clone(),
+                self.allow_gpu_surface,
+                web,
+            ) {
+                Ok(r) => s.renderer.borrow_mut().content = r,
+                Err(e) => tracing::error!(target: "wallpaper", "reloading output {idx}: {e}"),
+            }
+        }
+    }
+
+    /// Send `event` to every output showing a web wallpaper.
+    fn notify_web(&self, event: crate::render::web::WebInputEvent) {
+        for s in &self.surfaces {
+            if let ContentRenderer::Frames(fs) = &s.renderer.borrow().content {
+                if let Some(tx) = fs.web_input() {
+                    let _ = tx.try_send(event.clone());
+                }
+            }
+        }
     }
 
     /// Runs on its own `PAUSE_CHECK_INTERVAL` timer (inserted once at
     /// startup, independent of any surface's frame callbacks) — the only
-    /// thing that can notice a pause has cleared once `draw_at` has
-    /// stopped requesting new callbacks (see its own doc comment), since
-    /// nothing else would call back into this state to check again.
+    /// thing that can notice a halt has cleared once `draw_at` has stopped
+    /// requesting new callbacks.
     fn tick_pause_watchdog(&mut self) {
         let was_paused = self.paused;
-        let now_paused = self.should_pause(Instant::now());
-        if was_paused && !now_paused {
+        let action = self.playback_action(Instant::now());
+        crate::engine::audio::set_muted(action >= PlaybackAction::Mute);
+        if !was_paused && action.halts() {
+            self.notify_web(crate::render::web::WebInputEvent::Paused(true));
+        }
+        if was_paused && !action.halts() {
+            self.notify_web(crate::render::web::WebInputEvent::Paused(false));
+            self.paused = false;
             for idx in 0..self.surfaces.len() {
-                if self.surfaces[idx].renderer.is_animated() {
+                if self.surfaces[idx].renderer.borrow().content.is_animated() {
                     self.draw_at(idx);
                 }
             }
         } else {
-            self.paused = now_paused;
+            self.paused = action.halts();
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{pointer_norm, web_mouse_button, BTN_LEFT, BTN_RIGHT};
+    use super::{pointer_norm, span_region, web_mouse_button, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
+
+    #[test]
+    fn span_regions_split_the_bounding_box() {
+        // 1080p beside a 1440p monitor that sits 360 px higher.
+        let left = (0, 360, 1920, 1080);
+        let right = (1920, 0, 2560, 1440);
+        let all = [left, right];
+        let (canvas, r) = span_region(left, all.iter().copied());
+        assert_eq!(canvas, (4480, 1440));
+        assert_eq!(r, [0.0, 0.25, 1920.0 / 4480.0, 0.75]);
+        let (_, r) = span_region(right, all.iter().copied());
+        assert_eq!(r, [1920.0 / 4480.0, 0.0, 2560.0 / 4480.0, 1.0]);
+    }
 
     #[test]
     fn pointer_norm_is_top_origin_and_clamped() {
@@ -1121,12 +1596,11 @@ mod tests {
     /// Middle click and anything else (side buttons) must map to `None`
     /// rather than a guessed-at mapping.
     #[test]
-    fn web_mouse_button_maps_left_and_right_only() {
+    fn web_mouse_button_maps_left_middle_and_right() {
         use crate::render::web::WebMouseButton;
         assert_eq!(web_mouse_button(BTN_LEFT), Some(WebMouseButton::Left));
         assert_eq!(web_mouse_button(BTN_RIGHT), Some(WebMouseButton::Right));
-        const BTN_MIDDLE: u32 = 0x112;
-        assert_eq!(web_mouse_button(BTN_MIDDLE), None);
+        assert_eq!(web_mouse_button(BTN_MIDDLE), Some(WebMouseButton::Middle));
         assert_eq!(web_mouse_button(0), None);
     }
 }

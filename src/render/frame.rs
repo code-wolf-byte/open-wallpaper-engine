@@ -24,6 +24,8 @@ pub enum FrameSource {
         /// `None` for real video and CPU-scene-fallback, which share this
         /// same variant but have no page to receive input.
         web_input: Option<SyncSender<super::web::WebInputEvent>>,
+        /// A video's soundtrack, playing while this source lives.
+        audio: Option<crate::engine::audio::StreamingAudio>,
     },
 }
 
@@ -33,6 +35,15 @@ impl FrameSource {
     /// For video this blocks until the first frame is decoded so the wallpaper
     /// surface is never shown blank.
     pub fn from_content(content: WallpaperContent) -> Result<Self> {
+        Self::from_content_with(content, super::web::WebOptions::default())
+    }
+
+    /// [`Self::from_content`] with a web wallpaper's page size and frame
+    /// rate (the output it will show on).
+    pub fn from_content_with(
+        content: WallpaperContent,
+        web: super::web::WebOptions,
+    ) -> Result<Self> {
         match content {
             WallpaperContent::Static(img) => Ok(FrameSource::Static(img)),
             WallpaperContent::Scene { dir } => {
@@ -73,22 +84,29 @@ impl FrameSource {
                     .recv()
                     .map_err(|_| anyhow!("scene renderer exited before producing any frames"))?;
 
-                Ok(FrameSource::Video { current: first, rx, web_input: None })
+                Ok(FrameSource::Video {
+                    current: first,
+                    rx,
+                    web_input: None,
+                    audio: None,
+                })
             }
             // Web wallpapers reuse the `Video` variant rather than adding one:
             // it already means "a stream of frames plus the latest", which is
             // exactly what CEF's off-screen painting produces. Scene fallback
             // rendering shares it for the same reason.
             WallpaperContent::Web { html } => {
-                let (first, rx, input_tx) = super::web::start_web_stream(&html)?;
+                let (first, rx, input_tx) = super::web::start_web_stream(&html, web)?;
                 Ok(FrameSource::Video {
                     current: Arc::new(first),
                     rx,
                     web_input: Some(input_tx),
+                    audio: None,
                 })
             }
             WallpaperContent::Video { path } => {
                 let (tx, rx) = sync_channel::<Arc<RgbaImage>>(2);
+                let audio = crate::engine::audio::StreamingAudio::start(&path);
 
                 thread::spawn(move || {
                     if let Err(e) = super::ffmpeg::video_decode_loop(&path, &tx) {
@@ -102,7 +120,12 @@ impl FrameSource {
                     .recv()
                     .map_err(|_| anyhow!("video decoder exited before producing any frames"))?;
 
-                Ok(FrameSource::Video { current: first, rx, web_input: None })
+                Ok(FrameSource::Video {
+                    current: first,
+                    rx,
+                    web_input: None,
+                    audio,
+                })
             }
         }
     }

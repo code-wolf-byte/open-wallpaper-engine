@@ -126,10 +126,6 @@ pub struct ResolvedChildParticle {
 /// the ratio of the new bitmap size to the old, so no projection is re-derived.
 #[derive(Clone)]
 pub struct TextDynamic {
-    pub script: String,
-    /// The scene's authored `text.scriptproperties` object (per-instance
-    /// editor values, merged over the script's builder defaults).
-    pub script_properties: Option<serde_json::Value>,
     pub font_data: Vec<u8>,
     pub point_size: f32,
     /// Text currently rasterized into the layer image (the `value` WE feeds
@@ -137,7 +133,19 @@ pub struct TextDynamic {
     pub last_text: String,
 }
 
+/// What a backdrop layer captures each frame (see `backdrop_layer_from_object`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backdrop {
+    /// The scene beneath the layer's own quad (composition layer).
+    Region,
+    /// The whole scene (fullscreen / projection layer).
+    FullScene,
+}
+
 pub struct Layer {
+    /// `Some` for composition/fullscreen layers, whose texture is the scene
+    /// beneath them rather than an image.
+    pub backdrop: Option<Backdrop>,
     pub name: String,
     pub image: RgbaImage,
     /// Additional animation frames (frame 0 is `image`). Empty = not animated.
@@ -161,9 +169,6 @@ pub struct Layer {
     pub angles: [f32; 3],
     pub blend_mode: u32,
     pub alpha: f32,
-    /// Inline SceneScript source driving `alpha` per frame, if the property
-    /// was authored as `{"value": …, "script": "…"}`. `None` = static alpha.
-    pub alpha_script: Option<String>,
     pub color: [f32; 3],
     pub brightness: f32,
     /// True for WE "copybackground" layers — source is the rendered canvas so far.
@@ -188,26 +193,12 @@ pub struct Layer {
     /// rendered output as `_rt_imageLayerComposite_<id>_a`, so the live path
     /// needs to know which layer each id belongs to.
     pub object_id: Option<i64>,
-    /// Inline SceneScripts driving `visible`/`scale`/`origin`/`angles`, if any.
-    /// Evaluated per frame by the live GPU path (see `GpuSceneInstance::render`).
-    pub transform_scripts: TransformScripts,
     /// The object's AUTHORED `visible` value — the starting visibility and the
     /// `value` fed to a `visible` script. Critical: scripts that only define
     /// cursor handlers (invisible click hitboxes, `"value": false`) have no
     /// `update()`, so the script returns `value` unchanged — feeding `true`
     /// here would render those hitboxes as opaque boxes.
     pub visible_base: bool,
-}
-
-/// The per-frame SceneScripts a layer's transform can carry. Each `update`
-/// receives the property's base value (a `Vec3` for scale/origin/angles, a
-/// bool for visible) and returns the value for this frame.
-#[derive(Clone, Default)]
-pub struct TransformScripts {
-    pub visible: Option<String>,
-    pub scale: Option<String>,
-    pub origin: Option<String>,
-    pub angles: Option<String>,
 }
 
 /// A loaded texture plus any additional animation frames (e.g. from a `.tex`
@@ -386,7 +377,12 @@ impl ResolvedScene {
                     LoadedImage::single(white_pixel())
                 }
                 Some(path) => {
-                    if is_special_layer(path) {
+                    if let Some(mut layer) = backdrop_layer_from_object(obj, path) {
+                        if layer.size[0] == 0.0 || layer.size[1] == 0.0 {
+                            solid_indices.push(layers.len());
+                        }
+                        layer.order_index = obj_index;
+                        layers.push(layer);
                         continue;
                     }
                     match load_texture_from_dir(dir, path) {
@@ -486,7 +482,12 @@ impl ResolvedScene {
                     LoadedImage::single(white_pixel())
                 }
                 Some(path) => {
-                    if is_special_layer(path) {
+                    if let Some(mut layer) = backdrop_layer_from_object(obj, path) {
+                        if layer.size[0] == 0.0 || layer.size[1] == 0.0 {
+                            solid_indices.push(layers.len());
+                        }
+                        layer.order_index = obj_index;
+                        layers.push(layer);
                         continue;
                     }
                     match load_texture_from_pkg(pkg, path).or_else(|pkg_err| {
@@ -590,7 +591,12 @@ impl ResolvedScene {
                     LoadedImage::single(white_pixel())
                 }
                 Some(path) => {
-                    if is_special_layer(path) {
+                    if let Some(mut layer) = backdrop_layer_from_object(obj, path) {
+                        if layer.size[0] == 0.0 || layer.size[1] == 0.0 {
+                            solid_indices.push(layers.len());
+                        }
+                        layer.order_index = obj_index;
+                        layers.push(layer);
                         continue;
                     }
                     match load_texture_from_pkg(pkg, path) {
@@ -860,10 +866,79 @@ fn select_spritesheet_frame(obj: &SceneObject, loaded: &mut LoadedImage) {
         .as_ref()
         .and_then(|v| v.get("script"))
         .and_then(|s| s.as_str())
-        .and_then(|script| crate::engine::script::ScriptContext::new().eval_frame(script))
+        .and_then(|script| {
+            let init = crate::engine::script::ObjectInit {
+                visible: true,
+                alpha: 1.0,
+                frame_count: loaded.sprite_frames.len() as u32,
+                ..Default::default()
+            };
+            crate::engine::script::evaluate_once("visible", script, &init, None).frame
+        })
         .unwrap_or(0)
         .min(loaded.sprite_frames.len() as u32 - 1);
     loaded.image = loaded.sprite_frames[frame as usize].clone();
+}
+
+/// Build the layer for one object outside the scene load — SceneScript's
+/// `thisScene.createLayer`. Covers image, solid and text objects; particle
+/// and model objects return `None`. `pkg` is the scene's package, if any.
+pub fn runtime_layer(dir: &Path, pkg: Option<&Package>, obj: &SceneObject) -> Option<Layer> {
+    if obj.text.is_some() {
+        return text_layer_from_object(obj, Some(dir), pkg);
+    }
+    let path = obj.image.as_deref()?;
+    if is_special_layer(path) {
+        return backdrop_layer_from_object(obj, path);
+    }
+    let resolved_path = resolve_workshop_asset(dir, pkg, path);
+    let path = resolved_path.as_str();
+    let loaded = if is_solid_layer_path(path) {
+        LoadedImage::single(white_pixel())
+    } else {
+        let from_pkg = pkg.map(|p| load_texture_from_pkg(p, path));
+        match from_pkg {
+            Some(Ok(l)) => l,
+            _ => load_texture_from_dir(dir, path)
+                .inspect_err(
+                    |e| tracing::warn!(target: "scene", "createLayer: texture '{path}': {e:#}"),
+                )
+                .ok()?,
+        }
+    };
+    Some(layer_from_object(obj, loaded, None))
+}
+
+/// Scripts copied from a Workshop asset pack name assets relative to that
+/// pack (`models/bar.json`), which ships at `models/workshop/<id>/bar.json`.
+/// Returns `path` itself when it exists or no such copy is found.
+fn resolve_workshop_asset(dir: &Path, pkg: Option<&Package>, path: &str) -> String {
+    let exists = |p: &str| pkg.is_some_and(|k| k.contains(p)) || dir.join(p).is_file();
+    if exists(path) {
+        return path.to_string();
+    }
+    let Some((first, rest)) = path.split_once('/') else {
+        return path.to_string();
+    };
+    let prefix = format!("{first}/workshop/");
+    let suffix = format!("/{rest}");
+    let matches = |p: &str| {
+        p.strip_prefix(&prefix)
+            .and_then(|r| r.strip_suffix(&suffix))
+            .is_some_and(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+    };
+    if let Some(found) = pkg.and_then(|k| k.paths().find(|p| matches(p)).map(str::to_string)) {
+        return found;
+    }
+    if let Ok(entries) = std::fs::read_dir(dir.join(first).join("workshop")) {
+        for e in entries.flatten() {
+            let candidate = format!("{prefix}{}{suffix}", e.file_name().to_string_lossy());
+            if matches(&candidate) && dir.join(&candidate).is_file() {
+                return candidate;
+            }
+        }
+    }
+    path.to_string()
 }
 
 fn layer_from_object(
@@ -889,7 +964,13 @@ fn layer_from_object(
                 let layers: Vec<crate::engine::puppet::AnimLayer> = entries
                     .iter()
                     .enumerate()
-                    .filter(|(_, e)| e.get("visible").and_then(|v| v.as_bool()).unwrap_or(true))
+                    // `visible` is often a user-property binding
+                    // (`{"user": "head", "value": false}`), not a bare bool.
+                    .filter(|(_, e)| {
+                        e.get("visible")
+                            .and_then(crate::engine::scene::parse_value_bool)
+                            .unwrap_or(true)
+                    })
                     .map(|(i, e)| {
                         // `animation` is the MDLA record's own id (2321732083's
                         // samurai layers name 60/63/80/105). Match it; fall back
@@ -951,21 +1032,6 @@ fn layer_from_object(
         .and_then(|v| v.as_vec3())
         .map(|s| [s[0] as f64, s[1] as f64, s[2] as f64])
         .unwrap_or([1.0, 1.0, 1.0]);
-    let origin_animated = obj
-        .origin
-        .as_ref()
-        .map(crate::engine::model::json_to_animated);
-
-    // Per-frame transform scripts (evaluated by the live GPU path). origin/
-    // scale/angles carry their script on the animated value; visible carries
-    // it on the raw `visible` object.
-    let transform_scripts = TransformScripts {
-        visible: obj.visible_script(),
-        scale: scale_animated.as_ref().and_then(|v| v.script.clone()),
-        origin: origin_animated.as_ref().and_then(|v| v.script.clone()),
-        angles: angles_animated.as_ref().and_then(|v| v.script.clone()),
-    };
-
     let alpha_animated = obj
         .alpha
         .as_ref()
@@ -974,9 +1040,6 @@ fn layer_from_object(
         .as_ref()
         .and_then(|v| v.as_float())
         .unwrap_or(1.0);
-    // Inline SceneScript source driving `alpha`, if any — evaluated per frame
-    // by the render loop's ScriptContext (see GpuSceneInstance::render).
-    let alpha_script = alpha_animated.as_ref().and_then(|v| v.script.clone());
     let color = obj
         .color
         .as_ref()
@@ -1028,6 +1091,7 @@ fn layer_from_object(
     };
 
     Layer {
+        backdrop: None,
         name: obj.name.clone().unwrap_or_default(),
         image: loaded.image,
         extra_frames: loaded.extra_frames,
@@ -1048,7 +1112,6 @@ fn layer_from_object(
         angles: angles3,
         blend_mode: obj.color_blend_mode,
         alpha,
-        alpha_script,
         color,
         brightness,
         copybackground: obj.copybackground,
@@ -1068,7 +1131,6 @@ fn layer_from_object(
         text_dynamic: None,
         order_index: 0,
         object_id: obj.id,
-        transform_scripts,
         visible_base: obj.is_visible(),
     }
 }
@@ -1302,8 +1364,16 @@ fn text_layer_from_object(
         (Some(script), _) => {
             // One-shot load-time evaluation so the layer rasterizes real
             // content (and sizes itself correctly) from frame 0.
-            let mut ctx = crate::engine::script::ScriptContext::new();
-            ctx.eval_update_string(script, &static_str, script_properties.as_ref())
+            let init = crate::engine::script::ObjectInit {
+                name: obj.name.clone(),
+                id: obj.id,
+                visible: true,
+                alpha: 1.0,
+                text: Some(static_str.clone()),
+                ..Default::default()
+            };
+            crate::engine::script::evaluate_once("text", script, &init, script_properties.as_ref())
+                .text
                 .filter(|t| !t.is_empty())
                 .unwrap_or(static_str)
         }
@@ -1467,15 +1537,13 @@ fn text_layer_from_object(
         // Text + bg colors are baked into the bitmap; don't tint it again.
         layer.color = [1.0, 1.0, 1.0];
     }
-    if let Some(script) = script {
-        layer.text_dynamic = Some(TextDynamic {
-            script,
-            script_properties,
-            font_data,
-            point_size: raster_px,
-            last_text: text_str,
-        });
-    }
+    // Any text layer can be re-rasterized: its own script, or another
+    // object's script, may set its text.
+    layer.text_dynamic = Some(TextDynamic {
+        font_data,
+        point_size: raster_px,
+        last_text: text_str,
+    });
     Some(layer)
 }
 
@@ -2197,7 +2265,7 @@ fn rotate_euler_f64(v: [f64; 3], a: [f64; 3]) -> [f64; 3] {
 /// This object's own local transform, read from the raw scene fields (the same
 /// sources `layer_from_object` uses, minus alignment which is a per-layer draw
 /// concern).
-fn obj_local_xform(obj: &SceneObject) -> Xform {
+pub fn obj_local_xform(obj: &SceneObject) -> Xform {
     let t = obj.parsed_origin();
     let r = obj
         .angles
@@ -2284,26 +2352,13 @@ pub struct TransformGraph {
     pub parent: Vec<Option<usize>>,
     /// Authored local transform per object — the base a script updates from.
     pub local: Vec<Xform>,
-    /// `(origin, angles, scale)` SceneScript sources per object.
-    pub scripts: Vec<[Option<String>; 3]>,
-    /// Object name/id, indexed the same as every other field here — feeds
-    /// `ScriptContext::set_current_object`/`set_layers` so an
-    /// object-attachment script (`thisLayer`, `thisScene.getLayer(...)`) can
-    /// identify itself and look up other objects. See the Ghidra report's
-    /// object-attachment follow-up.
+    /// Object name/id, indexed the same as every other field here — lets the
+    /// live path find an object's sounds and layers by identity.
     pub name: Vec<Option<String>>,
     pub id: Vec<Option<i64>>,
 }
 
 impl TransformGraph {
-    /// True when at least one object's transform is script-driven AND at least
-    /// one object is parented — the only case the per-frame pass is needed for.
-    /// 189 of 197 real scenes answer `false` and skip the whole thing.
-    pub fn needs_per_frame(&self) -> bool {
-        self.parent.iter().any(Option::is_some)
-            && self.scripts.iter().any(|s| s.iter().any(Option::is_some))
-    }
-
     /// World transform per object, composing `locals` up each parent chain.
     /// `disabled[i]` (this frame's live `thisLayer.disablepropagation()`
     /// call — see the object-attachment API) makes object `i` stop
@@ -2358,26 +2413,12 @@ fn build_transform_graph(scene: &Scene) -> TransformGraph {
         .enumerate()
         .filter_map(|(i, o)| o.name.as_deref().map(|n| (n, i)))
         .collect();
-    let script_of = |v: Option<&serde_json::Value>| {
-        v.map(crate::engine::model::json_to_animated)
-            .and_then(|a| a.script)
-    };
     TransformGraph {
         parent: objects
             .iter()
             .map(|o| parent_index(o, &id_to_idx, &name_to_idx))
             .collect(),
         local: objects.iter().map(obj_local_xform).collect(),
-        scripts: objects
-            .iter()
-            .map(|o| {
-                [
-                    script_of(o.origin.as_ref()),
-                    script_of(o.angles.as_ref()),
-                    script_of(o.scale.as_ref()),
-                ]
-            })
-            .collect(),
         name: objects.iter().map(|o| o.name.clone()).collect(),
         id: objects.iter().map(|o| o.id).collect(),
     }
@@ -2565,6 +2606,35 @@ fn white_pixel() -> RgbaImage {
 /// no effects is a script/cursor holder ("Player Options" in 2988724897);
 /// stretching its opaque white over the scene hides the whole wallpaper, so
 /// callers only register those that carry effects.
+/// Composition (`composelayer`), fullscreen (`fullscreenlayer`) and
+/// projection (`projectlayer`) layers have no image of their own: their
+/// texture is the scene already drawn beneath them — the region under the
+/// layer for a composition layer, the whole scene otherwise — which their
+/// effects then process (audio bars, fisheye, colour grading, blur…).
+/// Built with a placeholder image; the live renderer captures the backdrop
+/// each frame. Fullscreen and projection layers (and composition layers
+/// without a size) are sized to the scene by `fill_solid_layer_sizes`.
+fn backdrop_layer_from_object(obj: &SceneObject, path: &str) -> Option<Layer> {
+    let p = path.to_lowercase();
+    let kind = if p.contains("composelayer") {
+        Backdrop::Region
+    } else if p.contains("fullscreenlayer") || p.contains("projectlayer") {
+        Backdrop::FullScene
+    } else {
+        return None;
+    };
+    let mut layer = layer_from_object(
+        obj,
+        LoadedImage::single(RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]))),
+        None,
+    );
+    if kind == Backdrop::FullScene {
+        layer.size = [0.0, 0.0, 0.0];
+    }
+    layer.backdrop = Some(kind);
+    Some(layer)
+}
+
 fn fill_solid_layer_sizes(layers: &mut [Layer], solid_indices: &[usize], width: u32, height: u32) {
     for &i in solid_indices {
         if layers[i].size[0] == 0.0 && layers[i].size[1] == 0.0 {
@@ -2576,6 +2646,29 @@ fn fill_solid_layer_sizes(layers: &mut [Layer], solid_indices: &[usize], width: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_and_fullscreen_objects_become_backdrop_layers() {
+        let objs: Vec<SceneObject> = serde_json::from_str(
+            r#"[{"image": "models/util/composelayer.json", "size": "200 100"},
+                {"image": "models/util/fullscreenlayer.json", "size": "200 100"},
+                {"image": "models/util/projectlayer.json"},
+                {"image": "models/other.json"}]"#,
+        )
+        .unwrap();
+        let a = backdrop_layer_from_object(&objs[0], objs[0].image.as_deref().unwrap()).unwrap();
+        assert_eq!(a.backdrop, Some(Backdrop::Region));
+        assert_eq!([a.size[0], a.size[1]], [200.0, 100.0]);
+        let b = backdrop_layer_from_object(&objs[1], objs[1].image.as_deref().unwrap()).unwrap();
+        assert_eq!(b.backdrop, Some(Backdrop::FullScene));
+        assert_eq!(
+            [b.size[0], b.size[1]],
+            [0.0, 0.0],
+            "sized to the scene later"
+        );
+        assert!(backdrop_layer_from_object(&objs[2], "models/util/projectlayer.json").is_some());
+        assert!(backdrop_layer_from_object(&objs[3], "models/other.json").is_none());
+    }
 
     /// Untextured mesh materials are common in real content
     /// (`"textures": [null,null,null]`), and their flat `color` is the only
@@ -2621,18 +2714,33 @@ mod tests {
         let graph = TransformGraph {
             parent: vec![None, Some(0), Some(1)],
             local: vec![Xform::IDENTITY; 3],
-            scripts: vec![[None, None, None], [None, None, None], [None, None, None]],
             name: vec![None, None, None],
             id: vec![None, None, None],
         };
         let locals = vec![
-            Xform { t: [10.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3] },
-            Xform { t: [1.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3] },
-            Xform { t: [1.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3] },
+            Xform {
+                t: [10.0, 0.0, 0.0],
+                r: [0.0; 3],
+                s: [1.0; 3],
+            },
+            Xform {
+                t: [1.0, 0.0, 0.0],
+                r: [0.0; 3],
+                s: [1.0; 3],
+            },
+            Xform {
+                t: [1.0, 0.0, 0.0],
+                r: [0.0; 3],
+                s: [1.0; 3],
+            },
         ];
 
         let worlds = graph.world(&locals, &[false, false, false]);
-        assert_eq!(worlds[2].t, [12.0, 0.0, 0.0], "baseline: full chain composes");
+        assert_eq!(
+            worlds[2].t,
+            [12.0, 0.0, 0.0],
+            "baseline: full chain composes"
+        );
 
         // Sever object 1's own inheritance from object 0.
         let worlds = graph.world(&locals, &[false, true, false]);
@@ -2734,6 +2842,7 @@ mod tests {
         let red_image = RgbaImage::from_pixel(100, 100, image::Rgba([255, 0, 0, 255]));
 
         let layers = vec![Layer {
+            backdrop: None,
             local_origin: [0.0; 3],
             local_scale: [1.0; 3],
             local_angles: [0.0; 3],
@@ -2749,7 +2858,6 @@ mod tests {
             angles: [0.0, 0.0, 0.0],
             blend_mode: 0,
             alpha: 1.0,
-            alpha_script: None,
             color: [1.0, 1.0, 1.0],
             brightness: 1.0,
             copybackground: false,
@@ -2760,7 +2868,6 @@ mod tests {
             text_dynamic: None,
             order_index: 1,
             object_id: None,
-            transform_scripts: TransformScripts::default(),
             visible_base: true,
         }];
 

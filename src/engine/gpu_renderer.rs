@@ -630,39 +630,40 @@ impl GpuSceneRenderer {
             bind_group_layouts: &[&shadow_pass_bgl],
             push_constant_ranges: &[],
         });
-        let mesh3d_shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mesh3d_shadow"),
-            layout: Some(&shadow_pass_layout),
-            vertex: wgpu::VertexState {
-                module: &shader_module,
-                entry_point: Some("vs_shadow_depth"),
-                // Same buffer the main mesh3d pipeline uses (stride 32,
-                // pos+uv+normal) — only position is declared/read here, but
-                // the stride must still match the real per-vertex layout.
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 32,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
-                }],
-                compilation_options: Default::default(),
-            },
-            fragment: None,
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: MESH3D_DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview: None,
-            cache: None,
-        });
+        let mesh3d_shadow_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("mesh3d_shadow"),
+                layout: Some(&shadow_pass_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader_module,
+                    entry_point: Some("vs_shadow_depth"),
+                    // Same buffer the main mesh3d pipeline uses (stride 32,
+                    // pos+uv+normal) — only position is declared/read here, but
+                    // the stride must still match the real per-vertex layout.
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: 32,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                    }],
+                    compilation_options: Default::default(),
+                },
+                fragment: None,
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: MESH3D_DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            });
         let shadow_comparison_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shadow_comparison_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -1533,6 +1534,9 @@ struct PassOverride {
 /// layers gets separate pipelines because combos/constants can differ).
 struct EffectInstanceDef {
     layer_idx: usize,
+    /// Position in the object's own `effects` list (scripts address effects
+    /// by it: `thisLayer.getEffect(1)`).
+    effect_index: usize,
     name: String,
     /// Verbatim scene.json effect `file` path (e.g. `"effects/clouds/effect.json"`
     /// or a workshop-nested `"effects/workshop/2138904733/foo/effect.json"`) —
@@ -1645,14 +1649,8 @@ struct SceneLayerGpu {
     /// draining to the latest frame drops rather than lags).
     video: Option<std::sync::Arc<std::sync::Mutex<crate::engine::render::VideoLayerStream>>>,
     blend_mode: u32,
-    /// Live alpha for the current frame. When `alpha_script` is present this is
-    /// recomputed each frame from `alpha_base`; otherwise it stays constant.
+    /// Live alpha; SceneScript may change it per frame.
     alpha: f32,
-    /// Authored alpha, passed as the `value` argument to `alpha_script` each
-    /// frame (WE feeds the property's base value, not the previous output).
-    alpha_base: f32,
-    /// Inline SceneScript source driving `alpha`, or `None` for static alpha.
-    alpha_script: Option<String>,
     /// Script-driven text: re-evaluated each tick; when the output string
     /// changes, `frames[0]` is re-rasterized and `rect` re-derived (clocks
     /// tick, dates roll over — 42 of the corpus's 58 script wallpapers).
@@ -1678,31 +1676,27 @@ struct SceneLayerGpu {
     /// approximation, a narrow and rare combination not worth a second
     /// pipeline variant per blend mode.
     quad_corners: Option<[[f32; 2]; 4]>,
-    /// Live visibility for this frame. Starts `true`; only a `visible` script
-    /// can flip it off. `render()` skips the layer entirely when `false`.
+    /// The object's own visibility (authored, then as scripts set it). The
+    /// layer draws only when it and every ancestor are visible — see
+    /// `GpuSceneInstance::object_visible`.
     visible: bool,
-    /// The authored `visible` value — fed to the `visible` script as `value`
-    /// (a script with no `update()`, e.g. a cursor-handler-only hitbox, returns
-    /// it unchanged, so this must not be hardcoded `true`).
-    visible_base: bool,
-    /// Per-frame transform scripts (visible/scale/origin/angles). When
-    /// scale/origin are present, `rect` is recomputed each frame from the
-    /// base values below; angles rebuilds `angle`. Only honored in the 2D
-    /// (orthographic) path — perspective layers keep their projected rect.
-    transform_scripts: crate::engine::render::TransformScripts,
-    /// Base values fed to the transform scripts as `value` and used to rebuild
-    /// `rect`: object size in px (pre-scale), authored origin (scene coords,
-    /// alignment folded in), scale multiplier, and full angles (radians).
+    /// Object size in px before scale — rebuilds `rect` when a script
+    /// changes scale.
     effective_size: [f64; 2],
-    origin_base: [f64; 3],
-    scale_base: [f32; 3],
-    angles_base: [f32; 3],
-    /// Pre-parent transform, for the per-frame parent recompose (see
-    /// `update_parent_transforms`). Distinct from `*_base`, which are the
-    /// post-parent values a per-object script updates from.
-    local_origin: [f64; 3],
-    local_scale: [f64; 3],
-    local_angles: [f32; 3],
+    /// Text a script set but not yet rasterized (throttled — see
+    /// `flush_text`), and when the last raster happened and how long it took.
+    pending_text: Option<String>,
+    text_rastered_at: Option<Instant>,
+    text_raster_cost: Duration,
+    /// Composition/fullscreen layer: `frames[0]` is refilled each frame
+    /// with the scene drawn beneath it (see `capture_backdrop`).
+    backdrop: Option<crate::engine::render::Backdrop>,
+    /// Spritesheet frame a script picked (`getTextureAnimation().setFrame`),
+    /// overriding the timed animation.
+    script_frame: Option<usize>,
+    /// `alignment`'s shift of the quad centre from the authored origin, kept
+    /// so a scripted origin moves the quad the same way.
+    align_offset: [f64; 3],
     no_interpolation: bool,
     clamp_uvs: bool,
     /// Unscaled object size in pixels — matches the reference's `CImage::m_size`
@@ -1744,6 +1738,49 @@ struct ParticleGpuTex {
 struct ParticleGpuAssets {
     parent: ParticleGpuTex,
     children: Vec<ParticleGpuTex>,
+}
+
+/// A scene `sound` object's playback stream, kept with its owner's identity
+/// so SceneScript can find it by layer name or id.
+pub(crate) struct SceneSound {
+    /// Index of the owning object in `scene.objects` (or a script-created one).
+    pub object: usize,
+    pub playback: crate::engine::audio::SoundPlayback,
+}
+
+/// Start a `sound` object's first decodable file, held silent when
+/// `startsilent` is set.
+fn start_scene_sound(
+    dir: &Path,
+    obj: &crate::engine::scene::SceneObject,
+) -> Option<crate::engine::audio::SoundPlayback> {
+    let sound = obj.sound.as_ref()?;
+    let start_silent = obj
+        .startsilent
+        .as_ref()
+        .and_then(|v| {
+            v.as_bool()
+                .or_else(|| v.get("value").and_then(|i| i.as_bool()))
+        })
+        .unwrap_or(false);
+    let volume = obj
+        .volume
+        .as_ref()
+        .and_then(crate::engine::scene::parse_value_f32)
+        .unwrap_or(1.0);
+    let mode = obj.playbackmode.as_ref().and_then(|v| v.as_str());
+    let looping = mode != Some("nointerrupt") && mode != Some("once");
+    let files: Vec<String> = match sound {
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        serde_json::Value::String(s) => vec![s.clone()],
+        _ => Vec::new(),
+    };
+    files.into_iter().find_map(|f| {
+        crate::engine::audio::SoundPlayback::start(&dir.join(&f), volume, looping, !start_silent)
+    })
 }
 
 pub struct GpuSceneInstance {
@@ -1798,17 +1835,52 @@ pub struct GpuSceneInstance {
     start: Instant,
     last_time: f32,
     mouse_norm: [f32; 2],
-    /// Persistent JS runtime for SceneScript-driven properties, ticked once per
-    /// frame. Lives here (on the render thread) because boa's `Context` is
-    /// `!Send`; created and used entirely within this instance.
-    script_ctx: crate::engine::script::ScriptContext,
+    /// The scene's SceneScript runtime, ticked once per frame. Lives here (on
+    /// the render thread) because boa's `Context` is `!Send`.
+    scripts: crate::engine::script::ScriptHost,
+    /// What live user-property edits diff against.
+    live_props: LiveProps,
+    /// Per-object visibility as scripts leave it, indexed like `scene.objects`
+    /// (authored visibility at load). A layer draws only when its object and
+    /// every ancestor are visible.
+    object_visible: Vec<bool>,
+    /// Live `disablepropagation()` state per object.
+    propagation_disabled: Vec<bool>,
+    /// Whether a script registered audio buffers (feeds them each frame).
+    scripts_want_audio: bool,
+    /// Last cursor position in scene pixels, and button state — for
+    /// `input.*` and cursor events.
+    cursor_scene: [f32; 2],
+    cursor_left_down: bool,
+    /// Left-button transitions since the last frame, in order, so a click
+    /// that starts and ends between two frames still registers.
+    pending_buttons: Vec<bool>,
+    /// Objects with cursor handlers (`cursorClick` & co), hit-tested each
+    /// frame; empty for the vast majority of scenes.
+    cursor_targets: Vec<usize>,
+    /// The handler object under the cursor last frame, and the one a press
+    /// started on (receives the matching `cursorUp`/`cursorClick`).
+    hovered: Option<usize>,
+    pressed: Option<usize>,
+    last_cursor_scene: [f32; 2],
+    /// Keyframed property animations (`"animation"` timelines).
+    timelines: Vec<TimelineEntry>,
+    /// Parallel to `scene_effects`: false once a script hides the effect.
+    effect_enabled: Vec<bool>,
+    /// Per-object draw position; starts as the object index, and
+    /// `thisScene.sortLayer` moves objects between their neighbours.
+    draw_rank: Vec<f64>,
+    sort_count: u32,
+    /// For `thisScene.createLayer`: the scene directory and its package.
+    scene_dir: std::path::PathBuf,
+    scene_pkg: Option<crate::engine::pkg::Package>,
     /// Desktop-audio capture, started only when an effect reads
     /// `g_AudioSpectrum*` (else `None` and the spectrum stays silent). Polled
     /// once per frame into the renderer's `audio_buf`.
     audio_capture: Option<crate::engine::audio::AudioCapture>,
     /// Live playback streams for `sound` objects; kept alive for the scene's
     /// lifetime (dropping stops the audio).
-    _sounds: Vec<crate::engine::audio::SoundPlayback>,
+    sounds: Vec<SceneSound>,
     /// MPRIS "what's playing" watcher (`engine::media`) — Linux-only (see
     /// its own module doc). Started unconditionally rather than gated on
     /// whether any script actually reads `media.*` (matching
@@ -1849,8 +1921,7 @@ pub struct GpuSceneInstance {
     /// Retained for the per-frame parent recompose, which has to rebuild each
     /// mesh's MVP and each layer's projected rect.
     camera3d: Option<crate::engine::camera3d::PerspectiveCamera>,
-    /// Parent chain + transform scripts. Only consulted when
-    /// `TransformGraph::needs_per_frame()` — 189 of 197 scenes skip it.
+    /// Parent chain per object, for recomposing transforms scripts change.
     transform_graph: crate::engine::render::TransformGraph,
     /// `general.zoom`, retained because the per-frame parent recompose rebuilds
     /// orthographic rects and has to apply the same scene-wide scale the build
@@ -2079,8 +2150,18 @@ fn mesh3d_lighting_bytes(
     push4([ambient[0], ambient[1], ambient[2], 0.0]);
     match &fog {
         Some(f) => {
-            push4([f.distance_color[0], f.distance_color[1], f.distance_color[2], f.distance_density]);
-            push4([f.height_color[0], f.height_color[1], f.height_color[2], f.height_density]);
+            push4([
+                f.distance_color[0],
+                f.distance_color[1],
+                f.distance_color[2],
+                f.distance_density,
+            ]);
+            push4([
+                f.height_color[0],
+                f.height_color[1],
+                f.height_color[2],
+                f.height_density,
+            ]);
             push4([f.height_exponent, f.height_offset, 0.0, 0.0]);
         }
         None => {
@@ -2108,7 +2189,12 @@ fn mesh3d_lighting_bytes(
                 .unwrap_or(0.0)
         };
         match light {
-            crate::engine::lighting::Light::Point { origin, color, intensity, .. } => {
+            crate::engine::lighting::Light::Point {
+                origin,
+                color,
+                intensity,
+                ..
+            } => {
                 let vp = cam.to_view_space(*origin);
                 *pos_slot = [vp[0], vp[1], vp[2], shadow_w()];
                 *color_slot = [color[0], color[1], color[2], *intensity];
@@ -2206,7 +2292,10 @@ fn mesh3d_lighting_bytes(
         }
     }
     for slot in 0..MESH3D_MAX_SHADOW_LIGHTS {
-        let uv_rect = shadow_slot_data.get(slot).map(|(_, r)| *r).unwrap_or([0.0; 4]);
+        let uv_rect = shadow_slot_data
+            .get(slot)
+            .map(|(_, r)| *r)
+            .unwrap_or([0.0; 4]);
         push4(uv_rect);
     }
     let cookie_view_proj = cookie
@@ -2241,6 +2330,13 @@ impl GpuSceneInstance {
 
     fn build(mut renderer: GpuSceneRenderer, dir: &Path) -> Result<Self> {
         let resolved = super::render::ResolvedScene::from_directory(dir)?;
+        // The unparsed scene.json: scripts and timelines read fields the
+        // typed model drops.
+        let raw_scene: serde_json::Value = crate::engine::assets::AssetStore::from_directory(dir)
+            .ok()
+            .and_then(|a| a.scene_json().ok())
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
         let w = resolved.width;
         let h = resolved.height;
 
@@ -2341,91 +2437,13 @@ impl GpuSceneInstance {
             .layers
             .iter()
             .map(|l| {
-                let all_frames: Vec<&RgbaImage> = std::iter::once(&l.image)
-                    .chain(l.extra_frames.iter())
-                    .collect();
-                // Textures stay at native resolution; the composite quad and
-                // sampler handle scaling to the object's on-screen size.
-                let frames: Vec<wgpu::Texture> = all_frames
-                    .iter()
-                    .map(|frame| renderer.upload_texture(frame))
-                    .collect();
-
-                // Unscaled object size: explicit scene.json size, else the
-                // texture's native resolution (CImage.cpp lines 213-222).
-                // True scene-fullscreen layers (models/util/fullscreenlayer.json
-                // etc.) never reach here — they're filtered out upstream by
-                // `is_special_layer` — so an unspecified size always means
-                // "use the texture's own dimensions", never "cover the scene".
-                let effective_size = if l.size[0] > 0.0 && l.size[1] > 0.0 {
-                    [l.size[0], l.size[1]]
-                } else {
-                    [l.image.width() as f64, l.image.height() as f64]
-                };
-                let object_size = (
-                    effective_size[0].round() as u32,
-                    effective_size[1].round() as u32,
-                );
-
-                // Object quad rect in NDC. WE origins are absolute scene
-                // coordinates (Y-up, bottom-left origin) pointing at the
-                // object's center.
-                let size_px = [
-                    effective_size[0] * l.scale[0],
-                    effective_size[1] * l.scale[1],
-                ];
-                let (rect, angle, depth, quad_corners) = if let Some(cam) = &camera3d {
-                    let center = [l.origin[0] as f32, l.origin[1] as f32, l.origin[2] as f32];
-                    let (rect, depth) = project_quad_ndc(cam, center, l.angles, size_px);
-                    let quad_corners = project_quad_corners(cam, center, l.angles, size_px);
-                    (rect, 0.0, depth, quad_corners)
-                } else {
-                    // `general.zoom` scales the whole scene about its center;
-                    // NDC (0,0) is the scene center, so a uniform rect scale
-                    // does it (center and half-extent both × zoom).
-                    let rect = [
-                        (2.0 * l.origin[0] / w as f64 - 1.0) as f32 * zoom,
-                        (2.0 * l.origin[1] / h as f64 - 1.0) as f32 * zoom,
-                        (size_px[0] / w as f64) as f32 * zoom,
-                        (size_px[1] / h as f64) as f32 * zoom,
-                    ];
-                    (rect, l.angle, 0.0, None)
-                };
-
-                SceneLayerGpu {
-                    frames,
-                    puppet: l.puppet.clone(),
-                    puppet_posed_at: 0.0,
-                    video: l.video.clone(),
-                    blend_mode: l.blend_mode,
-                    alpha: l.alpha,
-                    alpha_base: l.alpha,
-                    alpha_script: l.alpha_script.clone(),
-                    text_dynamic: l.text_dynamic.clone(),
-                    color: l.color,
-                    brightness: l.brightness,
-                    frame_duration_ms: l.frame_duration_ms,
-                    parallax_depth: [l.parallax_depth[0] as f32, l.parallax_depth[1] as f32],
-                    angle,
-                    rect,
-                    quad_corners,
-                    depth,
-                    object_size,
-                    no_interpolation: l.no_interpolation,
-                    clamp_uvs: l.clamp_uvs,
-                    order_index: l.order_index,
-                    object_id: l.object_id,
-                    visible: l.visible_base,
-                    visible_base: l.visible_base,
-                    transform_scripts: l.transform_scripts.clone(),
-                    effective_size,
-                    origin_base: l.origin,
-                    scale_base: [l.scale[0] as f32, l.scale[1] as f32, l.scale[2] as f32],
-                    angles_base: l.angles,
-                    local_origin: l.local_origin,
-                    local_scale: l.local_scale,
-                    local_angles: l.local_angles,
-                }
+                let authored = resolved
+                    .transform_graph
+                    .local
+                    .get(l.order_index)
+                    .map(|x| x.t)
+                    .unwrap_or(l.local_origin);
+                gpu_layer_from(&renderer, l, w, h, zoom, camera3d.as_ref(), authored)
             })
             .collect();
 
@@ -2449,48 +2467,17 @@ impl GpuSceneInstance {
             None
         };
 
-        // Sound objects: decode + play each file (looped unless startsilent).
-        let mut sounds = Vec::new();
-        for obj in &resolved.scene.objects {
-            let Some(sound) = obj.sound.as_ref() else {
-                continue;
-            };
-            if obj
-                .startsilent
-                .as_ref()
-                .and_then(|v| {
-                    v.as_bool()
-                        .or_else(|| v.get("value").and_then(|i| i.as_bool()))
-                })
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let volume = obj
-                .volume
-                .as_ref()
-                .and_then(crate::engine::scene::parse_value_f32)
-                .unwrap_or(1.0);
-            let mode = obj.playbackmode.as_ref().and_then(|v| v.as_str());
-            let looping = mode != Some("nointerrupt") && mode != Some("once");
-            // `sound` is an array of file paths; play the first that decodes.
-            let files: Vec<String> = match sound {
-                serde_json::Value::Array(a) => a
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect(),
-                serde_json::Value::String(s) => vec![s.clone()],
-                _ => Vec::new(),
-            };
-            for f in files {
-                if let Some(p) =
-                    crate::engine::audio::SoundPlayback::start(&dir.join(&f), volume, looping)
-                {
-                    sounds.push(p);
-                    break;
-                }
-            }
-        }
+        // Sound objects: decode each file and play it looped; `startsilent`
+        // ones are held ready but silent so a script can `play()` them.
+        let sounds: Vec<SceneSound> = resolved
+            .scene
+            .objects
+            .iter()
+            .enumerate()
+            .filter_map(|(object, obj)| {
+                start_scene_sound(dir, obj).map(|playback| SceneSound { object, playback })
+            })
+            .collect();
 
         // Computed early (not just before `build_shadow_atlas` needs it, its
         // original spot) so the FBO-pool setup below can also gate
@@ -2705,12 +2692,17 @@ impl GpuSceneInstance {
             (
                 renderer.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("shadow_atlas_dummy"),
-                    size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: MESH3D_DEPTH_FORMAT,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 }),
                 vec![None; lights.len()],
@@ -2732,28 +2724,39 @@ impl GpuSceneInstance {
         let cookie_data = {
             use crate::engine::lighting::Light;
             let (center, radius) = crate::engine::shadow::scene_bounds(&resolved.mesh3d_layers);
-            lights.iter().enumerate().find_map(|(i, (light, _, _, cookie_path))| {
-                let path = cookie_path.as_ref()?;
-                let Light::Spot { origin, direction, outer_cone_degrees, .. } = light else {
-                    return None;
-                };
-                let image = super::render::resolve_static_texture(Some(dir), None, path)?;
-                let vp = crate::engine::shadow::spot_light_view_proj(
-                    *origin,
-                    *direction,
-                    *outer_cone_degrees,
-                    center,
-                    radius,
-                );
-                Some((i, vp, image))
-            })
+            lights
+                .iter()
+                .enumerate()
+                .find_map(|(i, (light, _, _, cookie_path))| {
+                    let path = cookie_path.as_ref()?;
+                    let Light::Spot {
+                        origin,
+                        direction,
+                        outer_cone_degrees,
+                        ..
+                    } = light
+                    else {
+                        return None;
+                    };
+                    let image = super::render::resolve_static_texture(Some(dir), None, path)?;
+                    let vp = crate::engine::shadow::spot_light_view_proj(
+                        *origin,
+                        *direction,
+                        *outer_cone_degrees,
+                        center,
+                        radius,
+                    );
+                    Some((i, vp, image))
+                })
         };
         let cookie_view = renderer
             .upload_texture(
                 &cookie_data
                     .as_ref()
                     .map(|(_, _, img)| img.clone())
-                    .unwrap_or_else(|| RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]))),
+                    .unwrap_or_else(|| {
+                        RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]))
+                    }),
             )
             .create_view(&Default::default());
         // Volumetric-light-shaft ray march's static per-scene bind group —
@@ -2836,7 +2839,7 @@ impl GpuSceneInstance {
                 .create_view(&Default::default())
         });
 
-        Ok(Self {
+        let mut instance = Self {
             renderer,
             layers,
             scene_effects,
@@ -2858,9 +2861,39 @@ impl GpuSceneInstance {
             start: Instant::now(),
             last_time: 0.0,
             mouse_norm: [0.5, 0.5],
-            script_ctx: crate::engine::script::ScriptContext::new(),
+            scripts: build_script_host(
+                dir,
+                &resolved.scene,
+                &resolved.transform_graph,
+                [w, h],
+                &raw_scene,
+            ),
+            timelines: build_timelines(&raw_scene, &resolved.transform_graph),
+            live_props: LiveProps::new(dir, &raw_scene),
+            object_visible: resolved
+                .scene
+                .objects
+                .iter()
+                .map(|o| o.is_visible())
+                .collect(),
+            propagation_disabled: vec![false; resolved.scene.objects.len()],
+            scripts_want_audio: false,
+            cursor_scene: [w as f32 * 0.5, h as f32 * 0.5],
+            cursor_left_down: false,
+            pending_buttons: Vec::new(),
+            cursor_targets: Vec::new(),
+            hovered: None,
+            pressed: None,
+            last_cursor_scene: [w as f32 * 0.5, h as f32 * 0.5],
+            effect_enabled: Vec::new(),
+            draw_rank: (0..resolved.scene.objects.len())
+                .map(|i| i as f64)
+                .collect(),
+            sort_count: 0,
+            scene_dir: dir.to_path_buf(),
+            scene_pkg: None,
             audio_capture,
-            _sounds: sounds,
+            sounds,
             #[cfg(target_os = "linux")]
             media: crate::engine::media::MediaWatcher::start(),
             perspective: camera3d.is_some(),
@@ -2872,7 +2905,15 @@ impl GpuSceneInstance {
             current_locals: resolved.transform_graph.local.clone(),
             transform_graph: resolved.transform_graph,
             zoom,
-        })
+        };
+        // Hidden ancestors hide their subtree; script-referenced hidden
+        // objects are built but start hidden.
+        instance.refresh_layer_visibility();
+        instance.effect_enabled = vec![true; instance.scene_effects.len()];
+        instance.cursor_targets = instance
+            .scripts
+            .objects_with_handlers(crate::engine::script::CURSOR_EVENTS);
+        Ok(instance)
     }
 
     /// Build the volumetric-light-shaft ray march's static per-scene bind
@@ -2907,18 +2948,34 @@ impl GpuSceneInstance {
     ) -> Option<wgpu::BindGroup> {
         use crate::engine::lighting::Light;
 
-        let (idx, origin, color_intensity, density, exponent) =
-            lights.iter().enumerate().find_map(|(i, (light, _, volumetrics, _))| {
+        let (idx, origin, color_intensity, density, exponent) = lights
+            .iter()
+            .enumerate()
+            .find_map(|(i, (light, _, volumetrics, _))| {
                 let (density, exponent) = (*volumetrics)?;
                 let (origin, color, intensity) = match light {
                     // Directional has no position to march a shaft from;
                     // Tube isn't constructed by `Scene::lights()` yet (see
                     // `LightType::Tube`'s doc comment) — neither reaches here.
-                    Light::Point { origin, color, intensity, .. }
-                    | Light::Spot { origin, color, intensity, .. } => (*origin, *color, *intensity),
+                    Light::Point {
+                        origin,
+                        color,
+                        intensity,
+                        ..
+                    }
+                    | Light::Spot {
+                        origin,
+                        color,
+                        intensity,
+                        ..
+                    } => (*origin, *color, *intensity),
                     _ => return None,
                 };
-                let ci = [color[0] * intensity, color[1] * intensity, color[2] * intensity];
+                let ci = [
+                    color[0] * intensity,
+                    color[1] * intensity,
+                    color[2] * intensity,
+                ];
                 Some((i, origin, ci, density, exponent))
             })?;
 
@@ -2961,29 +3018,40 @@ impl GpuSceneInstance {
         };
         push4([eye[0], eye[1], eye[2], 0.0]);
         push4([origin[0], origin[1], origin[2], density]);
-        push4([color_intensity[0], color_intensity[1], color_intensity[2], exponent]);
+        push4([
+            color_intensity[0],
+            color_intensity[1],
+            color_intensity[2],
+            exponent,
+        ]);
         push4(shadow_uv_rect);
         push4([has_shadow, MAX_RANGE, 0.0, 0.0]);
 
         let ubo = renderer.make_uniform_buffer(&bytes, bytes.len() as u64);
-        Some(renderer.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("volumetrics_bg"),
-            layout: &renderer.volumetrics_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: ubo.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(shadow_atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&renderer.shadow_comparison_sampler),
-                },
-            ],
-        }))
+        Some(
+            renderer
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("volumetrics_bg"),
+                    layout: &renderer.volumetrics_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: ubo.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(shadow_atlas_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(
+                                &renderer.shadow_comparison_sampler,
+                            ),
+                        },
+                    ],
+                }),
+        )
     }
 
     /// Render the shadow atlas once at scene setup (shadow-casting lights
@@ -3073,7 +3141,8 @@ impl GpuSceneInstance {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: MESH3D_DEPTH_FORMAT,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
                 view_formats: &[],
             });
             return (dummy, shadow_slots, Vec::new());
@@ -3117,7 +3186,9 @@ impl GpuSceneInstance {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("shadow_atlas_pass"),
             });
-        for (slot, ((light_idx, view_proj), tile)) in shadow_casters.iter().zip(tiles.iter()).enumerate() {
+        for (slot, ((light_idx, view_proj), tile)) in
+            shadow_casters.iter().zip(tiles.iter()).enumerate()
+        {
             let view_proj = *view_proj;
             let uv_rect = shadow::tile_uv_rect(*tile, atlas_w, atlas_h);
             shadow_slots[*light_idx] = Some(slot);
@@ -3146,11 +3217,19 @@ impl GpuSceneInstance {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_viewport(tile.x as f32, tile.y as f32, tile.w as f32, tile.h as f32, 0.0, 1.0);
+            pass.set_viewport(
+                tile.x as f32,
+                tile.y as f32,
+                tile.w as f32,
+                tile.h as f32,
+                0.0,
+                1.0,
+            );
             pass.set_scissor_rect(tile.x, tile.y, tile.w, tile.h);
             pass.set_pipeline(&renderer.mesh3d_shadow_pipeline);
             for (layer, (vbuf, ibuf, index_count)) in mesh3d_layers.iter().zip(geometry.iter()) {
-                let model = crate::engine::camera3d::model_matrix(layer.origin, layer.angles, layer.scale);
+                let model =
+                    crate::engine::camera3d::model_matrix(layer.origin, layer.angles, layer.scale);
                 let light_mvp = crate::engine::camera3d::mat4_mul(&view_proj, &model);
                 let mut mvp_bytes = Vec::with_capacity(64);
                 for col in light_mvp.iter() {
@@ -3159,14 +3238,16 @@ impl GpuSceneInstance {
                     }
                 }
                 let mvp_buf = renderer.make_uniform_buffer(&mvp_bytes, 64);
-                let bg = renderer.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("shadow_pass_bg"),
-                    layout: &renderer.shadow_pass_bgl,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: mvp_buf.as_entire_binding(),
-                    }],
-                });
+                let bg = renderer
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("shadow_pass_bg"),
+                        layout: &renderer.shadow_pass_bgl,
+                        entries: &[wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: mvp_buf.as_entire_binding(),
+                        }],
+                    });
                 pass.set_bind_group(0, &bg, &[]);
                 pass.set_vertex_buffer(0, vbuf.slice(..));
                 pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
@@ -3295,69 +3376,774 @@ impl GpuSceneInstance {
         }
     }
 
-    /// Recompose parent chains for this frame.
-    ///
-    /// `apply_parent_transforms` bakes the chain at load, which is correct only
-    /// while the chain is static. A scripted parent moves every frame, and
-    /// those parent nodes are usually image-less — they have no `Layer`, so the
-    /// per-layer script loop never touches them. This evaluates every object's
-    /// transform scripts (parents included), recomposes each chain, and pushes
-    /// the result into whatever the object actually draws as.
-    ///
-    /// Skipped entirely unless the scene both parents something and scripts a
-    /// transform — true for 8 of 197 real scenes.
-    fn update_parent_transforms(&mut self) {
-        if !self.transform_graph.needs_per_frame() {
+    /// For a composition/fullscreen layer, copy the scene drawn so far under
+    /// its quad into its texture, so its effects process the backdrop.
+    fn capture_backdrop(&self, encoder: &mut wgpu::CommandEncoder, layer_idx: usize) {
+        let layer = &self.layers[layer_idx];
+        if layer.backdrop.is_none() {
             return;
         }
-        use crate::engine::render::Xform;
-
-        // Evaluate in declaration order: these scripts talk to each other
-        // through the shared `shared` object (one writes `shared.gjz`, another
-        // reads it), and declaration order is the only ordering WE implies.
-        let mut locals = self.current_locals.clone();
-        let mut disabled = vec![false; self.transform_graph.parent.len()];
-        for (i, scripts) in self.transform_graph.scripts.iter().enumerate() {
-            // Previous frame's value, not the authored one — see `current_locals`.
-            let base = self.current_locals[i];
-            // `thisLayer`/`disablepropagation()` — the object-attachment
-            // scripting API (see `engine::script::OBJECT_ATTACHMENT_API_JS`)
-            // — needs to know which object is about to run, and this is the
-            // one place every object (including image-less parent nodes)
-            // gets its scripts evaluated.
-            self.script_ctx.set_current_object(
-                self.transform_graph.name[i].as_deref(),
-                self.transform_graph.id[i],
-                [base.t[0] as f32, base.t[1] as f32, base.t[2] as f32],
-                [base.r[0] as f32, base.r[1] as f32, base.r[2] as f32],
-                [base.s[0] as f32, base.s[1] as f32, base.s[2] as f32],
-                [0.0, 0.0],
-            );
-            let eval = |ctx: &mut crate::engine::script::ScriptContext,
-                        src: &Option<String>,
-                        b: [f64; 3]| match src {
-                Some(src) => ctx
-                    .eval_update_vec3(src, [b[0] as f32, b[1] as f32, b[2] as f32])
-                    .map(|v| [v[0] as f64, v[1] as f64, v[2] as f64])
-                    .unwrap_or(b),
-                None => b,
-            };
-            locals[i] = Xform {
-                t: eval(&mut self.script_ctx, &scripts[0], base.t),
-                r: eval(&mut self.script_ctx, &scripts[1], base.r),
-                s: eval(&mut self.script_ctx, &scripts[2], base.s),
-            };
-            disabled[i] = self.script_ctx.take_propagation_disabled();
+        let dst = &layer.frames[0];
+        let (w, h) = (self.width as i64, self.height as i64);
+        // Quad → target pixels (texture rows run top-down).
+        let x0 = (((layer.rect[0] - layer.rect[2]) + 1.0) * 0.5 * w as f32).round() as i64;
+        let y0 = ((1.0 - (layer.rect[1] + layer.rect[3])) * 0.5 * h as f32).round() as i64;
+        let (sx, sy) = (x0.max(0), y0.max(0));
+        let (dx, dy) = (sx - x0, sy - y0);
+        let cw = (dst.width() as i64 - dx).min(w - sx);
+        let ch = (dst.height() as i64 - dy).min(h - sy);
+        if cw <= 0 || ch <= 0 {
+            return;
         }
-        self.current_locals.clone_from(&locals);
-        let worlds = self.transform_graph.world(&locals, &disabled);
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.target,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: sx as u32,
+                    y: sy as u32,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: dst,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: dx as u32,
+                    y: dy as u32,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: cw as u32,
+                height: ch as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Advance keyframe animations and apply the properties they move.
+    fn tick_timelines(&mut self, delta: f32) {
+        use crate::engine::script::{ObjectChange, ScriptChanges};
+        if self.timelines.is_empty() {
+            return;
+        }
+        let mut changes: Vec<(usize, ObjectChange)> = Vec::new();
+        let mut events: Vec<(usize, String)> = Vec::new();
+        let mut synced: Vec<(usize, String, serde_json::Value)> = Vec::new();
+        for t in &mut self.timelines {
+            for name in t.anim.advance(delta) {
+                events.push((t.object, name));
+            }
+            let mut v = t.anim.sample();
+            if t.anim.relative {
+                for (k, x) in v.iter_mut().enumerate() {
+                    *x += t.base.get(k).copied().unwrap_or(0.0);
+                }
+            }
+            if t.last.as_ref() == Some(&v) {
+                continue;
+            }
+            t.last = Some(v.clone());
+            let idx = match changes.iter().position(|(o, _)| *o == t.object) {
+                Some(i) => i,
+                None => {
+                    changes.push((t.object, ObjectChange::default()));
+                    changes.len() - 1
+                }
+            };
+            let c = &mut changes[idx].1;
+            let v3 = |fill: f32| -> [f32; 3] {
+                std::array::from_fn(|k| {
+                    v.get(k).copied().or(t.base.get(k).copied()).unwrap_or(fill)
+                })
+            };
+            let json = if v.len() == 1 {
+                serde_json::json!(v[0])
+            } else {
+                serde_json::json!(v)
+            };
+            match t.key.as_str() {
+                "origin" => c.origin = Some(v3(0.0)),
+                "scale" => c.scale = Some(v3(1.0)),
+                "angles" => c.angles = Some(v3(0.0)),
+                "color" => c.color = Some(v3(1.0)),
+                "alpha" => c.alpha = v.first().copied(),
+                "brightness" => c.brightness = v.first().copied(),
+                key => {
+                    c.extra.insert(key.to_string(), json.clone());
+                }
+            }
+            synced.push((t.object, t.key.clone(), json));
+        }
+        if self.scripts.has_scripts() {
+            for (object, key, value) in &synced {
+                self.scripts.sync_property(*object, key, value);
+            }
+            for (object, name) in &events {
+                self.scripts.dispatch_event(
+                    *object,
+                    "animationEvent",
+                    &serde_json::json!({ "name": name }),
+                );
+            }
+        }
+        if !changes.is_empty() {
+            self.apply_script_changes(ScriptChanges {
+                objects: changes,
+                commands: Vec::new(),
+            });
+        }
+    }
+
+    /// `thisLayer.getAnimation(name).play()` & co: control the animations on
+    /// object `index` named `property` (by animation name or property key),
+    /// along with the animations grouped with them.
+    fn control_timeline(&mut self, index: usize, property: &str, op: &str, frame: Option<f32>) {
+        let matched: Vec<String> = self
+            .timelines
+            .iter()
+            .filter(|t| t.object == index)
+            .filter(|t| t.key == property || t.anim.name.as_deref() == Some(property))
+            .flat_map(|t| std::iter::once(t.key.clone()).chain(t.anim.children.iter().cloned()))
+            .collect();
+        for t in self.timelines.iter_mut().filter(|t| t.object == index) {
+            let grouped = matched.contains(&t.key)
+                || t.anim.parent.as_ref().is_some_and(|p| matched.contains(p));
+            if grouped {
+                t.anim.control(op, frame);
+            }
+        }
+    }
+
+    /// Run this frame's SceneScripts and apply what they changed.
+    fn tick_scripts(&mut self, time: f32, delta: f32) {
+        if !self.scripts.has_scripts() {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(info) = self.media.as_ref().and_then(|w| w.try_recv()) {
+            use crate::engine::media::PlaybackState;
+            self.scripts.set_media(
+                info.available,
+                match info.playback_state {
+                    PlaybackState::Stopped => 0,
+                    PlaybackState::Playing => 1,
+                    PlaybackState::Paused => 2,
+                },
+                &info.title,
+                &info.artist,
+                &info.album,
+                info.position_us,
+                info.duration_us,
+                info.art_url.as_deref(),
+            );
+        }
+        if self.scripts_want_audio {
+            if let Some(cap) = &self.audio_capture {
+                let sp = cap.spectrum();
+                self.scripts.set_audio([
+                    &sp.s16_left,
+                    &sp.s16_right,
+                    &sp.s32_left,
+                    &sp.s32_right,
+                    &sp.s64_left,
+                    &sp.s64_right,
+                ]);
+            }
+        }
+        self.scripts.set_cursor(
+            self.cursor_scene,
+            self.cursor_screen(),
+            self.cursor_left_down,
+        );
+        self.dispatch_cursor_events();
+        self.scripts
+            .frame(time, crate::engine::script::local_time_of_day(), delta);
+        let changes = self.scripts.collect();
+        self.apply_script_changes(changes);
+        self.flush_text();
+
+        // `registerAudioBuffers` usually runs at module load, so this is
+        // known after the first frame; start capture then if nothing else did.
+        if !self.scripts_want_audio && self.scripts.wants_audio() {
+            self.scripts_want_audio = true;
+            if self.audio_capture.is_none() {
+                self.audio_capture = crate::engine::audio::AudioCapture::start();
+            }
+        }
+    }
+
+    /// Fire `cursorEnter`/`Leave`/`Move`/`Down`/`Up`/`Click` on handler
+    /// objects from this frame's pointer state.
+    fn dispatch_cursor_events(&mut self) {
+        let buttons = std::mem::take(&mut self.pending_buttons);
+        if self.cursor_targets.is_empty() {
+            return;
+        }
+        let pos = self.cursor_scene;
+        let hit = self.hit_test(self.mouse_norm);
+        if hit != self.hovered {
+            if let Some(old) = self.hovered {
+                self.scripts.dispatch_cursor(old, "cursorLeave", pos);
+            }
+            if let Some(new) = hit {
+                self.scripts.dispatch_cursor(new, "cursorEnter", pos);
+            }
+            self.hovered = hit;
+        }
+        if pos != self.last_cursor_scene {
+            self.last_cursor_scene = pos;
+            if let Some(h) = hit {
+                self.scripts.dispatch_cursor(h, "cursorMove", pos);
+            }
+            // A drag keeps reporting to the layer it started on.
+            if let Some(p) = self.pressed.filter(|p| Some(*p) != hit) {
+                self.scripts.dispatch_cursor(p, "cursorMove", pos);
+            }
+        }
+        for down in buttons {
+            if down {
+                self.pressed = hit;
+                if let Some(h) = hit {
+                    self.scripts.dispatch_cursor(h, "cursorDown", pos);
+                }
+            } else if let Some(p) = self.pressed.take() {
+                self.scripts.dispatch_cursor(p, "cursorUp", pos);
+                if hit == Some(p) {
+                    self.scripts.dispatch_cursor(p, "cursorClick", pos);
+                }
+            }
+        }
+    }
+
+    /// The topmost cursor-handler object whose quad contains the cursor
+    /// (`norm`: `[0,1]²`, top-left origin). Hidden layers still count:
+    /// real content uses invisible hitboxes that toggle themselves.
+    fn hit_test(&self, norm: [f32; 2]) -> Option<usize> {
+        let (w, h) = (self.width as f32, self.height as f32);
+        // Output pixels, Y-up, origin at the centre — the space `rect` is in.
+        let p = [(norm[0] - 0.5) * w, (0.5 - norm[1]) * h];
+        self.layers
+            .iter()
+            .filter(|l| self.cursor_targets.contains(&l.order_index))
+            .filter(|l| {
+                let corners: [[f32; 2]; 4] = match l.quad_corners {
+                    Some(c) => c.map(|c| [c[0] * w * 0.5, c[1] * h * 0.5]),
+                    None => quad_corners_px(l.rect, l.angle, w, h),
+                };
+                point_in_convex_quad(p, &corners)
+            })
+            .map(|l| l.order_index)
+            .max()
+    }
+
+    /// Record a left-button press or release (from the platform layer).
+    pub fn set_mouse_button(&mut self, left_down: bool) {
+        if left_down != self.cursor_left_down {
+            self.cursor_left_down = left_down;
+            self.pending_buttons.push(left_down);
+        }
+    }
+
+    /// The cursor in output pixels, top-left origin (`input.cursorScreenPosition`).
+    fn cursor_screen(&self) -> [f32; 2] {
+        [
+            self.mouse_norm[0] * self.width as f32,
+            self.mouse_norm[1] * self.height as f32,
+        ]
+    }
+
+    /// Apply a frame's script changes: transforms recompose through the
+    /// parent graph, everything else lands on the object's layers and sounds.
+    fn apply_script_changes(&mut self, changes: crate::engine::script::ScriptChanges) {
+        use crate::engine::script::ScriptCommand;
+        let n = self.current_locals.len();
+        let mut moved = vec![false; n];
+        let mut visibility_changed = false;
+        for (i, c) in &changes.objects {
+            let i = *i;
+            if i >= n {
+                continue;
+            }
+            let x = &mut self.current_locals[i];
+            if let Some(o) = c.origin {
+                x.t = o.map(|v| v as f64);
+                moved[i] = true;
+            }
+            if let Some(a) = c.angles {
+                x.r = a.map(|v| v as f64);
+                moved[i] = true;
+            }
+            if let Some(sc) = c.scale {
+                x.s = sc.map(|v| v as f64);
+                moved[i] = true;
+            }
+            if let Some(d) = c.propagation_disabled {
+                self.propagation_disabled[i] = d;
+                moved[i] = true;
+            }
+            if let Some(v) = c.visible {
+                self.object_visible[i] = v;
+                visibility_changed = true;
+            }
+            if let Some(v) = c.volume {
+                for snd in self.sounds_of(i) {
+                    snd.set_volume(v);
+                }
+            }
+            for (key, value) in &c.extra {
+                self.apply_script_extra(i, key, value);
+            }
+            for li in 0..self.layers.len() {
+                if self.layers[li].order_index != i {
+                    continue;
+                }
+                let layer = &mut self.layers[li];
+                if let Some(v) = c.visible {
+                    layer.visible = v;
+                }
+                if let Some(a) = c.alpha {
+                    layer.alpha = a;
+                }
+                if let Some(col) = c.color {
+                    layer.color = col;
+                }
+                if let Some(b) = c.brightness {
+                    layer.brightness = b;
+                }
+                if let Some(f) = c.frame {
+                    layer.script_frame = Some(f as usize);
+                }
+                if let Some(ps) = c.pointsize {
+                    if let Some(td) = &mut layer.text_dynamic {
+                        td.point_size = ps.max(1.0);
+                        td.last_text.clear();
+                    }
+                }
+                if c.text.is_some() || c.pointsize.is_some() {
+                    self.rerasterize_text(li, c.text.as_deref());
+                }
+            }
+        }
+        for cmd in changes.commands {
+            match cmd {
+                ScriptCommand::Sound { index, op } => {
+                    for snd in self.sounds_of(index) {
+                        match op.as_str() {
+                            "play" => snd.play(),
+                            "pause" => snd.pause(),
+                            "stop" => snd.stop(),
+                            _ => {}
+                        }
+                    }
+                }
+                ScriptCommand::Sort { index, to } => self.sort_object(index, to),
+                ScriptCommand::Animation {
+                    index,
+                    property,
+                    op,
+                    frame,
+                } => self.control_timeline(index, &property, &op, frame),
+                ScriptCommand::Create { index, config } => {
+                    self.create_object(index, &config);
+                    visibility_changed = true;
+                }
+                ScriptCommand::Destroy { index } => {
+                    // Hidden for good rather than removed: per-layer render
+                    // targets are keyed by position in `self.layers`.
+                    if let Some(v) = self.object_visible.get_mut(index) {
+                        *v = false;
+                    }
+                    self.cursor_targets.retain(|t| *t != index);
+                    visibility_changed = true;
+                }
+                other => {
+                    tracing::debug!(target: "script", "unhandled script command {other:?}");
+                }
+            }
+        }
+        if visibility_changed {
+            self.refresh_layer_visibility();
+        }
+        if moved.iter().any(|m| *m) {
+            self.apply_object_transforms(&moved);
+        }
+    }
+
+    /// The user properties `names` changed in the saved settings: show them
+    /// live. Returns `false` when the scene must be rebuilt instead (see
+    /// [`Self::apply_user_properties`]).
+    pub fn set_user_properties(&mut self, names: &[String]) -> bool {
+        let props =
+            crate::engine::properties::SceneProperties::from_project_dir(&self.live_props.dir);
+        self.apply_user_properties(props, names)
+    }
+
+    /// Re-resolve the scene against `props` and push each object's
+    /// differences through the same path SceneScript writes take; scripts
+    /// get `applyUserProperties` for `names`. Returns `false` when a change
+    /// can't be applied live (scene-wide settings, an effect that wasn't
+    /// built at load, a field scripts can't set).
+    fn apply_user_properties(
+        &mut self,
+        props: crate::engine::properties::SceneProperties,
+        names: &[String],
+    ) -> bool {
+        let lp = &mut self.live_props;
+        lp.props = props;
+        let mut next = lp.raw.clone();
+        lp.props.resolve_scene_json(&mut next);
+        let prev = std::mem::replace(&mut lp.resolved, next);
+        if prev.get("general") != lp.resolved.get("general") {
+            return false;
+        }
+        let objects = |v: &serde_json::Value| {
+            v.get("objects")
+                .and_then(|o| o.as_array())
+                .cloned()
+                .unwrap_or_default()
+        };
+        let (before, after) = (objects(&prev), objects(&lp.resolved));
+        if before.len() != after.len() {
+            return false;
+        }
+        let user: serde_json::Map<String, serde_json::Value> = names
+            .iter()
+            .filter_map(|n| {
+                Some((
+                    n.clone(),
+                    serde_json::json!({ "value": lp.props.get(n)?.clone() }),
+                ))
+            })
+            .collect();
+        let mut objects = Vec::new();
+        for (i, (a, b)) in before.iter().zip(&after).enumerate() {
+            let mut diffs = Vec::new();
+            changed_leaves(a, b, &mut Vec::new(), &mut diffs);
+            if diffs.is_empty() {
+                continue;
+            }
+            let mut change = crate::engine::script::ObjectChange::default();
+            for (path, v) in &diffs {
+                if self.live_change(i, path, v, &mut change).is_none() {
+                    tracing::debug!(target: "properties", "object {i}: {} needs a reload", path.join("."));
+                    return false;
+                }
+            }
+            objects.push((i, change));
+        }
+        self.apply_script_changes(crate::engine::script::ScriptChanges {
+            objects,
+            commands: Vec::new(),
+        });
+        self.scripts
+            .apply_user_properties(&serde_json::Value::Object(user));
+        true
+    }
+
+    /// One changed scene.json field of object `object`, as a script change.
+    /// `None` when it has no live counterpart.
+    fn live_change(
+        &self,
+        object: usize,
+        path: &[String],
+        v: &serde_json::Value,
+        c: &mut crate::engine::script::ObjectChange,
+    ) -> Option<()> {
+        use crate::engine::scene::{parse_value_bool, parse_value_f32, parse_value_vec3};
+        // `{"user": …, "value": X}` bindings resolve to their `value`.
+        let v = v.get("value").unwrap_or(v);
+        let vec3 = |v| parse_value_vec3(v).map(|a| a.map(|x| x as f32));
+        let path: Vec<&str> = path.iter().map(String::as_str).collect();
+        match path.as_slice() {
+            ["visible"] => c.visible = Some(parse_value_bool(v)?),
+            ["alpha"] => c.alpha = Some(parse_value_f32(v)?),
+            ["brightness"] => c.brightness = Some(parse_value_f32(v)?),
+            ["color"] => c.color = Some(vec3(v)?),
+            ["origin"] => c.origin = Some(vec3(v)?),
+            ["scale"] => c.scale = Some(vec3(v)?),
+            ["volume"] => c.volume = Some(parse_value_f32(v)?),
+            ["pointsize"] => c.pointsize = Some(parse_value_f32(v)?),
+            ["text"] => c.text = Some(v.as_str()?.to_string()),
+            ["instanceoverride", k] => {
+                c.extra.insert(format!("instance.{k}"), v.clone());
+            }
+            ["effects", e, rest @ ..] => {
+                let e: usize = e.parse().ok()?;
+                // Effects hidden at load were never built.
+                self.scene_effects
+                    .iter()
+                    .any(|d| d.layer_idx == object && d.effect_index == e)
+                    .then_some(())?;
+                match rest {
+                    ["visible"] => {
+                        c.extra
+                            .insert(format!("effects.{e}.visible"), parse_value_bool(v)?.into());
+                    }
+                    ["passes", pass, "constantshadervalues", k] => {
+                        c.extra.insert(format!("effects.{e}.{pass}.{k}"), v.clone());
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// A script wrote a declared extra property: `instance.<key>` (particle
+    /// override), `effects.<e>.visible`, or `effects.<e>.<pass>.<constant>`.
+    fn apply_script_extra(&mut self, object: usize, key: &str, value: &serde_json::Value) {
+        if let Some(k) = key.strip_prefix("instance.") {
+            for (sys, _) in self
+                .particle_systems
+                .iter_mut()
+                .zip(&self.particle_order)
+                .filter(|(_, o)| **o == object)
+            {
+                sys.set_instance_value(k, value);
+            }
+            return;
+        }
+        let Some(rest) = key.strip_prefix("effects.") else {
+            return;
+        };
+        let mut parts = rest.splitn(3, '.');
+        let Some(e) = parts.next().and_then(|e| e.parse::<usize>().ok()) else {
+            return;
+        };
+        let Some(k) = self
+            .scene_effects
+            .iter()
+            .position(|d| d.layer_idx == object && d.effect_index == e)
+        else {
+            return;
+        };
+        match (parts.next(), parts.next()) {
+            (Some("visible"), None) => {
+                self.effect_enabled[k] = value.as_bool().unwrap_or(true);
+            }
+            (Some(pass), Some(name)) => {
+                let Some(pass) = pass.parse::<usize>().ok() else {
+                    return;
+                };
+                let Some(runtime) = self.effect_runtimes.get_mut(k).and_then(|r| r.as_mut()) else {
+                    return;
+                };
+                if let Some(p) = runtime.passes.get_mut(pass) {
+                    // Vectors come back as arrays; the value parser wants "x y z".
+                    let v = match value {
+                        serde_json::Value::Array(a) => serde_json::Value::String(
+                            a.iter()
+                                .map(|x| x.as_f64().unwrap_or(0.0).to_string())
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        ),
+                        other => other.clone(),
+                    };
+                    insert_value_components(&mut p.values, name, &v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `thisScene.sortLayer(layer, index)`: draw `index`'s object just below
+    /// the object currently at `to`, later sorts landing lower.
+    fn sort_object(&mut self, index: usize, to: usize) {
+        let Some(base) = self.draw_rank.get(to).copied() else {
+            return;
+        };
+        self.sort_count += 1;
+        if let Some(r) = self.draw_rank.get_mut(index) {
+            *r = base - 0.5 + 0.49 / self.sort_count as f64;
+        }
+    }
+
+    /// `thisScene.createLayer(config)`: build object `index` from a
+    /// scene.json-shaped config. Image, solid and text objects only; their
+    /// effects are not instantiated.
+    fn create_object(&mut self, index: usize, config: &serde_json::Value) {
+        use crate::engine::render::Xform;
+        // Keep every per-object table indexed in step with the script side,
+        // even when this object can't be built.
+        let n = index + 1;
+        if self.current_locals.len() < n {
+            self.current_locals.resize(n, Xform::IDENTITY);
+            self.transform_graph.parent.resize(n, None);
+            self.transform_graph.local.resize(n, Xform::IDENTITY);
+            self.transform_graph.name.resize(n, None);
+            self.transform_graph.id.resize(n, None);
+            self.object_visible.resize(n, true);
+            self.propagation_disabled.resize(n, false);
+            let len = self.draw_rank.len();
+            self.draw_rank.extend((len..n).map(|i| i as f64));
+        }
+        let obj: crate::engine::scene::SceneObject = match serde_json::from_value(config.clone()) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(target: "script", "createLayer: bad config: {e}");
+                return;
+            }
+        };
+        if obj.sound.is_some() {
+            if let Some(playback) = start_scene_sound(&self.scene_dir, &obj) {
+                self.sounds.push(SceneSound {
+                    object: index,
+                    playback,
+                });
+            }
+            return;
+        }
+        if self.scene_pkg.is_none() {
+            self.scene_pkg =
+                crate::engine::pkg::Package::from_file(&self.scene_dir.join("scene.pkg")).ok();
+        }
+        let Some(mut layer) =
+            crate::engine::render::runtime_layer(&self.scene_dir, self.scene_pkg.as_ref(), &obj)
+        else {
+            tracing::debug!(target: "script", "createLayer: object {index} has nothing to draw");
+            return;
+        };
+        layer.order_index = index;
+        let local = crate::engine::render::obj_local_xform(&obj);
+        self.current_locals[index] = local;
+        self.transform_graph.local[index] = local;
+        self.transform_graph.name[index] = obj.name.clone();
+        self.object_visible[index] = obj.is_visible();
+        let gpu = gpu_layer_from(
+            &self.renderer,
+            &layer,
+            self.width,
+            self.height,
+            self.zoom,
+            self.camera3d.as_ref(),
+            local.t,
+        );
+        let (ow, oh) = (gpu.object_size.0.max(1), gpu.object_size.1.max(1));
+        let li = self.layers.len();
+        let device = self.renderer.device().clone();
+        self.fbo_pool
+            .get_or_create(&device, &pingpong_key(li, 0), ow, oh);
+        self.fbo_pool
+            .get_or_create(&device, &pingpong_key(li, 1), ow, oh);
+        self.layers.push(gpu);
+    }
+
+    /// Sound controls belonging to scene object `index`.
+    fn sounds_of(&self, index: usize) -> Vec<std::sync::Arc<crate::engine::audio::SoundControl>> {
+        self.sounds
+            .iter()
+            .filter(|s| s.object == index)
+            .map(|s| s.playback.control())
+            .collect()
+    }
+
+    /// Queue new text (or, with `None`, a re-raster at a new point size) for
+    /// a text layer; [`Self::flush_text`] rasterizes it.
+    fn rerasterize_text(&mut self, li: usize, text: Option<&str>) {
+        let layer = &mut self.layers[li];
+        let Some(td) = &layer.text_dynamic else {
+            return;
+        };
+        let new_text = text
+            .map(str::to_string)
+            .or_else(|| layer.pending_text.clone())
+            .unwrap_or_else(|| td.last_text.clone());
+        if new_text.is_empty() || (text.is_some() && new_text == td.last_text) {
+            layer.pending_text = None;
+            return;
+        }
+        layer.pending_text = Some(new_text);
+    }
+
+    /// Rasterize pending text. Throttled per layer to every 100 ms, or every
+    /// 10× the last raster's cost when that is longer, so a script that
+    /// rewrites a huge text block every frame (debug overlays, timers with
+    /// milliseconds) can't stall rendering; the newest text always lands.
+    fn flush_text(&mut self) {
+        let now = Instant::now();
+        for li in 0..self.layers.len() {
+            let layer = &mut self.layers[li];
+            let (Some(text), Some(td)) = (&layer.pending_text, &mut layer.text_dynamic) else {
+                continue;
+            };
+            let wait = (layer.text_raster_cost * 10).max(Duration::from_millis(100));
+            if layer
+                .text_rastered_at
+                .is_some_and(|t| now.duration_since(t) < wait)
+            {
+                continue;
+            }
+            let started = Instant::now();
+            if let Some(img) = crate::engine::text::rasterize(&td.font_data, text, td.point_size) {
+                // The quad keeps its authored box; only the texture changes.
+                layer.frames[0] = self.renderer.upload_texture(&img);
+                td.last_text = text.clone();
+            }
+            layer.text_raster_cost = started.elapsed();
+            layer.text_rastered_at = Some(now);
+            layer.pending_text = None;
+        }
+    }
+
+    /// A layer draws only when its own object and every ancestor are visible.
+    fn refresh_layer_visibility(&mut self) {
+        let parent = &self.transform_graph.parent;
+        let visible = &self.object_visible;
+        let effective = |mut i: usize| -> bool {
+            for _ in 0..64 {
+                if !visible.get(i).copied().unwrap_or(true) {
+                    return false;
+                }
+                match parent.get(i).copied().flatten() {
+                    Some(p) if p != i => i = p,
+                    _ => return true,
+                }
+            }
+            true
+        };
+        for layer in &mut self.layers {
+            layer.visible = effective(layer.order_index);
+        }
+    }
+
+    /// Recompose world transforms from `current_locals` and push them into
+    /// the layers and meshes they move: those whose own object or any
+    /// ancestor `moved`.
+    fn apply_object_transforms(&mut self, moved: &[bool]) {
+        use crate::engine::render::Xform;
+        let n = self.current_locals.len();
+        let parent = self.transform_graph.parent.clone();
+        // affected[i]: object i or an ancestor moved.
+        let mut affected = vec![false; n];
+        for i in 0..n {
+            let mut cur = i;
+            for _ in 0..64 {
+                if moved.get(cur).copied().unwrap_or(false) {
+                    affected[i] = true;
+                    break;
+                }
+                match parent.get(cur).copied().flatten() {
+                    Some(p) if p != cur => cur = p,
+                    _ => break,
+                }
+            }
+        }
+        let locals = self.current_locals.clone();
+        let worlds = self
+            .transform_graph
+            .world(&locals, &self.propagation_disabled);
         // The PARENT's world transform, not the object's own — `worlds[i]`
-        // already folds in object i's local transform, and the layer/mesh
-        // values we apply it to are pre-parent locals. Applying the full world
-        // would compose i's own transform twice. This mirrors exactly what
-        // `apply_parent_transforms` does at load.
-        let parent_world = |i: usize| -> crate::engine::render::Xform {
-            match self.transform_graph.parent.get(i).copied().flatten() {
+        // already folds in object i's local transform.
+        let parent_world = |i: usize| -> Xform {
+            if self.propagation_disabled.get(i).copied().unwrap_or(false) {
+                return Xform::IDENTITY;
+            }
+            match parent.get(i).copied().flatten() {
                 Some(p) if p != i => worlds[p],
                 _ => Xform::IDENTITY,
             }
@@ -3365,24 +4151,35 @@ impl GpuSceneInstance {
 
         // 3D meshes: rebuild the MVP from the recomposed world transform.
         // Computed up front so the write-back can borrow `self.mesh3d` mutably.
-        let mesh_updates: Vec<(Vec<u8>, f32)> = match &self.camera3d {
+        let mesh_updates: Vec<(usize, Vec<u8>, f32)> = match &self.camera3d {
             Some(cam) => self
                 .mesh3d
                 .iter()
+                .filter(|m| affected.get(m.order_index).copied().unwrap_or(false))
                 .map(|m| {
                     let w = parent_world(m.order_index);
-                    let (lo, la, ls) = m.local;
+                    let (lo, la, ls) = match locals.get(m.order_index) {
+                        Some(x) => (
+                            [x.t[0] as f32, x.t[1] as f32, x.t[2] as f32],
+                            [x.r[0] as f32, x.r[1] as f32, x.r[2] as f32],
+                            [x.s[0] as f32, x.s[1] as f32, x.s[2] as f32],
+                        ),
+                        None => m.local,
+                    };
                     let o = w.apply_point([lo[0] as f64, lo[1] as f64, lo[2] as f64]);
                     let centre = [o[0] as f32, o[1] as f32, o[2] as f32];
                     let angles: [f32; 3] = std::array::from_fn(|i| la[i] + w.r[i] as f32);
                     let scale: [f32; 3] = std::array::from_fn(|i| ls[i] * w.s[i] as f32);
                     let bytes = mesh3d_transform_bytes(cam, centre, angles, scale);
-                    (bytes, cam.view_depth(centre))
+                    (m.order_index, bytes, cam.view_depth(centre))
                 })
                 .collect(),
             None => Vec::new(),
         };
-        for (m, (bytes, depth)) in self.mesh3d.iter_mut().zip(mesh_updates) {
+        for (idx, bytes, depth) in mesh_updates {
+            let Some(m) = self.mesh3d.iter_mut().find(|m| m.order_index == idx) else {
+                continue;
+            };
             self.renderer.queue.write_buffer(&m.ubo, 0, &bytes);
             m.depth = depth;
         }
@@ -3392,19 +4189,21 @@ impl GpuSceneInstance {
         // both start from the same recomposed world transform.
         let (w_px, h_px) = (self.width as f64, self.height as f64);
         for layer in &mut self.layers {
-            let w = parent_world(layer.order_index);
-            if w.is_identity() {
+            let i = layer.order_index;
+            if !affected.get(i).copied().unwrap_or(false) {
                 continue;
             }
-            let o = w.apply_point(layer.local_origin);
+            let w = parent_world(i);
+            let local = locals[i];
+            let o = w.apply_point(std::array::from_fn(|k| local.t[k] + layer.align_offset[k]));
             let size_px = [
-                layer.effective_size[0] * layer.local_scale[0] * w.s[0],
-                layer.effective_size[1] * layer.local_scale[1] * w.s[1],
+                layer.effective_size[0] * local.s[0] * w.s[0],
+                layer.effective_size[1] * local.s[1] * w.s[1],
             ];
+            let local_angles: [f32; 3] = std::array::from_fn(|k| local.r[k] as f32);
             match &self.camera3d {
                 Some(cam) => {
-                    let angles: [f32; 3] =
-                        std::array::from_fn(|i| layer.local_angles[i] + w.r[i] as f32);
+                    let angles: [f32; 3] = std::array::from_fn(|k| local_angles[k] + w.r[k] as f32);
                     let centre = [o[0] as f32, o[1] as f32, o[2] as f32];
                     let (rect, depth) = project_quad_ndc(cam, centre, angles, size_px);
                     layer.rect = rect;
@@ -3422,7 +4221,7 @@ impl GpuSceneInstance {
                         (size_px[0] / w_px) as f32 * z,
                         (size_px[1] / h_px) as f32 * z,
                     ];
-                    layer.angle = -(layer.local_angles[2] + w.r[2] as f32);
+                    layer.angle = -(local_angles[2] + w.r[2] as f32);
                 }
             }
         }
@@ -3502,6 +4301,11 @@ impl GpuSceneInstance {
     /// Feed pointer position in [0,1]² (drives camera parallax).
     pub fn set_mouse(&mut self, norm: [f32; 2]) {
         self.mouse_norm = norm;
+        // Scene space is Y-up with the origin bottom-left.
+        self.cursor_scene = [
+            norm[0] * self.width as f32,
+            (1.0 - norm[1]) * self.height as f32,
+        ];
     }
 
     /// Render the next frame into the internal scene target.
@@ -3511,179 +4315,8 @@ impl GpuSceneInstance {
         self.last_time = time;
         let dynamics = self.dynamics.update(time, delta, self.mouse_norm);
 
-        // Tick SceneScript-driven properties for this frame. `engine.timeOfDay`
-        // is fractional hours in [0,24); we derive it from the wall clock (UTC
-        // for now — local-time zoning is a follow-up).
-        {
-            let secs_into_day = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() % 86_400)
-                .unwrap_or(0);
-            let time_of_day = secs_into_day as f32 / 3600.0;
-            let (w, h, persp) = (self.width, self.height, self.perspective);
-            // Every scene object's current name/id/transform, for
-            // `thisScene.getLayer(...)` (the object-attachment API — see
-            // `engine::script::OBJECT_ATTACHMENT_API_JS`) to search. Built
-            // from last frame's resolved locals (`update_parent_transforms`,
-            // which refreshes them, runs later this same frame) — one frame
-            // of staleness here, same as every other cross-script read in
-            // this codebase (e.g. the `shared` object's declaration-order
-            // dependency, documented below).
-            let layer_snapshots: Vec<crate::engine::script::LayerSnapshot> = self
-                .transform_graph
-                .name
-                .iter()
-                .zip(self.transform_graph.id.iter())
-                .zip(self.current_locals.iter())
-                .map(|((name, id), xform)| crate::engine::script::LayerSnapshot {
-                    name: name.as_deref(),
-                    id: *id,
-                    origin: [xform.t[0] as f32, xform.t[1] as f32, xform.t[2] as f32],
-                    angles: [xform.r[0] as f32, xform.r[1] as f32, xform.r[2] as f32],
-                    scale: [xform.s[0] as f32, xform.s[1] as f32, xform.s[2] as f32],
-                })
-                .collect();
-            #[cfg(target_os = "linux")]
-            let media_update = self.media.as_ref().and_then(|w| w.try_recv());
-            let ctx = &mut self.script_ctx;
-            // `delta`, not `time - self.last_time`: last_time was already
-            // advanced to `time` above, so that expression is always exactly 0
-            // and every `engine.frametime` script silently multiplied by zero.
-            ctx.set_time(time, time_of_day, delta);
-            ctx.set_layers(&layer_snapshots);
-            #[cfg(target_os = "linux")]
-            if let Some(info) = media_update {
-                use crate::engine::media::PlaybackState;
-                ctx.set_media(
-                    info.available,
-                    match info.playback_state {
-                        PlaybackState::Stopped => 0,
-                        PlaybackState::Playing => 1,
-                        PlaybackState::Paused => 2,
-                    },
-                    &info.title,
-                    &info.artist,
-                    &info.album,
-                    info.position_us,
-                    info.duration_us,
-                    info.art_url.as_deref(),
-                );
-            }
-            for layer in &mut self.layers {
-                // Refreshes `thisLayer` so this object's own scripts can use
-                // the object-attachment API (`lookAt`, `setParent`,
-                // `getTransformMatrix`, etc.) against real data.
-                ctx.set_current_object(
-                    self.transform_graph
-                        .name
-                        .get(layer.order_index)
-                        .and_then(|n| n.as_deref()),
-                    layer.object_id,
-                    [
-                        layer.origin_base[0] as f32,
-                        layer.origin_base[1] as f32,
-                        layer.origin_base[2] as f32,
-                    ],
-                    layer.angles_base,
-                    layer.scale_base,
-                    layer.parallax_depth,
-                );
-                if let Some(script) = &layer.alpha_script {
-                    layer.alpha = ctx
-                        .eval_update(script, layer.alpha_base)
-                        .unwrap_or(layer.alpha_base);
-                }
-                // Transform scripts. `visible` gates the draw; scale/origin
-                // rebuild `rect`; angles rebuilds `angle`. The rect rebuild is
-                // 2D-only (perspective layers keep their camera-projected rect).
-                // Each script borrow is scoped to its eval so the `rect`/`angle`
-                // writes below don't overlap it.
-                if let Some(v) = layer
-                    .transform_scripts
-                    .visible
-                    .as_ref()
-                    .and_then(|s| ctx.eval_update_bool(s, layer.visible_base))
-                {
-                    layer.visible = v;
-                }
-                if !persp
-                    && (layer.transform_scripts.scale.is_some()
-                        || layer.transform_scripts.origin.is_some())
-                {
-                    let scale = match &layer.transform_scripts.scale {
-                        Some(s) => ctx
-                            .eval_update_vec3(s, layer.scale_base)
-                            .unwrap_or(layer.scale_base),
-                        None => layer.scale_base,
-                    };
-                    let origin_base = [
-                        layer.origin_base[0] as f32,
-                        layer.origin_base[1] as f32,
-                        layer.origin_base[2] as f32,
-                    ];
-                    let origin = match &layer.transform_scripts.origin {
-                        Some(s) => ctx.eval_update_vec3(s, origin_base).unwrap_or(origin_base),
-                        None => origin_base,
-                    };
-                    let size_px = [
-                        layer.effective_size[0] * scale[0] as f64,
-                        layer.effective_size[1] * scale[1] as f64,
-                    ];
-                    layer.rect = [
-                        (2.0 * origin[0] as f64 / w as f64 - 1.0) as f32,
-                        (2.0 * origin[1] as f64 / h as f64 - 1.0) as f32,
-                        (size_px[0] / w as f64) as f32,
-                        (size_px[1] / h as f64) as f32,
-                    ];
-                }
-                if !persp {
-                    if let Some(a) = layer
-                        .transform_scripts
-                        .angles
-                        .as_ref()
-                        .and_then(|s| ctx.eval_update_vec3(s, layer.angles_base))
-                    {
-                        layer.angle = -a[2];
-                    }
-                }
-                // Script-driven text: re-evaluate; only a CHANGED string pays
-                // for rasterization + upload (a clock re-rasterizes once per
-                // displayed unit — second or minute — not per frame).
-                if let Some(td) = &mut layer.text_dynamic {
-                    if let Some(new_text) = ctx.eval_update_string(
-                        &td.script,
-                        &td.last_text,
-                        td.script_properties.as_ref(),
-                    ) {
-                        if new_text != td.last_text && !new_text.is_empty() {
-                            if let Some(img) = crate::engine::text::rasterize(
-                                &td.font_data,
-                                &new_text,
-                                td.point_size,
-                            ) {
-                                // The quad's rect was sized at build to the
-                                // object's authored `size` box and projected
-                                // through the camera/parent transform; the text
-                                // bitmap is stretched to fill it. A content
-                                // change only swaps that texture — the quad
-                                // stays put, so leave `rect` untouched (the old
-                                // per-change ortho recompute is what moved the
-                                // clock off-screen / shrank it).
-                                // ponytail: fixed authored-size quad — right for
-                                // the clock/date (constant-width). Text that
-                                // must grow to fit would need its box re-fit.
-                                layer.frames[0] = self.renderer.upload_texture(&img);
-                                td.last_text = new_text;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Recompose parent chains now that this frame's scripts have run —
-        // a scripted parent moves its whole subtree.
-        self.update_parent_transforms();
+        self.tick_timelines(delta);
+        self.tick_scripts(time, delta);
 
         // Refresh the g_AudioSpectrum* UBO from the latest captured window, and
         // drive audio-reactive particle emitters from the overall loudness.
@@ -3694,9 +4327,10 @@ impl GpuSceneInstance {
                 0,
                 &spectrum.to_uniform_bytes(),
             );
-            let level = spectrum.average_level();
+            let bands =
+                std::array::from_fn(|i| (spectrum.s16_left[i] + spectrum.s16_right[i]) * 0.5);
             for system in &mut self.particle_systems {
-                system.set_audio_level(level);
+                system.set_audio_bands(bands);
             }
         }
 
@@ -3796,7 +4430,8 @@ impl GpuSceneInstance {
                     .map(|(i, m)| (m.order_index, DrawItem::Mesh(i))),
             )
             .collect();
-        items.sort_by_key(|(order, _)| *order);
+        let rank = |order: usize| self.draw_rank.get(order).copied().unwrap_or(order as f64);
+        items.sort_by(|(a, _), (b, _)| rank(*a).total_cmp(&rank(*b)));
 
         if self.perspective {
             // Painter's algorithm for 3D scenes: draw image layers strictly
@@ -3869,9 +4504,12 @@ impl GpuSceneInstance {
         time: f32,
         dynamics: CameraFrameDynamics,
     ) {
+        self.capture_backdrop(encoder, layer_idx);
         {
             let layer = &self.layers[layer_idx];
-            let frame_idx = if layer.frames.len() > 1 && layer.frame_duration_ms > 0 {
+            let frame_idx = if let Some(f) = layer.script_frame {
+                f.min(layer.frames.len() - 1)
+            } else if layer.frames.len() > 1 && layer.frame_duration_ms > 0 {
                 ((time * 1000.0 / layer.frame_duration_ms as f32) as usize) % layer.frames.len()
             } else {
                 0
@@ -3917,7 +4555,8 @@ impl GpuSceneInstance {
             let has_effects = self
                 .scene_effects
                 .iter()
-                .any(|inst| inst.layer_idx == obj_index);
+                .zip(&self.effect_enabled)
+                .any(|(inst, on)| *on && inst.layer_idx == obj_index);
 
             // Base material pass (genericimage3-equivalent): reference always
             // renders `texture * g_Color4` into the object's own FBO *before*
@@ -3970,7 +4609,7 @@ impl GpuSceneInstance {
                 .scene_effects
                 .iter()
                 .enumerate()
-                .filter(|(_, inst)| inst.layer_idx == obj_index)
+                .filter(|(k, inst)| inst.layer_idx == obj_index && self.effect_enabled[*k])
             {
                 let Some(runtime) = self
                     .effect_runtimes
@@ -4180,24 +4819,27 @@ impl GpuSceneInstance {
                     params.extend_from_slice(&f.to_le_bytes());
                 }
                 let quad3d_buf = self.renderer.make_uniform_buffer(&params, 80);
-                let quad3d_bg = self.renderer.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("quad3d_bg"),
-                    layout: &self.renderer.quad3d_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: quad3d_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&src_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(layer_sampler),
-                        },
-                    ],
-                });
+                let quad3d_bg =
+                    self.renderer
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("quad3d_bg"),
+                            layout: &self.renderer.quad3d_bgl,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: quad3d_buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::TextureView(&src_view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::Sampler(layer_sampler),
+                                },
+                            ],
+                        });
                 (&self.renderer.quad3d_pipeline, quad3d_bg)
             } else {
                 let composite_buf = self.renderer.make_uniform_buffer(
@@ -4545,7 +5187,11 @@ impl GpuSceneInstance {
     /// and the Ghidra report's `_rt_volumetrics*` follow-up. A no-op unless
     /// `self.volumetrics_bind_group` is `Some` (a `castvolumetrics` light
     /// exists) — checked by the one caller, `render()`.
-    fn record_volumetrics(&self, encoder: &mut wgpu::CommandEncoder, target_view: &wgpu::TextureView) {
+    fn record_volumetrics(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+    ) {
         let Some(vol_bg) = &self.volumetrics_bind_group else {
             return;
         };
@@ -4773,17 +5419,25 @@ impl GpuSceneInstance {
         format: wgpu::TextureFormat,
     ) {
         self.render();
+        let full = crate::render::settings::FULL_REGION;
+        self.present_region(view, format, (view_w, view_h), full);
+    }
 
-        // Aspect-fill (cover): sample a centered sub-rect of the scene.
-        let scene_aspect = self.width as f32 / self.height as f32;
-        let view_aspect = view_w.max(1) as f32 / view_h.max(1) as f32;
-        let (uv_scale, uv_offset) = if view_aspect >= scene_aspect {
-            let sy = scene_aspect / view_aspect;
-            ([1.0f32, sy], [0.0f32, (1.0 - sy) * 0.5])
-        } else {
-            let sx = view_aspect / scene_aspect;
-            ([sx, 1.0f32], [(1.0 - sx) * 0.5, 0.0f32])
-        };
+    /// Blit the last rendered frame into `view`, which shows `region` of a
+    /// `canvas` the scene is aspect-filled into (a spanned or cloned
+    /// wallpaper renders once and presents to every monitor this way).
+    pub fn present_region(
+        &mut self,
+        view: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        canvas: (u32, u32),
+        region: [f32; 4],
+    ) {
+        let (uv_scale, uv_offset) = crate::render::ScaleMode::Fill.uv_transform_region(
+            (self.width, self.height),
+            canvas,
+            region,
+        );
         let mut params = [0u8; 16];
         params[0..4].copy_from_slice(&uv_scale[0].to_le_bytes());
         params[4..8].copy_from_slice(&uv_scale[1].to_le_bytes());
@@ -4829,12 +5483,9 @@ fn named_fbo_key(instance_idx: usize, fbo_name: &str) -> String {
 }
 
 /// Fraction of the local day in [0,1) (the reference's g_Daytime).
+/// `g_Daytime`: fraction of the local day elapsed.
 fn daytime_fraction() -> f32 {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    ((secs % 86_400) as f32) / 86_400.0
+    crate::engine::script::local_time_of_day()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5411,6 +6062,66 @@ pub fn gpu_scene_render_loop(
     }
 }
 
+/// The unresolved scene.json, the wallpaper's user properties, and the scene
+/// as last resolved against them.
+struct LiveProps {
+    dir: std::path::PathBuf,
+    raw: serde_json::Value,
+    props: crate::engine::properties::SceneProperties,
+    resolved: serde_json::Value,
+}
+
+impl LiveProps {
+    fn new(dir: &Path, raw: &serde_json::Value) -> Self {
+        let props = crate::engine::properties::SceneProperties::from_project_dir(dir);
+        let mut resolved = raw.clone();
+        props.resolve_scene_json(&mut resolved);
+        Self {
+            dir: dir.to_path_buf(),
+            raw: raw.clone(),
+            props,
+            resolved,
+        }
+    }
+}
+
+/// Collect the leaves that differ between `a` and `b` as (path, new value).
+/// A `{"user": …}` binding counts as one leaf, as do arrays that changed
+/// length.
+fn changed_leaves(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+    path: &mut Vec<String>,
+    out: &mut Vec<(Vec<String>, serde_json::Value)>,
+) {
+    use serde_json::Value;
+    if a == b {
+        return;
+    }
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) if !y.contains_key("user") => {
+            for k in x.keys().chain(y.keys().filter(|k| !x.contains_key(*k))) {
+                path.push(k.clone());
+                changed_leaves(
+                    x.get(k).unwrap_or(&Value::Null),
+                    y.get(k).unwrap_or(&Value::Null),
+                    path,
+                    out,
+                );
+                path.pop();
+            }
+        }
+        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => {
+            for (i, (p, q)) in x.iter().zip(y).enumerate() {
+                path.push(i.to_string());
+                changed_leaves(p, q, path, out);
+                path.pop();
+            }
+        }
+        _ => out.push((path.clone(), b.clone())),
+    }
+}
+
 type ShaderVals = std::collections::HashMap<String, f32>;
 
 /// Insert a constant under every spelling the packer might look up: the raw
@@ -5469,7 +6180,7 @@ fn collect_effects(scene: &crate::engine::model::SceneModel) -> Vec<EffectInstan
         if !obj.is_visible() {
             continue;
         }
-        for eff in &obj.effects {
+        for (effect_index, eff) in obj.effects.iter().enumerate() {
             if !eff.visible {
                 continue;
             }
@@ -5506,6 +6217,7 @@ fn collect_effects(scene: &crate::engine::model::SceneModel) -> Vec<EffectInstan
 
             result.push(EffectInstanceDef {
                 layer_idx: i,
+                effect_index,
                 name,
                 file: file.clone(),
                 pass_overrides,
@@ -5798,6 +6510,555 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
     }
 }
 
+/// Upload one CPU `Layer` and derive its GPU-side quad. `authored_origin` is
+/// the object's scene.json origin, before alignment.
+fn gpu_layer_from(
+    renderer: &GpuSceneRenderer,
+    l: &crate::engine::render::Layer,
+    w: u32,
+    h: u32,
+    zoom: f32,
+    camera3d: Option<&crate::engine::camera3d::PerspectiveCamera>,
+    authored_origin: [f64; 3],
+) -> SceneLayerGpu {
+    let all_frames: Vec<&RgbaImage> = std::iter::once(&l.image)
+        .chain(l.extra_frames.iter())
+        .collect();
+    // Textures stay at native resolution; the composite quad and
+    // sampler handle scaling to the object's on-screen size.
+    let mut frames: Vec<wgpu::Texture> = all_frames
+        .iter()
+        .map(|frame| renderer.upload_texture(frame))
+        .collect();
+
+    // Unscaled object size: explicit scene.json size, else the
+    // texture's native resolution (CImage.cpp lines 213-222).
+    // True scene-fullscreen layers (models/util/fullscreenlayer.json
+    // etc.) never reach here — they're filtered out upstream by
+    // `is_special_layer` — so an unspecified size always means
+    // "use the texture's own dimensions", never "cover the scene".
+    let effective_size = if l.size[0] > 0.0 && l.size[1] > 0.0 {
+        [l.size[0], l.size[1]]
+    } else {
+        [l.image.width() as f64, l.image.height() as f64]
+    };
+    let object_size = (
+        effective_size[0].round() as u32,
+        effective_size[1].round() as u32,
+    );
+
+    // Object quad rect in NDC. WE origins are absolute scene
+    // coordinates (Y-up, bottom-left origin) pointing at the
+    // object's center.
+    let size_px = [
+        effective_size[0] * l.scale[0],
+        effective_size[1] * l.scale[1],
+    ];
+    let (rect, angle, depth, quad_corners) = if let Some(cam) = camera3d {
+        let center = [l.origin[0] as f32, l.origin[1] as f32, l.origin[2] as f32];
+        let (rect, depth) = project_quad_ndc(cam, center, l.angles, size_px);
+        let quad_corners = project_quad_corners(cam, center, l.angles, size_px);
+        (rect, 0.0, depth, quad_corners)
+    } else {
+        // `general.zoom` scales the whole scene about its center;
+        // NDC (0,0) is the scene center, so a uniform rect scale
+        // does it (center and half-extent both × zoom).
+        let rect = [
+            (2.0 * l.origin[0] / w as f64 - 1.0) as f32 * zoom,
+            (2.0 * l.origin[1] / h as f64 - 1.0) as f32 * zoom,
+            (size_px[0] / w as f64) as f32 * zoom,
+            (size_px[1] / h as f64) as f32 * zoom,
+        ];
+        (rect, l.angle, 0.0, None)
+    };
+
+    // A backdrop layer's texture is a copy of the scene under its quad,
+    // sized to that on-screen region.
+    if l.backdrop.is_some() {
+        let px = (
+            ((rect[2] * w as f32).round() as u32).clamp(1, w.max(1)),
+            ((rect[3] * h as f32).round() as u32).clamp(1, h.max(1)),
+        );
+        frames = vec![renderer.create_render_target(px.0, px.1)];
+    }
+    SceneLayerGpu {
+        frames,
+        puppet: l.puppet.clone(),
+        puppet_posed_at: 0.0,
+        video: l.video.clone(),
+        blend_mode: l.blend_mode,
+        alpha: l.alpha,
+        text_dynamic: l.text_dynamic.clone(),
+        color: l.color,
+        brightness: l.brightness,
+        frame_duration_ms: l.frame_duration_ms,
+        parallax_depth: [l.parallax_depth[0] as f32, l.parallax_depth[1] as f32],
+        angle,
+        rect,
+        quad_corners,
+        depth,
+        object_size,
+        no_interpolation: l.no_interpolation,
+        clamp_uvs: l.clamp_uvs,
+        order_index: l.order_index,
+        object_id: l.object_id,
+        visible: l.visible_base,
+        effective_size,
+        align_offset: std::array::from_fn(|i| l.local_origin[i] - authored_origin[i]),
+        script_frame: None,
+        backdrop: l.backdrop,
+        pending_text: None,
+        text_rastered_at: None,
+        text_raster_cost: Duration::ZERO,
+    }
+}
+
+/// A layer quad's corners in output pixels (Y-up, centred), from its NDC
+/// `rect` (centre, half-extent) and z-rotation.
+fn quad_corners_px(rect: [f32; 4], angle: f32, w: f32, h: f32) -> [[f32; 2]; 4] {
+    let (cx, cy) = (rect[0] * w * 0.5, rect[1] * h * 0.5);
+    let (hx, hy) = (rect[2] * w * 0.5, rect[3] * h * 0.5);
+    let (s, c) = angle.sin_cos();
+    [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]]
+        .map(|[x, y]| [cx + x * c - y * s, cy + x * s + y * c])
+}
+
+/// Whether `p` lies inside the convex quad `q` (either winding).
+fn point_in_convex_quad(p: [f32; 2], q: &[[f32; 2]; 4]) -> bool {
+    let mut sign = 0.0f32;
+    for i in 0..4 {
+        let a = q[i];
+        let b = q[(i + 1) % 4];
+        let cross = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+        if cross.abs() < f32::EPSILON {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if cross.signum() != sign {
+            return false;
+        }
+    }
+    sign != 0.0
+}
+
+#[cfg(test)]
+mod hit_tests {
+    use super::*;
+
+    #[test]
+    fn hit_test_geometry() {
+        // A 200x100 px quad centred at (100, 50) px in a 1000x500 output.
+        let rect = [0.2, 0.2, 0.2, 0.2];
+        let q = quad_corners_px(rect, 0.0, 1000.0, 500.0);
+        assert!(point_in_convex_quad([100.0, 50.0], &q));
+        assert!(point_in_convex_quad([199.0, 74.0], &q));
+        assert!(!point_in_convex_quad([201.0, 50.0], &q));
+        // Rotated 90°: the long axis is now vertical.
+        let q = quad_corners_px(rect, std::f32::consts::FRAC_PI_2, 1000.0, 500.0);
+        assert!(point_in_convex_quad([100.0, 140.0], &q));
+        assert!(!point_in_convex_quad([190.0, 50.0], &q));
+    }
+    /// Debug aid: run a scene's scripts headlessly (no GPU) for a few
+    /// frames and print every script log line. `WP_SCRIPT_SCENE=<id|dir>`.
+    #[test]
+    #[ignore]
+    fn run_scene_scripts() {
+        let Ok(target) = std::env::var("WP_SCRIPT_SCENE") else {
+            return;
+        };
+        let dir = crate::workshop::find_item_dir(&target, None)
+            .unwrap_or_else(|| std::path::PathBuf::from(&target));
+        let resolved = crate::engine::render::ResolvedScene::from_directory(&dir).unwrap();
+        let raw_scene: serde_json::Value = crate::engine::assets::AssetStore::from_directory(&dir)
+            .ok()
+            .and_then(|a| a.scene_json().ok())
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let mut host = build_script_host(
+            &dir,
+            &resolved.scene,
+            &resolved.transform_graph,
+            [resolved.width, resolved.height],
+            &raw_scene,
+        );
+        for f in 0..30 {
+            host.frame(f as f32 * 0.5, 0.5, 0.5);
+            let c = host.collect();
+            if f == 0 {
+                eprintln!(
+                    "frame 0: {} objects changed, {} commands",
+                    c.objects.len(),
+                    c.commands.len()
+                );
+            }
+        }
+    }
+
+    /// A real intro sequence (3453730450): layers keyed to fade in over the
+    /// first ~13 s start hidden and end fully visible.
+    #[test]
+    #[ignore]
+    fn keyframed_alpha_fades_in() {
+        let Some(dir) = crate::workshop::find_item_dir("3453730450", None) else {
+            eprintln!("workshop item 3453730450 not installed; skipping");
+            return;
+        };
+        let mut scene = GpuSceneInstance::open(&dir).expect("scene loads");
+        let animated: Vec<usize> = scene
+            .timelines
+            .iter()
+            .filter(|t| t.key == "alpha")
+            .map(|t| t.object)
+            .collect();
+        assert!(!animated.is_empty());
+        let alpha_of = |s: &GpuSceneInstance, o: usize| {
+            s.layers
+                .iter()
+                .find(|l| l.order_index == o)
+                .map(|l| l.alpha)
+        };
+        scene.tick_timelines(0.1);
+        let early: Vec<f32> = animated
+            .iter()
+            .filter_map(|o| alpha_of(&scene, *o))
+            .collect();
+        assert!(
+            early.iter().all(|a| *a < 0.05),
+            "hidden at start: {early:?}"
+        );
+        for _ in 0..140 {
+            scene.tick_timelines(0.1);
+        }
+        let late: Vec<f32> = animated
+            .iter()
+            .filter_map(|o| alpha_of(&scene, *o))
+            .collect();
+        assert!(
+            late.iter().filter(|a| **a > 0.3).count() >= late.len() - 1,
+            "faded in: {late:?}"
+        );
+    }
+
+    #[test]
+    fn changed_leaves_stops_at_user_bindings() {
+        let a = serde_json::json!({"visible": {"user": "grid", "value": false},
+            "effects": [{"passes": [{"constantshadervalues": {"speed": 1}}]}], "name": "x"});
+        let b = serde_json::json!({"visible": {"user": "grid", "value": true},
+            "effects": [{"passes": [{"constantshadervalues": {"speed": 2}}]}], "name": "x"});
+        let mut out = Vec::new();
+        changed_leaves(&a, &b, &mut Vec::new(), &mut out);
+        let paths: Vec<String> = out.iter().map(|(p, _)| p.join(".")).collect();
+        assert_eq!(
+            paths,
+            ["effects.0.passes.0.constantshadervalues.speed", "visible"]
+        );
+        assert_eq!(out[1].1["value"], true);
+    }
+
+    /// A user setting bound to layer visibility (2156479578: `grid` shows
+    /// the Grid layer) applies live, without rebuilding the scene.
+    #[test]
+    #[ignore]
+    fn bool_setting_toggles_a_layer_live() {
+        let Some(dir) = crate::workshop::find_item_dir("2156479578", None) else {
+            eprintln!("workshop item 2156479578 not installed; skipping");
+            return;
+        };
+        let mut scene = GpuSceneInstance::open(&dir).expect("scene loads");
+        let before = scene.object_visible[4];
+        let flipped = if before { "0" } else { "1" };
+        assert!(
+            {
+                let mut props = scene.live_props.props.clone();
+                props.apply_overrides(HashMap::from([("grid".to_string(), flipped.to_string())]));
+                scene.apply_user_properties(props, &["grid".to_string()])
+            },
+            "applied live"
+        );
+        assert_eq!(scene.object_visible[4], !before);
+        scene.render();
+    }
+
+    /// End to end against a real Workshop scene with clickable layers
+    /// (2348914357: clicking the radio/music buttons toggles them). Needs
+    /// the item installed and a GPU, hence ignored by default.
+    #[test]
+    #[ignore]
+    fn clicking_a_scripted_button_toggles_it() {
+        let Some(dir) = crate::workshop::find_item_dir("2348914357", None) else {
+            eprintln!("workshop item 2348914357 not installed; skipping");
+            return;
+        };
+        let mut scene = GpuSceneInstance::open(&dir).expect("scene loads");
+        assert!(!scene.cursor_targets.is_empty(), "scene has click targets");
+        scene.render();
+        let target = scene
+            .layers
+            .iter()
+            .find(|l| scene.cursor_targets.contains(&l.order_index))
+            .expect("a click target has a layer");
+        let (idx, before) = (target.order_index, scene.object_visible[target.order_index]);
+        let norm = [(target.rect[0] + 1.0) * 0.5, (1.0 - target.rect[1]) * 0.5];
+        assert_eq!(
+            scene.hit_test(norm),
+            Some(idx),
+            "hit test finds the target at its centre"
+        );
+        scene.set_mouse(norm);
+        scene.render();
+        scene.set_mouse_button(true);
+        scene.set_mouse_button(false);
+        scene.render();
+        assert_eq!(
+            scene.object_visible[idx], !before,
+            "the click toggled the layer"
+        );
+    }
+}
+
+/// One property's keyframe animation on one object.
+struct TimelineEntry {
+    object: usize,
+    /// `origin`/`alpha`/…, or a script-style extra key (`instance.rate`,
+    /// `effects.<e>.<pass>.<constant>`).
+    key: String,
+    /// Base value, which transform keyframes are offsets from.
+    base: Vec<f32>,
+    anim: crate::engine::timeline::PropertyAnimation,
+    /// Last value applied, to skip re-applying an idle animation.
+    last: Option<Vec<f32>>,
+}
+
+/// Collect every animated property from the raw scene.json objects.
+fn build_timelines(
+    raw_scene: &serde_json::Value,
+    graph: &crate::engine::render::TransformGraph,
+) -> Vec<TimelineEntry> {
+    use crate::engine::timeline::PropertyAnimation;
+    let mut out = Vec::new();
+    let objects = raw_scene.get("objects").and_then(|o| o.as_array());
+    for (i, raw) in objects.into_iter().flatten().enumerate() {
+        let mut props: Vec<(String, &serde_json::Value)> =
+            ["origin", "scale", "angles", "alpha", "color", "brightness"]
+                .iter()
+                .filter_map(|k| raw.get(*k).map(|v| (k.to_string(), v)))
+                .collect();
+        if let Some(m) = raw.get("instanceoverride").and_then(|v| v.as_object()) {
+            props.extend(m.iter().map(|(k, v)| (format!("instance.{k}"), v)));
+        }
+        for (e, eff) in raw
+            .get("effects")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            for (p, pass) in eff
+                .get("passes")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if let Some(m) = pass.get("constantshadervalues").and_then(|v| v.as_object()) {
+                    props.extend(m.iter().map(|(k, v)| (format!("effects.{e}.{p}.{k}"), v)));
+                }
+            }
+        }
+        for (key, value) in props {
+            let Some(anim) = value
+                .get("animation")
+                .and_then(|a| PropertyAnimation::parse(&key, a))
+            else {
+                continue;
+            };
+            let local = graph
+                .local
+                .get(i)
+                .copied()
+                .unwrap_or(crate::engine::render::Xform::IDENTITY);
+            let base: Vec<f32> = match key.as_str() {
+                "origin" => local.t.iter().map(|v| *v as f32).collect(),
+                "scale" => local.s.iter().map(|v| *v as f32).collect(),
+                "angles" => local.r.iter().map(|v| *v as f32).collect(),
+                _ => Vec::new(),
+            };
+            out.push(TimelineEntry {
+                object: i,
+                key,
+                base,
+                anim,
+                last: None,
+            });
+        }
+    }
+    out
+}
+
+/// Build the scene's SceneScript runtime: one layer proxy per scene object
+/// (indexed like `scene.objects`, the same index `order_index` and the
+/// transform graph use), then one instance per scripted property.
+fn build_script_host(
+    dir: &Path,
+    scene: &crate::engine::scene::Scene,
+    graph: &crate::engine::render::TransformGraph,
+    canvas: [u32; 2],
+    raw_scene: &serde_json::Value,
+) -> crate::engine::script::ScriptHost {
+    use crate::engine::scene::{parse_value_f32, parse_value_vec3};
+    use crate::engine::script::{ObjectInit, ScriptHost};
+
+    let mut host = ScriptHost::new();
+    if scene.objects.iter().all(|o| o.scripts().is_empty()) {
+        return host;
+    }
+    if let Some(path) = ScriptHost::storage_path_for(dir) {
+        host = host.with_storage(path);
+    }
+    // The raw scene.json entries back `thisScene.getInitialLayerConfig`.
+    let raw_objects: Vec<serde_json::Value> = raw_scene
+        .get("objects")
+        .and_then(|o| o.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(general) = raw_scene.get("general") {
+        host.set_scene_general(general);
+    }
+
+    let user_props: serde_json::Map<String, serde_json::Value> =
+        crate::engine::properties::SceneProperties::from_project_dir(dir)
+            .iter()
+            .map(|p| (p.name.clone(), p.value.clone()))
+            .collect();
+    host.set_scene_info(
+        [canvas[0] as f32, canvas[1] as f32],
+        canvas,
+        &serde_json::Value::Object(user_props),
+    );
+
+    let f32v = |v: [f64; 3]| [v[0] as f32, v[1] as f32, v[2] as f32];
+    for (i, obj) in scene.objects.iter().enumerate() {
+        let local = graph
+            .local
+            .get(i)
+            .copied()
+            .unwrap_or(crate::engine::render::Xform::IDENTITY);
+        let text = obj.text.as_ref().and_then(|t| match t {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(m) => {
+                m.get("value").and_then(|v| v.as_str()).map(str::to_string)
+            }
+            _ => None,
+        });
+        let init = ObjectInit {
+            name: obj.name.clone(),
+            id: obj.id,
+            origin: f32v(local.t),
+            angles: f32v(local.r),
+            scale: f32v(local.s),
+            size: f32v(obj.parsed_size()),
+            color: obj
+                .color
+                .as_ref()
+                .and_then(parse_value_vec3)
+                .map(f32v)
+                .unwrap_or([1.0; 3]),
+            visible: obj.is_visible(),
+            alpha: obj.alpha.as_ref().and_then(parse_value_f32).unwrap_or(1.0),
+            brightness: obj
+                .brightness
+                .as_ref()
+                .and_then(parse_value_f32)
+                .unwrap_or(1.0),
+            text,
+            pointsize: obj
+                .pointsize
+                .as_ref()
+                .and_then(parse_value_f32)
+                .unwrap_or(32.0),
+            volume: obj.volume.as_ref().and_then(parse_value_f32).unwrap_or(1.0),
+            parallax_depth: obj
+                .parallax_depth
+                .as_ref()
+                .and_then(parse_value_vec3)
+                .map(|v| [v[0] as f32, v[1] as f32])
+                .unwrap_or([0.0; 2]),
+            parent_index: graph.parent.get(i).copied().flatten(),
+            frame_count: 1,
+            raw: raw_objects.get(i).cloned(),
+        };
+        host.register_object(i, &init);
+    }
+
+    for (i, obj) in scene.objects.iter().enumerate() {
+        let props: [(&str, Option<&serde_json::Value>); 10] = [
+            ("visible", obj.visible.as_ref()),
+            ("origin", obj.origin.as_ref()),
+            ("angles", obj.angles.as_ref()),
+            ("scale", obj.scale.as_ref()),
+            ("alpha", obj.alpha.as_ref()),
+            ("color", obj.color.as_ref()),
+            ("brightness", obj.brightness.as_ref()),
+            ("text", obj.text.as_ref()),
+            ("pointsize", obj.pointsize.as_ref()),
+            ("volume", obj.volume.as_ref()),
+        ];
+        for (prop, value) in props {
+            if let Some((script, authored)) = crate::engine::script::scripted(value) {
+                host.attach(i, Some(prop), script, authored);
+            }
+        }
+        // Scripted particle overrides and effect constants/visibility, read
+        // from the raw entry (the typed model drops their scripts).
+        let Some(raw) = raw_objects.get(i) else {
+            continue;
+        };
+        let mut extras: Vec<(String, &serde_json::Value)> = Vec::new();
+        if let Some(m) = raw.get("instanceoverride").and_then(|v| v.as_object()) {
+            extras.extend(m.iter().map(|(k, v)| (format!("instance.{k}"), v)));
+        }
+        for (e, eff) in raw
+            .get("effects")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            if let Some(v) = eff.get("visible") {
+                extras.push((format!("effects.{e}.visible"), v));
+            }
+            for (p, pass) in eff
+                .get("passes")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if let Some(m) = pass.get("constantshadervalues").and_then(|v| v.as_object()) {
+                    extras.extend(m.iter().map(|(k, v)| (format!("effects.{e}.{p}.{k}"), v)));
+                }
+            }
+        }
+        for (key, value) in extras {
+            if let Some((script, authored)) = crate::engine::script::scripted(Some(value)) {
+                let initial = value
+                    .get("value")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                host.declare_property(
+                    i,
+                    &key,
+                    crate::engine::script::value_kind(&initial),
+                    &initial,
+                );
+                host.attach(i, Some(&key), script, authored);
+            }
+        }
+    }
+    host
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5881,7 +7142,9 @@ mod tests {
     fn project_quad_corners_none_when_behind_camera() {
         let cam = quad3d_test_camera();
         // Eye is at z=10 looking toward the origin; z=20 is behind it.
-        assert!(project_quad_corners(&cam, [0.0, 0.0, 20.0], [0.0, 0.0, 0.0], [4.0, 2.0]).is_none());
+        assert!(
+            project_quad_corners(&cam, [0.0, 0.0, 20.0], [0.0, 0.0, 0.0], [4.0, 2.0]).is_none()
+        );
     }
 
     /// Same rule as `hardcoded_effect_params_are_uniform_sized` below, for the
@@ -5906,10 +7169,7 @@ mod tests {
         // since the shadow arrays are fixed-size regardless of how many
         // slots are actually in use.
         let shadow_slots = vec![Some(0)];
-        let shadow_slot_data = vec![(
-            crate::engine::camera3d::identity(),
-            [0.0, 0.0, 1.0, 1.0],
-        )];
+        let shadow_slot_data = vec![(crate::engine::camera3d::identity(), [0.0, 0.0, 1.0, 1.0])];
         let bytes = mesh3d_lighting_bytes(&scene, &cam, &shadow_slots, &shadow_slot_data, None);
         assert_eq!(bytes.len(), MESH3D_LIGHTING_BYTES_LEN);
     }
@@ -5943,7 +7203,11 @@ mod tests {
             )
         };
         // Column 3, row 0 (the value we perturbed) is float index 12.
-        assert_eq!(read_f32(12), 42.0, "cookie_view_proj must round-trip the matrix");
+        assert_eq!(
+            read_f32(12),
+            42.0,
+            "cookie_view_proj must round-trip the matrix"
+        );
     }
 
     /// A spot light must (a) count as renderable (`flags.x == 1.0` — the
@@ -5973,7 +7237,10 @@ mod tests {
 
         // flags.x is the buffer's first f32.
         let flags_x = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        assert_eq!(flags_x, 1.0, "a spot-only scene must still engage the lit branch");
+        assert_eq!(
+            flags_x, 1.0,
+            "a spot-only scene must still engage the lit branch"
+        );
 
         // light_spot[0] starts after 5 leading vec4s + 2 MESH3D_MAX_LIGHTS
         // vec4 arrays (positions, colors).
@@ -5988,7 +7255,10 @@ mod tests {
         let dir = [read_f32(0), read_f32(1), read_f32(2)];
         let len2 = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
         assert!(len2 > 0.25, "spot direction must not read as zero: {dir:?}");
-        assert!(read_f32(3) >= 1.0, "exponent must be clamped to at least 1.0");
+        assert!(
+            read_f32(3) >= 1.0,
+            "exponent must be clamped to at least 1.0"
+        );
     }
 
     /// A directional light must flag itself via `light_pos[0].w == -1.0`
@@ -6014,7 +7284,10 @@ mod tests {
         let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[], None);
 
         let flags_x = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        assert_eq!(flags_x, 1.0, "a directional-only scene must still engage the lit branch");
+        assert_eq!(
+            flags_x, 1.0,
+            "a directional-only scene must still engage the lit branch"
+        );
 
         // light_pos[0] starts right after the 5 leading vec4s.
         let pos0_offset = 16 * 5;
@@ -6027,7 +7300,10 @@ mod tests {
         };
         let dir = [read_f32(0), read_f32(1), read_f32(2)];
         let len2 = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
-        assert!((len2 - 1.0).abs() < 1e-4, "direction must be unit-length: {dir:?}");
+        assert!(
+            (len2 - 1.0).abs() < 1e-4,
+            "direction must be unit-length: {dir:?}"
+        );
         assert_eq!(read_f32(3), -1.0, "w must carry the directional sentinel");
     }
 
@@ -6056,19 +7332,37 @@ mod tests {
         let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[], None);
 
         let flags_x = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        assert_eq!(flags_x, 1.0, "a tube-only scene must still engage the lit branch");
+        assert_eq!(
+            flags_x, 1.0,
+            "a tube-only scene must still engage the lit branch"
+        );
 
         let pos0_offset = 16 * 5;
         let spot0_offset = 16 * 5 + 16 * MESH3D_MAX_LIGHTS * 2;
         let read_f32 = |offset: usize, i: usize| {
-            f32::from_le_bytes(bytes[offset + i * 4..offset + i * 4 + 4].try_into().unwrap())
+            f32::from_le_bytes(
+                bytes[offset + i * 4..offset + i * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            )
         };
-        assert_eq!(read_f32(pos0_offset, 3), -3.0, "w must carry the tube sentinel");
-        let endpoint_b = [read_f32(spot0_offset, 0), read_f32(spot0_offset, 1), read_f32(spot0_offset, 2)];
+        assert_eq!(
+            read_f32(pos0_offset, 3),
+            -3.0,
+            "w must carry the tube sentinel"
+        );
+        let endpoint_b = [
+            read_f32(spot0_offset, 0),
+            read_f32(spot0_offset, 1),
+            read_f32(spot0_offset, 2),
+        ];
         let len2 = endpoint_b[0] * endpoint_b[0]
             + endpoint_b[1] * endpoint_b[1]
             + endpoint_b[2] * endpoint_b[2];
-        assert!(len2 > 1.0, "endpoint B should be a real view-space position, not a unit vector: {endpoint_b:?}");
+        assert!(
+            len2 > 1.0,
+            "endpoint B should be a real view-space position, not a unit vector: {endpoint_b:?}"
+        );
     }
 
     /// WGSL rounds every uniform-address-space struct up to a 16-byte

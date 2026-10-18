@@ -36,7 +36,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// A known-valid constant, so the `expect` here can never actually fire.
 fn player_iface() -> InterfaceName<'static> {
-    InterfaceName::try_from(MPRIS_PLAYER_IFACE).expect("MPRIS_PLAYER_IFACE is a valid interface name")
+    InterfaceName::try_from(MPRIS_PLAYER_IFACE)
+        .expect("MPRIS_PLAYER_IFACE is a valid interface name")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -202,7 +203,10 @@ fn poll_active_player(conn: &Connection) -> Option<MediaInfo> {
 
     if let Some(metadata) = all.get("Metadata") {
         if let Ok(dict) = HashMap::<String, OwnedValue>::try_from(metadata.clone()) {
-            if let Some(title) = dict.get("xesam:title").and_then(|v| String::try_from(v.clone()).ok()) {
+            if let Some(title) = dict
+                .get("xesam:title")
+                .and_then(|v| String::try_from(v.clone()).ok())
+            {
                 info.title = title;
             }
             // `xesam:artist` is a string array (`as`) — take the first,
@@ -216,15 +220,24 @@ fn poll_active_player(conn: &Connection) -> Option<MediaInfo> {
                     info.artist = first;
                 }
             }
-            if let Some(album) = dict.get("xesam:album").and_then(|v| String::try_from(v.clone()).ok()) {
+            if let Some(album) = dict
+                .get("xesam:album")
+                .and_then(|v| String::try_from(v.clone()).ok())
+            {
                 info.album = album;
             }
-            if let Some(art_url) = dict.get("mpris:artUrl").and_then(|v| String::try_from(v.clone()).ok()) {
+            if let Some(art_url) = dict
+                .get("mpris:artUrl")
+                .and_then(|v| String::try_from(v.clone()).ok())
+            {
                 if !art_url.is_empty() {
                     info.art_url = Some(art_url);
                 }
             }
-            if let Some(length) = dict.get("mpris:length").and_then(|v| i64::try_from(v.clone()).ok()) {
+            if let Some(length) = dict
+                .get("mpris:length")
+                .and_then(|v| i64::try_from(v.clone()).ok())
+            {
                 info.duration_us = length;
             }
         }

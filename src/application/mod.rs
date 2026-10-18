@@ -37,7 +37,10 @@ impl WallpaperApplication {
     /// Prepare the application: installs the context's property overrides so
     /// every scene loaded afterwards resolves user settings against them.
     pub fn new(context: ApplicationContext) -> Self {
-        crate::engine::properties::set_global_overrides(context.properties.clone());
+        crate::engine::properties::set_overrides_for(
+            &context.background,
+            context.properties.clone(),
+        );
         Self {
             context,
             handle: None,
@@ -56,9 +59,8 @@ impl WallpaperApplication {
     /// default for that one output rather than failing the whole wallpaper
     /// over one bad per-screen entry.
     fn resolve_screen_content(&self) -> Result<ScreenContent> {
-        let default = WallpaperContent::from_any_path(&self.context.background).with_context(
-            || format!("loading wallpaper {}", self.context.background.display()),
-        )?;
+        let default = WallpaperContent::from_any_path(&self.context.background)
+            .with_context(|| format!("loading wallpaper {}", self.context.background.display()))?;
         let mut by_output = std::collections::HashMap::new();
         for (screen, path) in &self.context.screens {
             match WallpaperContent::from_any_path(path) {
@@ -74,7 +76,13 @@ impl WallpaperApplication {
                 }
             }
         }
-        Ok(ScreenContent { by_output, default })
+        Ok(ScreenContent {
+            by_output,
+            default,
+            layout: crate::settings::WpSettings::load()
+                .layout
+                .unwrap_or_default(),
+        })
     }
 
     /// The [`ScreenSettings`] twin of `resolve_screen_content` — `screen_
