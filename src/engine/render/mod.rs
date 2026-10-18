@@ -761,8 +761,12 @@ impl ResolvedScene {
                 dst[1] as f32 / 255.0,
                 dst[2] as f32 / 255.0,
             ];
-            let out =
-                crate::engine::blend::apply_blending(layer.blend_mode, dest_rgb, src_rgb, src_a);
+            let out = crate::engine::gpu::blend::apply_blending(
+                layer.blend_mode,
+                dest_rgb,
+                src_rgb,
+                src_a,
+            );
             dst[0] = (out[0].clamp(0.0, 1.0) * 255.0) as u8;
             dst[1] = (out[1].clamp(0.0, 1.0) * 255.0) as u8;
             dst[2] = (out[2].clamp(0.0, 1.0) * 255.0) as u8;
