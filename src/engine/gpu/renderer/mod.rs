@@ -5433,7 +5433,7 @@ impl GpuSceneInstance {
         format: wgpu::TextureFormat,
     ) {
         self.render();
-        let full = crate::render::settings::FULL_REGION;
+        let full = crate::content::settings::FULL_REGION;
         self.present_region(view, format, (view_w, view_h), full);
     }
 
@@ -5447,7 +5447,7 @@ impl GpuSceneInstance {
         canvas: (u32, u32),
         region: [f32; 4],
     ) {
-        let (uv_scale, uv_offset) = crate::render::ScaleMode::Fill.uv_transform_region(
+        let (uv_scale, uv_offset) = crate::content::ScaleMode::Fill.uv_transform_region(
             (self.width, self.height),
             canvas,
             region,
