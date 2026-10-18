@@ -140,7 +140,7 @@ impl WallpaperContent {
             )
         })?;
         if let Some(preset) = &project.preset {
-            crate::engine::properties::register_preset(&parent, dir, preset);
+            crate::workshop::properties::register_preset(&parent, dir, preset);
         }
         tracing::info!(target: "content", "preset {} → base item {}", dir.display(), parent.display());
         Ok(parent)
