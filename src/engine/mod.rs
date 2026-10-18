@@ -19,7 +19,6 @@ pub mod particle;
 pub mod pkg;
 pub mod playback_gate;
 pub mod properties;
-pub mod puppet;
 pub mod render;
 pub mod scene;
 pub mod script;

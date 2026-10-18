@@ -1641,7 +1641,7 @@ struct SceneLayerGpu {
     /// posed mesh at `PUPPET_UPDATE_INTERVAL` (skinning + CPU raster costs
     /// ~30ms at 4K, so it runs at a capped rate rather than per frame;
     /// idle-style puppet animations are slow enough not to notice).
-    puppet: Option<std::sync::Arc<crate::engine::puppet::PuppetRuntime>>,
+    puppet: Option<std::sync::Arc<crate::engine::sim::puppet::PuppetRuntime>>,
     /// Last animation time `frames[0]` was posed at, seconds.
     puppet_posed_at: f32,
     /// Embedded-video stream — `frames[0]` is replaced with the newest
