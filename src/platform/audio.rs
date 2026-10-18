@@ -131,7 +131,7 @@ pub fn wallpaper_uses_audio(dir: &std::path::Path) -> bool {
     let json = std::fs::read_to_string(dir.join("scene.json"))
         .ok()
         .or_else(|| {
-            let pkg = crate::engine::pkg::Package::from_file(&dir.join("scene.pkg")).ok()?;
+            let pkg = crate::formats::pkg::Package::from_file(&dir.join("scene.pkg")).ok()?;
             pkg.get("scene.json")
                 .map(|b| String::from_utf8_lossy(b).into_owned())
         });

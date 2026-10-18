@@ -11,7 +11,6 @@ pub mod gpu;
 #[cfg(target_os = "linux")]
 pub mod media;
 pub mod model;
-pub mod pkg;
 pub mod playback_gate;
 pub mod properties;
 pub mod sim;
@@ -23,6 +22,6 @@ pub use crate::engine::gpu::fbo::{RenderTarget, RenderTargetPool};
 pub use crate::engine::model::resolve::ResolvedScene;
 pub use crate::engine::model::scene::Scene;
 pub use crate::engine::sim::camera_dynamics::{CameraDynamics, CameraFrameDynamics};
-pub use pkg::Package;
+pub use crate::formats::pkg::Package;
 pub use properties::SceneProperties;
 pub use tex::TexFile;

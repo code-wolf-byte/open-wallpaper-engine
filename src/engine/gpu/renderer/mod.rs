@@ -1874,7 +1874,7 @@ pub struct GpuSceneInstance {
     sort_count: u32,
     /// For `thisScene.createLayer`: the scene directory and its package.
     scene_dir: std::path::PathBuf,
-    scene_pkg: Option<crate::engine::pkg::Package>,
+    scene_pkg: Option<crate::formats::pkg::Package>,
     /// Desktop-audio capture, started only when an effect reads
     /// `g_AudioSpectrum*` (else `None` and the spectrum stays silent). Polled
     /// once per frame into the renderer's `audio_buf`.
@@ -4010,7 +4010,7 @@ impl GpuSceneInstance {
         }
         if self.scene_pkg.is_none() {
             self.scene_pkg =
-                crate::engine::pkg::Package::from_file(&self.scene_dir.join("scene.pkg")).ok();
+                crate::formats::pkg::Package::from_file(&self.scene_dir.join("scene.pkg")).ok();
         }
         let Some(mut layer) = crate::engine::model::resolve::runtime_layer(
             &self.scene_dir,

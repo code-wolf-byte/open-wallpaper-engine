@@ -3,8 +3,8 @@ use image::RgbaImage;
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 
-use super::pkg::Package;
 use super::tex::TexFile;
+use crate::formats::pkg::Package;
 
 /// Wallpaper asset resolver.
 ///
