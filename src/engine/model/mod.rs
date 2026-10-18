@@ -1,3 +1,7 @@
+//! What a scene is: the `scene.json` types ([`scene`]), resolving them into
+//! drawable layers ([`resolve`]), static `.mdl` meshes, and the typed
+//! object/shader model with its per-frame dynamic values.
+
 pub mod dynamic_value;
 pub mod mesh3d;
 pub mod objects;
