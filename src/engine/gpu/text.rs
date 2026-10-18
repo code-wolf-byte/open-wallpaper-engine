@@ -215,7 +215,7 @@ pub fn with_background(
 pub fn resolve_font_data(
     font_ref: Option<&str>,
     dir: Option<&std::path::Path>,
-    pkg: Option<&crate::engine::pkg::Package>,
+    pkg: Option<&crate::formats::pkg::Package>,
 ) -> Option<Vec<u8>> {
     if let Some(font_ref) = font_ref {
         if !font_ref.is_empty() && !font_ref.starts_with("systemfont_") {
