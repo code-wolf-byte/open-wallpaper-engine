@@ -2,7 +2,7 @@
 //!
 //! Mirrors `ApplyBlending`/`WE_COMMON_BLENDING_H` in
 //! `shaders/transpiler.rs` (the GLSL/WGSL version used by the GPU compositor),
-//! for the CPU-side compositor in `render.rs`. `dest` is the pixel already on
+//! for the CPU-side compositor in `model::resolve`. `dest` is the pixel already on
 //! the canvas, `src` is the incoming layer's own color, `opacity` is the
 //! layer's own alpha at that pixel.
 
