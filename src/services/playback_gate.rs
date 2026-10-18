@@ -10,7 +10,7 @@
 //!
 //! This module is pure decision logic; the platform backends fill in
 //! [`PlaybackState`] (EWMH / `zwlr_foreign_toplevel_management` for window
-//! state, `platform::power` for battery and lock, MPRIS for other media).
+//! state, `services::power` for battery and lock, MPRIS for other media).
 
 use serde::{Deserialize, Serialize};
 
