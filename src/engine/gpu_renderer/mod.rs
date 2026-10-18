@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::engine::camera_dynamics::{CameraDynamics, CameraFrameDynamics};
-use crate::engine::fbo::RenderTargetPool;
+use crate::engine::gpu::fbo::RenderTargetPool;
 use crate::engine::model::{ShaderModel, WEBlending};
 use crate::engine::particle;
 use crate::engine::scene::{parse_value_bool, parse_value_f32};
@@ -1122,7 +1122,7 @@ impl GpuSceneRenderer {
 
     pub fn upload_texture(&self, img: &RgbaImage) -> wgpu::Texture {
         let (fw, fh) =
-            crate::engine::fbo::fit_texture_limit(&self.device, img.width(), img.height());
+            crate::engine::gpu::fbo::fit_texture_limit(&self.device, img.width(), img.height());
         let downscaled;
         let img = if (fw, fh) != img.dimensions() {
             tracing::warn!(
