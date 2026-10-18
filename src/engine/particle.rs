@@ -707,8 +707,8 @@ pub struct ParticleSystem {
     /// `mapsequencebetweencontrolpoints` initializer + its counter.
     map_seq_between: Option<MapSequenceBetweenParams>,
     map_seq_between_index: u32,
-    /// `turbulentvelocityrandom` initializer parameters.
-    turbulent_velocity: Option<TurbulentVelocityParams>,
+    /// `turbulentvelocityrandom` initializers; each adds its own velocity.
+    turbulent_velocity: Vec<TurbulentVelocityParams>,
     /// `turbulence` operator parameters.
     turbulence: Option<TurbulenceParams>,
     /// `vortex` operator parameters.
@@ -1400,20 +1400,29 @@ impl ParticleSystem {
         let size_exp = initializer_exponent(&config.initializer, "sizerandom");
         let (alpha_min, alpha_max) =
             scalar_range_from_initializers(&config.initializer, "alpharandom", 1.0, 1.0);
-        let velocity_range = vec3_range_from_initializers(&config.initializer, "velocityrandom");
+        // Particle vectors are authored y-up; this simulation is y-down, so
+        // y flips on the way in (CParticle.cpp does the same for velocity,
+        // gravity and turbulent directions, as it does for emitter origins).
+        let flip_y = |v: [f32; 3]| [v[0], -v[1], v[2]];
+        let velocity_range = vec3_range_from_initializers(
+            &config.initializer,
+            "velocityrandom",
+            [-32.0; 3],
+            [32.0; 3],
+        );
         let (velocity_min, velocity_max) = match velocity_range {
-            Some((min, max)) => (Some(min), Some(max)),
+            Some((min, max)) => (Some(flip_y(min)), Some(flip_y(max))),
             None => (None, None),
         };
         let (color_min, color_max) =
-            vec3_range_from_initializers(&config.initializer, "colorrandom")
+            vec3_range_from_initializers(&config.initializer, "colorrandom", [0.0; 3], [255.0; 3])
                 .unwrap_or(([255.0; 3], [255.0; 3]));
 
         let movement_op = config.operator.iter().find(|op| op.name == "movement");
         let gravity = movement_op
             .and_then(|op| op.gravity.as_deref())
             .map(|s| parse_f32_vec3(Some(s)))
-            .map(|v| [v[0], v[1]])
+            .map(|v| [v[0], -v[1]])
             .unwrap_or([0.0, 0.0]);
         // `movement.drag`: per-second velocity decay (CParticle.cpp
         // createMovementOperator) — without it, operators that keep adding
@@ -1640,7 +1649,7 @@ impl ParticleSystem {
         let turbulent_velocity = config
             .initializer
             .iter()
-            .find(|init| init.name == "turbulentvelocityrandom")
+            .filter(|init| init.name == "turbulentvelocityrandom")
             .map(|init| TurbulentVelocityParams {
                 speed_min: init
                     .speedmin
@@ -1658,7 +1667,8 @@ impl ParticleSystem {
                     .forward
                     .as_ref()
                     .and_then(value_as_vec3)
-                    .unwrap_or([0.0, 1.0, 0.0]),
+                    .map(flip_y)
+                    .unwrap_or([0.0, -1.0, 0.0]),
                 timescale: init.timescale.unwrap_or(1.0) as f32,
                 phase_min: init.phasemin.unwrap_or(0.0) as f32,
                 phase_max: init.phasemax.unwrap_or(0.1) as f32,
@@ -1666,8 +1676,10 @@ impl ParticleSystem {
                     .right
                     .as_ref()
                     .and_then(value_as_vec3)
+                    .map(flip_y)
                     .unwrap_or([0.0, 0.0, 1.0]),
-            });
+            })
+            .collect();
 
         // `turbulence`: phase and speed are randomized once per operator
         // instance (the reference draws them in the factory, not per
@@ -2578,21 +2590,19 @@ impl ParticleSystem {
                     let sy = ms.speed_min[1]
                         + fastrand::f32() * (ms.speed_max[1] - ms.speed_min[1]).max(0.0);
                     let (sin, cos) = angle.sin_cos();
-                    // The reference rotates in its y-up sim space
-                    // (v' = (cos*x + sin*y, -sin*x + cos*y), column-major
-                    // glm::mat3) and projects y-up; our space is y-down, so
-                    // the net screen-space rotation is the conjugate —
-                    // otherwise the spawn sequence sweeps the circle in the
-                    // mirrored direction.
+                    // The reference flips y, then rotates by
+                    // (cos*x + sin*y, -sin*x + cos*y) (column-major
+                    // glm::mat3); with the flip folded in that is the
+                    // conjugate rotation followed by a y flip.
                     vx = (cos * sx - sin * sy) * self.speed_mult;
-                    vy = (sin * sx + cos * sy) * self.speed_mult;
+                    vy = -(sin * sx + cos * sy) * self.speed_mult;
                 }
 
                 // `turbulentvelocityrandom` (CParticle.cpp): curl-noise
                 // spawn velocity, angle-limited around `forward`, added on
                 // top of any plain `velocityrandom` contribution.
-                if let Some(t) = self.turbulent_velocity {
-                    let forward = vec3_normalize_or(t.forward, [0.0, 1.0, 0.0]);
+                for &t in &self.turbulent_velocity {
+                    let forward = vec3_normalize_or(t.forward, [0.0, -1.0, 0.0]);
                     let right = vec3_normalize_or(t.right, [1.0, 0.0, 0.0]);
                     let speed =
                         t.speed_min + fastrand::f32() * (t.speed_max - t.speed_min).max(0.0);
@@ -2608,12 +2618,15 @@ impl ParticleSystem {
                     let mut dir = vec3_normalize_or(curl, forward);
 
                     // `scale` < 2 limits how far the direction may deviate
-                    // from `forward` (normalized angle, max = scale/2).
-                    if t.scale < 2.0 {
+                    // from `forward` (normalized angle, max = scale/2); 0
+                    // means straight along `forward`.
+                    if t.scale <= 0.0 {
+                        dir = forward;
+                    } else if t.scale < 2.0 {
                         let cos_angle = vec3_dot(dir, forward).clamp(-1.0, 1.0);
                         let angle = cos_angle.acos() / std::f32::consts::PI;
                         let max_angle = t.scale / 2.0;
-                        if angle > max_angle && max_angle > 0.0001 {
+                        if angle > max_angle {
                             let axis = vec3_cross(dir, forward);
                             if vec3_length(axis) > 0.0001 {
                                 let axis = vec3_normalize_or(axis, [0.0, 0.0, 1.0]);
@@ -4006,13 +4019,26 @@ fn scalar_range_from_initializers(
 /// Returns `Some((min, max))` when the named initializer exists and both
 /// bounds parse as a 3-component vector (e.g. `velocityrandom`/`colorrandom`).
 /// Exact-name matching for the same reason as `scalar_range_from_initializers`.
+/// The (min, max) of initializer `name`, each falling back to WE's default
+/// when omitted (ObjectParser.cpp: `colorrandom` black..white,
+/// `velocityrandom` -32..32). `None` when there is no such initializer.
 fn vec3_range_from_initializers(
     initializers: &[Initializer],
     name: &str,
+    default_min: [f32; 3],
+    default_max: [f32; 3],
 ) -> Option<([f32; 3], [f32; 3])> {
     let init = initializers.iter().find(|init| init.name == name)?;
-    let min = init.min.as_ref().and_then(value_as_vec3)?;
-    let max = init.max.as_ref().and_then(value_as_vec3)?;
+    let min = init
+        .min
+        .as_ref()
+        .and_then(value_as_vec3)
+        .unwrap_or(default_min);
+    let max = init
+        .max
+        .as_ref()
+        .and_then(value_as_vec3)
+        .unwrap_or(default_max);
     Some((min, max))
 }
 
@@ -4180,7 +4206,9 @@ mod tests {
         }"#;
         let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
         let sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
-        assert_eq!(sys.gravity, [0.0, -50.0]);
+        // Authored y-up: "0 -50 0" pulls down the screen, +y in this
+        // y-down simulation.
+        assert_eq!(sys.gravity, [0.0, 50.0]);
     }
 
     #[test]
@@ -5073,6 +5101,26 @@ mod tests {
     /// must not shadow them — the old substring matcher (`contains`)
     /// read the turbulent initializer's fields as the plain velocity
     /// range and the angular operator's (absent) gravity as movement's.
+    /// An omitted `min`/`max` takes WE's default instead of discarding the
+    /// initializer: 3598808038's vapor sets only `colorrandom.max = 0 0 0`
+    /// and must come out black, not the no-initializer white.
+    #[test]
+    fn partial_vec3_initializers_use_we_defaults() {
+        let json = r#"{
+            "maxcount": 4,
+            "emitter": [{"name":"box","rate":1}],
+            "initializer": [
+                {"id":1,"name":"colorrandom","max":"0 0 0"},
+                {"id":2,"name":"velocityrandom","min":"0 10 0"}
+            ]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        assert_eq!((sys.color_min, sys.color_max), ([0.0; 3], [0.0; 3]));
+        assert_eq!(sys.velocity_min, Some([0.0, -10.0, 0.0]));
+        assert_eq!(sys.velocity_max, Some([32.0, -32.0, 32.0]));
+    }
+
     #[test]
     fn similarly_named_initializers_do_not_shadow_each_other() {
         let json = r#"{
@@ -5089,12 +5137,12 @@ mod tests {
         }"#;
         let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
         let sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
-        assert_eq!(sys.velocity_min, Some([3.0, 3.0, 0.0]));
-        assert_eq!(sys.velocity_max, Some([3.0, 3.0, 0.0]));
-        // Preset vectors apply unflipped in our y-down space: the reference
-        // flips y into its y-up sim space and flips again at projection, so
-        // the net screen-space direction equals the raw preset value.
-        assert_eq!(sys.gravity[1], -7.0);
+        // Authored y-up vectors flip into this y-down simulation. Real
+        // content settles the direction: snow, rain and leaf presets fall
+        // with -y velocity, embers rise with +y gravity.
+        assert_eq!(sys.velocity_min, Some([3.0, -3.0, 0.0]));
+        assert_eq!(sys.velocity_max, Some([3.0, -3.0, 0.0]));
+        assert_eq!(sys.gravity[1], 7.0);
     }
 
     /// A config with no `alpharandom` initializer at all must stay a no-op
