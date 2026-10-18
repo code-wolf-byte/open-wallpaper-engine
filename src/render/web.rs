@@ -570,7 +570,7 @@ mod imp {
         let mut last_audio_push = Instant::now();
         // MPRIS is a freedesktop.org/Linux-only surface — see `engine::media`.
         #[cfg(target_os = "linux")]
-        let mut media: Option<crate::engine::media::MediaWatcher> = None;
+        let mut media: Option<crate::services::media::MediaWatcher> = None;
 
         loop {
             match rx.try_recv() {
@@ -604,7 +604,7 @@ mod imp {
                     }
                     #[cfg(target_os = "linux")]
                     if wants_media {
-                        media = crate::engine::media::MediaWatcher::start();
+                        media = crate::services::media::MediaWatcher::start();
                         if media.is_none() {
                             tracing::warn!(
                                 target: "web",
@@ -782,7 +782,7 @@ mod imp {
     /// through in the same raw microseconds `MediaInfo` itself carries —
     /// see its own doc comment for why.
     #[cfg(target_os = "linux")]
-    fn media_push_script(info: &crate::engine::media::MediaInfo) -> String {
+    fn media_push_script(info: &crate::services::media::MediaInfo) -> String {
         let json_str = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
         let art_url = info
             .art_url
