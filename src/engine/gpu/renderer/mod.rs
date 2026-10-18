@@ -1920,7 +1920,7 @@ pub struct GpuSceneInstance {
     shadow_atlas_tex: wgpu::Texture,
     /// Retained for the per-frame parent recompose, which has to rebuild each
     /// mesh's MVP and each layer's projected rect.
-    camera3d: Option<crate::engine::camera3d::PerspectiveCamera>,
+    camera3d: Option<crate::engine::sim::camera3d::PerspectiveCamera>,
     /// Parent chain per object, for recomposing transforms scripts change.
     transform_graph: crate::engine::render::TransformGraph,
     /// `general.zoom`, retained because the per-frame parent recompose rebuilds
@@ -1944,7 +1944,7 @@ fn quad_world_corners(center: [f32; 3], angles: [f32; 3], size_px: [f64; 2]) -> 
     let hx = (size_px[0] / 2.0) as f32;
     let hy = (size_px[1] / 2.0) as f32;
     [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]].map(|[cx, cy]| {
-        let off = crate::engine::camera3d::rotate_euler([cx, cy, 0.0], angles);
+        let off = crate::engine::sim::camera3d::rotate_euler([cx, cy, 0.0], angles);
         [center[0] + off[0], center[1] + off[1], center[2] + off[2]]
     })
 }
@@ -1960,7 +1960,7 @@ fn quad_world_corners(center: [f32; 3], angles: [f32; 3], size_px: [f64; 2]) -> 
 /// the composite fallback in all cases; `project_quad_corners` (below) gives
 /// the true quad shape for the common normal-blend case — see its own docs.
 fn project_quad_ndc(
-    cam: &crate::engine::camera3d::PerspectiveCamera,
+    cam: &crate::engine::sim::camera3d::PerspectiveCamera,
     center: [f32; 3],
     angles: [f32; 3],
     size_px: [f64; 2],
@@ -2004,7 +2004,7 @@ fn project_quad_ndc(
 /// full perspective-correct texture mapping is a further, separate
 /// improvement.
 fn project_quad_corners(
-    cam: &crate::engine::camera3d::PerspectiveCamera,
+    cam: &crate::engine::sim::camera3d::PerspectiveCamera,
     center: [f32; 3],
     angles: [f32; 3],
     size_px: [f64; 2],
@@ -2062,7 +2062,7 @@ const MESH3D_LIGHTING_BYTES_LEN: usize =
 /// is naturally built in world space, unlike everything else here which
 /// works in the main camera's view space.
 fn mesh3d_transform_bytes(
-    cam: &crate::engine::camera3d::PerspectiveCamera,
+    cam: &crate::engine::sim::camera3d::PerspectiveCamera,
     origin: [f32; 3],
     angles: [f32; 3],
     scale: [f32; 3],
@@ -2072,7 +2072,7 @@ fn mesh3d_transform_bytes(
         cam.mvp(origin, angles, scale),
         cam.model_view(origin, angles, scale),
         cam.normal_view(angles, scale),
-        crate::engine::camera3d::model_matrix(origin, angles, scale),
+        crate::engine::sim::camera3d::model_matrix(origin, angles, scale),
     ] {
         for col in mat.iter() {
             for f in col {
@@ -2107,10 +2107,10 @@ fn mesh3d_transform_bytes(
 /// `cookie_view_proj` field.
 fn mesh3d_lighting_bytes(
     scene: &crate::engine::scene::Scene,
-    cam: &crate::engine::camera3d::PerspectiveCamera,
+    cam: &crate::engine::sim::camera3d::PerspectiveCamera,
     shadow_slots: &[Option<usize>],
-    shadow_slot_data: &[(crate::engine::camera3d::Mat4, [f32; 4])],
-    cookie: Option<(usize, crate::engine::camera3d::Mat4)>,
+    shadow_slot_data: &[(crate::engine::sim::camera3d::Mat4, [f32; 4])],
+    cookie: Option<(usize, crate::engine::sim::camera3d::Mat4)>,
 ) -> Vec<u8> {
     let lights = scene.lights();
     let general = scene.general.as_ref();
@@ -2286,7 +2286,7 @@ fn mesh3d_lighting_bytes(
         let vp = shadow_slot_data
             .get(slot)
             .map(|(vp, _)| *vp)
-            .unwrap_or_else(crate::engine::camera3d::identity);
+            .unwrap_or_else(crate::engine::sim::camera3d::identity);
         for col in vp.iter() {
             push4(*col);
         }
@@ -2300,7 +2300,7 @@ fn mesh3d_lighting_bytes(
     }
     let cookie_view_proj = cookie
         .map(|(_, vp)| vp)
-        .unwrap_or_else(crate::engine::camera3d::identity);
+        .unwrap_or_else(crate::engine::sim::camera3d::identity);
     for col in cookie_view_proj.iter() {
         push4(*col);
     }
@@ -2428,7 +2428,7 @@ impl GpuSceneInstance {
 
         // Perspective (3D) scenes project layer quads through the scene
         // camera instead of mapping pixel origins to NDC directly.
-        let camera3d = crate::engine::camera3d::PerspectiveCamera::from_scene(
+        let camera3d = crate::engine::sim::camera3d::PerspectiveCamera::from_scene(
             &resolved.scene,
             w as f32 / h as f32,
         );
@@ -2937,7 +2937,7 @@ impl GpuSceneInstance {
     /// procedural per-light cone/box mesh — see the report's scoping note).
     fn build_volumetrics(
         renderer: &GpuSceneRenderer,
-        cam: &crate::engine::camera3d::PerspectiveCamera,
+        cam: &crate::engine::sim::camera3d::PerspectiveCamera,
         lights: &[(
             crate::engine::gpu::lighting::Light,
             bool,
@@ -2945,7 +2945,7 @@ impl GpuSceneInstance {
             Option<String>,
         )],
         shadow_slots: &[Option<usize>],
-        shadow_slot_data: &[(crate::engine::camera3d::Mat4, [f32; 4])],
+        shadow_slot_data: &[(crate::engine::sim::camera3d::Mat4, [f32; 4])],
         shadow_atlas_view: &wgpu::TextureView,
     ) -> Option<wgpu::BindGroup> {
         use crate::engine::gpu::lighting::Light;
@@ -2994,9 +2994,9 @@ impl GpuSceneInstance {
             .flatten()
             .and_then(|slot| shadow_slot_data.get(slot))
             .map(|(vp, rect)| (*vp, *rect, 1.0f32))
-            .unwrap_or((crate::engine::camera3d::identity(), [0.0; 4], 0.0));
+            .unwrap_or((crate::engine::sim::camera3d::identity(), [0.0; 4], 0.0));
 
-        let inv_view_proj = crate::engine::camera3d::mat4_inverse(&cam.view_proj_raw());
+        let inv_view_proj = crate::engine::sim::camera3d::mat4_inverse(&cam.view_proj_raw());
         let eye = cam.eye();
         // Fixed, honest default range for the ray march — no real content
         // to derive a better heuristic from (see the fn doc comment).
@@ -3004,7 +3004,7 @@ impl GpuSceneInstance {
         const MAX_RANGE: f32 = 40.0;
 
         let mut bytes = Vec::with_capacity(4 * 16 * 4 + 16 * 5);
-        let mut push_mat = |m: &crate::engine::camera3d::Mat4| {
+        let mut push_mat = |m: &crate::engine::sim::camera3d::Mat4| {
             for col in m.iter() {
                 for f in col {
                     bytes.extend_from_slice(&f.to_le_bytes());
@@ -3082,7 +3082,7 @@ impl GpuSceneInstance {
     ) -> (
         wgpu::Texture,
         Vec<Option<usize>>,
-        Vec<(crate::engine::camera3d::Mat4, [f32; 4])>,
+        Vec<(crate::engine::sim::camera3d::Mat4, [f32; 4])>,
     ) {
         use crate::engine::gpu::lighting::Light;
         use crate::engine::gpu::shadow;
@@ -3095,7 +3095,7 @@ impl GpuSceneInstance {
         // rather than after filtering casters like the point-only version
         // did.
         let (center, radius) = shadow::scene_bounds(mesh3d_layers);
-        let shadow_casters: Vec<(usize, crate::engine::camera3d::Mat4)> = lights
+        let shadow_casters: Vec<(usize, crate::engine::sim::camera3d::Mat4)> = lights
             .iter()
             .enumerate()
             .filter_map(|(i, (light, casts_shadow, _volumetrics, _))| {
@@ -3230,9 +3230,12 @@ impl GpuSceneInstance {
             pass.set_scissor_rect(tile.x, tile.y, tile.w, tile.h);
             pass.set_pipeline(&renderer.mesh3d_shadow_pipeline);
             for (layer, (vbuf, ibuf, index_count)) in mesh3d_layers.iter().zip(geometry.iter()) {
-                let model =
-                    crate::engine::camera3d::model_matrix(layer.origin, layer.angles, layer.scale);
-                let light_mvp = crate::engine::camera3d::mat4_mul(&view_proj, &model);
+                let model = crate::engine::sim::camera3d::model_matrix(
+                    layer.origin,
+                    layer.angles,
+                    layer.scale,
+                );
+                let light_mvp = crate::engine::sim::camera3d::mat4_mul(&view_proj, &model);
                 let mut mvp_bytes = Vec::with_capacity(64);
                 for col in light_mvp.iter() {
                     for f in col {
@@ -3301,7 +3304,7 @@ impl GpuSceneInstance {
     /// both static in real content, so this runs once at load.
     fn build_mesh3d(
         renderer: &GpuSceneRenderer,
-        cam: &crate::engine::camera3d::PerspectiveCamera,
+        cam: &crate::engine::sim::camera3d::PerspectiveCamera,
         layer: &crate::engine::render::Mesh3dLayer,
         lighting_ubo: &wgpu::Buffer,
         shadow_atlas_view: &wgpu::TextureView,
@@ -6522,7 +6525,7 @@ fn gpu_layer_from(
     w: u32,
     h: u32,
     zoom: f32,
-    camera3d: Option<&crate::engine::camera3d::PerspectiveCamera>,
+    camera3d: Option<&crate::engine::sim::camera3d::PerspectiveCamera>,
     authored_origin: [f64; 3],
 ) -> SceneLayerGpu {
     let all_frames: Vec<&RgbaImage> = std::iter::once(&l.image)
