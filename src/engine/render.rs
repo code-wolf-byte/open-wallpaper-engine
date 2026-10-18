@@ -964,7 +964,13 @@ fn layer_from_object(
                 let layers: Vec<crate::engine::puppet::AnimLayer> = entries
                     .iter()
                     .enumerate()
-                    .filter(|(_, e)| e.get("visible").and_then(|v| v.as_bool()).unwrap_or(true))
+                    // `visible` is often a user-property binding
+                    // (`{"user": "head", "value": false}`), not a bare bool.
+                    .filter(|(_, e)| {
+                        e.get("visible")
+                            .and_then(crate::engine::scene::parse_value_bool)
+                            .unwrap_or(true)
+                    })
                     .map(|(i, e)| {
                         // `animation` is the MDLA record's own id (2321732083's
                         // samurai layers name 60/63/80/105). Match it; fall back
