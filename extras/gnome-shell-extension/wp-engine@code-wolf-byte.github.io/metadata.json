@@ -1,0 +1,7 @@
+{
+  "uuid": "wp-engine@code-wolf-byte.github.io",
+  "name": "wp-engine wallpaper",
+  "description": "Shows wp-engine's Wallpaper Engine wallpapers as the GNOME desktop background. GNOME has no wlr-layer-shell, so wp-engine renders into a normal window per monitor and this extension moves it behind the desktop.",
+  "url": "https://github.com/code-wolf-byte/open-wallpaper-engine",
+  "shell-version": ["45", "46", "47", "48", "49"]
+}
