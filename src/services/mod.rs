@@ -6,3 +6,4 @@ pub mod audio;
 pub mod audio_devices;
 #[cfg(target_os = "linux")]
 pub mod media;
+pub mod power;

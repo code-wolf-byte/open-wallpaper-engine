@@ -4,7 +4,6 @@ pub mod gpu;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod platform_info;
-pub mod power;
 pub mod scaler;
 #[cfg(target_os = "linux")]
 pub mod wayland;
