@@ -3,3 +3,4 @@
 
 pub mod blend;
 pub mod fbo;
+pub mod lighting;
