@@ -1,7 +1,7 @@
 use anyhow::Result;
 
-use crate::render::ScreenContent;
-use crate::render::ScreenSettings;
+use crate::content::ScreenContent;
+use crate::content::ScreenSettings;
 
 // ── Private inner trait ───────────────────────────────────────────────────────
 
