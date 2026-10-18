@@ -1854,7 +1854,7 @@ pub(crate) fn resolve_static_texture(
 /// living only in the global assets install, never copied into the
 /// wallpaper's own directory/pkg — see [[wp_engine_project]] memory.
 fn read_from_global_assets(rel_path: &str) -> Option<Vec<u8>> {
-    let dir = crate::engine::shaders::loader::find_we_assets_dir()?;
+    let dir = crate::engine::gpu::shaders::loader::find_we_assets_dir()?;
     std::fs::read(dir.join(rel_path)).ok()
 }
 
