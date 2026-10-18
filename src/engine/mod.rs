@@ -7,7 +7,6 @@
 pub mod cpu;
 pub mod gpu;
 pub mod model;
-pub mod properties;
 pub mod sim;
 
 // Convenience re-exports.
@@ -18,4 +17,4 @@ pub use crate::engine::model::scene::Scene;
 pub use crate::engine::sim::camera_dynamics::{CameraDynamics, CameraFrameDynamics};
 pub use crate::formats::pkg::Package;
 pub use crate::formats::tex::TexFile;
-pub use properties::SceneProperties;
+pub use crate::workshop::properties::SceneProperties;
