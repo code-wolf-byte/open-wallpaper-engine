@@ -6038,7 +6038,7 @@ dependencies = [
 
 [[package]]
 name = "wp-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "boa_engine",

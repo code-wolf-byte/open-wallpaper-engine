@@ -1,6 +1,6 @@
 [package]
 name = "wp-engine"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Derived from Almamu/linux-wallpaperengine (GPL-3), so this carries the same
 # licence. Upstream ships the GPL-3 text with no "or any later version" grant,
