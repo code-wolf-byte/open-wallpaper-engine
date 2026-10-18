@@ -7,7 +7,7 @@
 //! particle-space projections in CParticle.cpp) so image layers placed at 3D
 //! origins can be projected to screen space.
 
-use crate::engine::scene::Scene;
+use crate::engine::model::scene::Scene;
 
 /// Column-major 4x4, `m[col][row]` — glm's layout, so it uploads to a WGSL
 /// `mat4x4<f32>` as-is.
@@ -95,16 +95,16 @@ impl PerspectiveCamera {
         let g = scene.general.as_ref();
         let fov_deg = g
             .and_then(|g| g.fov.as_ref())
-            .and_then(crate::engine::scene::parse_value_f32)
+            .and_then(crate::engine::model::scene::parse_value_f32)
             .unwrap_or(50.0);
         let near = g
             .and_then(|g| g.nearz.as_ref())
-            .and_then(crate::engine::scene::parse_value_f32)
+            .and_then(crate::engine::model::scene::parse_value_f32)
             .unwrap_or(0.1)
             .max(1e-4);
         let far = g
             .and_then(|g| g.farz.as_ref())
-            .and_then(crate::engine::scene::parse_value_f32)
+            .and_then(crate::engine::model::scene::parse_value_f32)
             .unwrap_or(10000.0)
             .max(near * 2.0);
 
