@@ -1,4 +1,5 @@
-//! Showing wallpapers: `set`, `set-file` and `run`, and the saved settings they apply.
+//! Showing wallpapers: `set`, `set-file` and `run`, and the saved settings they
+//! apply.
 
 use super::*;
 
