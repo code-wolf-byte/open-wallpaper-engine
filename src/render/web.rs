@@ -566,7 +566,7 @@ mod imp {
         let mut open: Vec<(Browser, Receiver<WebInputEvent>)> = Vec::new();
         let mut properties = String::new();
         let mut general = String::new();
-        let mut audio: Option<crate::engine::audio::AudioCapture> = None;
+        let mut audio: Option<crate::services::audio::AudioCapture> = None;
         let mut last_audio_push = Instant::now();
         // MPRIS is a freedesktop.org/Linux-only surface — see `engine::media`.
         #[cfg(target_os = "linux")]
@@ -593,7 +593,7 @@ mod imp {
                         None => tracing::error!(target: "web", "failed to create CEF browser"),
                     }
                     if wants_audio {
-                        audio = crate::engine::audio::AudioCapture::start();
+                        audio = crate::services::audio::AudioCapture::start();
                         if audio.is_none() {
                             tracing::warn!(
                                 target: "web",
@@ -754,7 +754,7 @@ mod imp {
     /// WE hands the listener 128 values: 64 left-channel bands followed by 64
     /// right-channel bands — precisely `AudioSpectrum`'s `s64_*` pair, so no
     /// resampling is needed.
-    fn audio_push_script(spectrum: &crate::engine::audio::AudioSpectrum) -> String {
+    fn audio_push_script(spectrum: &crate::services::audio::AudioSpectrum) -> String {
         let mut s = String::with_capacity(1024);
         s.push_str("window.__wpAudio&&window.__wpAudio([");
         for (i, v) in spectrum
