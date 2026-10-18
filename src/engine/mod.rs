@@ -8,7 +8,6 @@ pub mod animated;
 pub mod assets;
 pub mod audio;
 pub mod blend;
-pub mod camera;
 pub mod camera3d;
 pub mod camera_dynamics;
 pub mod effect;
@@ -39,7 +38,6 @@ pub mod text;
 pub mod timeline;
 
 // Convenience re-exports.
-pub use camera::SceneCamera;
 pub use camera_dynamics::{CameraDynamics, CameraFrameDynamics};
 pub use fbo::{RenderTarget, RenderTargetPool};
 pub use graph::SceneGraph;
