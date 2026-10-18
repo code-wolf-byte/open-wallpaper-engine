@@ -1,4 +1,5 @@
-//! Inspection and debugging tools: `probe`, `pkg-info`, `tex-info`, `render-scene`, `render-frame`, `test-scene` and `preview-scene`.
+//! Inspection and debugging tools: `probe`, `pkg-info`, `tex-info`, `render-
+//! scene`, `render-frame`, `test-scene` and `preview-scene`.
 
 use super::*;
 
