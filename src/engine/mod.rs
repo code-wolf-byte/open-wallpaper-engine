@@ -8,7 +8,6 @@ pub mod animated;
 pub mod assets;
 pub mod audio;
 pub mod camera3d;
-pub mod camera_dynamics;
 pub mod effect;
 pub mod gpu;
 pub mod graph;
@@ -30,7 +29,7 @@ pub mod tex;
 
 // Convenience re-exports.
 pub use crate::engine::gpu::fbo::{RenderTarget, RenderTargetPool};
-pub use camera_dynamics::{CameraDynamics, CameraFrameDynamics};
+pub use crate::engine::sim::camera_dynamics::{CameraDynamics, CameraFrameDynamics};
 pub use graph::SceneGraph;
 pub use pkg::Package;
 pub use properties::SceneProperties;
