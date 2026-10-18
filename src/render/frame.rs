@@ -58,9 +58,9 @@ impl FrameSource {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
                             tracing::warn!(target: "render", "GPU scene render failed, falling back to CPU: {e}");
-                            if let Err(e2) =
-                                crate::engine::animated::scene_render_loop(&dir, &tx, target_fps)
-                            {
+                            if let Err(e2) = crate::engine::cpu::animated::scene_render_loop(
+                                &dir, &tx, target_fps,
+                            ) {
                                 tracing::error!(target: "render", "CPU scene render error: {e2}");
                             }
                         }
@@ -71,9 +71,9 @@ impl FrameSource {
                                 .or_else(|| panic_val.downcast_ref::<&str>().map(|s| s.to_string()))
                                 .unwrap_or_else(|| "(unknown panic)".into());
                             tracing::error!(target: "render", "GPU render thread panicked: {msg} — falling back to CPU");
-                            if let Err(e2) =
-                                crate::engine::animated::scene_render_loop(&dir, &tx, target_fps)
-                            {
+                            if let Err(e2) = crate::engine::cpu::animated::scene_render_loop(
+                                &dir, &tx, target_fps,
+                            ) {
                                 tracing::error!(target: "render", "CPU scene render error: {e2}");
                             }
                         }
