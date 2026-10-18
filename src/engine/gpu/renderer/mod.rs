@@ -3787,7 +3787,7 @@ impl GpuSceneInstance {
     /// [`Self::apply_user_properties`]).
     pub fn set_user_properties(&mut self, names: &[String]) -> bool {
         let props =
-            crate::engine::properties::SceneProperties::from_project_dir(&self.live_props.dir);
+            crate::workshop::properties::SceneProperties::from_project_dir(&self.live_props.dir);
         self.apply_user_properties(props, names)
     }
 
@@ -3798,7 +3798,7 @@ impl GpuSceneInstance {
     /// built at load, a field scripts can't set).
     fn apply_user_properties(
         &mut self,
-        props: crate::engine::properties::SceneProperties,
+        props: crate::workshop::properties::SceneProperties,
         names: &[String],
     ) -> bool {
         let lp = &mut self.live_props;
@@ -6081,13 +6081,13 @@ pub fn gpu_scene_render_loop(
 struct LiveProps {
     dir: std::path::PathBuf,
     raw: serde_json::Value,
-    props: crate::engine::properties::SceneProperties,
+    props: crate::workshop::properties::SceneProperties,
     resolved: serde_json::Value,
 }
 
 impl LiveProps {
     fn new(dir: &Path, raw: &serde_json::Value) -> Self {
-        let props = crate::engine::properties::SceneProperties::from_project_dir(dir);
+        let props = crate::workshop::properties::SceneProperties::from_project_dir(dir);
         let mut resolved = raw.clone();
         props.resolve_scene_json(&mut resolved);
         Self {
@@ -6766,7 +6766,7 @@ fn build_script_host(
     }
 
     let user_props: serde_json::Map<String, serde_json::Value> =
-        crate::engine::properties::SceneProperties::from_project_dir(dir)
+        crate::workshop::properties::SceneProperties::from_project_dir(dir)
             .iter()
             .map(|p| (p.name.clone(), p.value.clone()))
             .collect();

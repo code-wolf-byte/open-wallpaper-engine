@@ -912,7 +912,7 @@ mod imp {
             return String::new();
         };
 
-        let resolved = crate::engine::properties::SceneProperties::from_project_dir(dir);
+        let resolved = crate::workshop::properties::SceneProperties::from_project_dir(dir);
         for (name, decl) in props.iter_mut() {
             if let Some(value) = resolved.get(name) {
                 decl["value"] = value.clone();
