@@ -646,8 +646,8 @@ fn wallpaper_loop(
                 }
             }
         }
-        crate::engine::audio::set_muted(action >= PlaybackAction::Mute);
-        crate::engine::audio::set_master_volume(settings.default.lock().unwrap().volume);
+        crate::services::audio::set_muted(action >= PlaybackAction::Mute);
+        crate::services::audio::set_master_volume(settings.default.lock().unwrap().volume);
 
         // Stop: drop each output's renderer (scene GPU resources, decoder
         // threads), keeping its last frame on the pixmap; rebuild on resume.

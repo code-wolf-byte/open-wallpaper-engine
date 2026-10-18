@@ -7,6 +7,7 @@ pub mod logging;
 pub mod platform;
 pub mod render;
 pub mod schedule;
+pub mod services;
 pub mod settings;
 pub mod ui;
 pub mod workshop;
