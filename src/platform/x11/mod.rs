@@ -35,17 +35,11 @@ use crate::engine::playback_gate::PlaybackAction;
 use x11rb::wrapper::ConnectionExt as _;
 
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
-use crate::engine::gpu_renderer::GpuSceneInstance;
 use crate::platform;
-use crate::render::{FrameSource, RenderSettings, ScreenContent, ScreenSettings, WallpaperContent};
-
-/// Frames per second for animated content. Matches `FrameSource`'s own target.
-
-/// How often to re-check playback-pause conditions (battery, session lock,
-/// fullscreen/maximized app) — see `engine::playback_gate`. Real I/O (sysfs
-/// reads, an EWMH round trip, a D-Bus call), so this stays well below frame
-/// rate rather than adding that cost to every tick.
-const PAUSE_CHECK_INTERVAL: Duration = Duration::from_millis(750);
+use crate::render::session::{
+    pending_property_edits, ContentRenderer, PlaybackMonitor, WindowState, PAUSE_CHECK_INTERVAL,
+};
+use crate::render::{FrameSource, RenderSettings, ScreenContent, ScreenSettings};
 
 // ── Platform implementation ───────────────────────────────────────────────────
 
@@ -214,34 +208,6 @@ fn discover_outputs(
     }
 }
 
-// ── Content ───────────────────────────────────────────────────────────────────
-
-/// How the wallpaper produces pixels. Both arms end in a CPU RGBA frame —
-/// the root pixmap has no GPU-surface equivalent.
-enum ContentRenderer {
-    Frames(FrameSource),
-    Scene(Box<GpuSceneInstance>),
-}
-
-impl ContentRenderer {
-    fn is_animated(&self) -> bool {
-        match self {
-            ContentRenderer::Frames(fs) => fs.is_animated(),
-            ContentRenderer::Scene(_) => true,
-        }
-    }
-
-    fn next_frame(&mut self) -> Result<Arc<image::RgbaImage>> {
-        match self {
-            ContentRenderer::Frames(fs) => {
-                fs.try_advance();
-                Ok(Arc::clone(fs.current_frame()))
-            }
-            ContentRenderer::Scene(instance) => Ok(Arc::new(instance.render_rgba()?)),
-        }
-    }
-}
-
 // ── PutImage ──────────────────────────────────────────────────────────────────
 
 /// Bytes of fixed overhead in a `PutImage` request (24-byte header, plus slack
@@ -317,15 +283,6 @@ struct EwmhAtoms {
     type_dock: Atom,
 }
 
-/// The active window's state, for the playback policy.
-#[derive(Debug, Default, Clone, Copy)]
-struct ActiveWindow {
-    fullscreen: bool,
-    maximized: bool,
-    /// An application window (not the desktop or a panel) is active.
-    focused: bool,
-}
-
 impl EwmhAtoms {
     fn intern(conn: &impl Connection) -> Result<Self> {
         let atom =
@@ -346,22 +303,22 @@ impl EwmhAtoms {
     /// when there's no active window, the window manager doesn't publish
     /// one, or a request fails — a WM without EWMH support degrades to
     /// "never pauses" rather than erroring the render loop.
-    fn check(&self, conn: &impl Connection, root: Window) -> ActiveWindow {
+    fn check(&self, conn: &impl Connection, root: Window) -> WindowState {
         let Some(active) = read_window32(conn, root, self.active_window) else {
-            return ActiveWindow::default();
+            return WindowState::default();
         };
         if active == 0 || active == root {
-            return ActiveWindow::default();
+            return WindowState::default();
         }
         let types = read_atoms32(conn, active, self.window_type).unwrap_or_default();
         let focused = !types.contains(&self.type_desktop) && !types.contains(&self.type_dock);
         let Some(states) = read_atoms32(conn, active, self.wm_state) else {
-            return ActiveWindow {
+            return WindowState {
                 focused,
                 ..Default::default()
             };
         };
-        ActiveWindow {
+        WindowState {
             fullscreen: states.contains(&self.fullscreen),
             maximized: states.contains(&self.maximized_vert)
                 && states.contains(&self.maximized_horz),
@@ -490,32 +447,6 @@ fn make_click_through(conn: &RustConnection, win: Window) -> Result<()> {
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
-/// Build the renderer for one output's resolved content — the X11 twin of
-/// the Wayland backend's `build_content_renderer`. Split out so each output
-/// gets its own independent `GpuSceneInstance`/`FrameSource` instead of one
-/// shared across the whole root pixmap.
-fn build_content_renderer(
-    content: WallpaperContent,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    web: crate::render::web::WebOptions,
-) -> Result<ContentRenderer> {
-    Ok(match content {
-        WallpaperContent::Scene { dir } => {
-            match GpuSceneInstance::with_device(device, queue, &dir) {
-                Ok(instance) => ContentRenderer::Scene(Box::new(instance)),
-                Err(e) => {
-                    tracing::warn!(target: "wallpaper", "GPU scene init failed ({e}); using frame-loop fallback");
-                    ContentRenderer::Frames(FrameSource::from_content(WallpaperContent::Scene {
-                        dir,
-                    })?)
-                }
-            }
-        }
-        other => ContentRenderer::Frames(FrameSource::from_content_with(other, web)?),
-    })
-}
-
 /// A web wallpaper's page size and frame rate for one output.
 fn web_options(
     rect: OutputRect,
@@ -601,7 +532,7 @@ fn wallpaper_loop(
             .is_some_and(|n| content.by_output.contains_key(n));
         let resolved = content.resolve(named.name.as_deref());
         let web = web_options(named.rect, &settings, named.name.as_deref());
-        match build_content_renderer(resolved, device.clone(), queue.clone(), web) {
+        match ContentRenderer::build(resolved, device.clone(), queue.clone(), true, web) {
             Ok(renderer) => {
                 tracing::info!(
                     target: "wallpaper",
@@ -653,13 +584,7 @@ fn wallpaper_loop(
     // `PAUSE_CHECK_INTERVAL` throttle rather than every frame, since both
     // involve real I/O (sysfs reads, a D-Bus round trip) a 30fps loop
     // shouldn't pay for every tick.
-    let policy = crate::engine::playback_gate::PlaybackPolicy::load();
-    let media = if policy.watches_audio() {
-        crate::engine::media::MediaWatcher::start()
-    } else {
-        None
-    };
-    let mut media_playing = false;
+    let mut playback = PlaybackMonitor::new();
     let mut stopped = false;
     let ewmh = EwmhAtoms::intern(&conn)?;
     let desktop_window = if use_desktop_window(&conn, root, ewmh.type_desktop) {
@@ -675,9 +600,6 @@ fn wallpaper_loop(
             tracing::info!(target: "wallpaper", "X11: showing the wallpaper on the root window")
         }
     }
-    let mut lock_watcher = platform::power::LockWatcher::start();
-    let mut playback_state = crate::engine::playback_gate::PlaybackState::default();
-    let mut last_pause_check = Instant::now() - PAUSE_CHECK_INTERVAL;
 
     // Any output still animating keeps the whole loop going; a genuinely
     // static desktop (every output static) holds the pixmap and sleeps.
@@ -689,37 +611,17 @@ fn wallpaper_loop(
         }
         let started = Instant::now();
 
-        if started.duration_since(last_pause_check) >= PAUSE_CHECK_INTERVAL {
-            last_pause_check = started;
-            let active = ewmh.check(&conn, root);
-            while let Some(info) = media.as_ref().and_then(|m| m.try_recv()) {
-                media_playing = info.playback_state == crate::engine::media::PlaybackState::Playing;
-            }
-            playback_state = crate::engine::playback_gate::PlaybackState {
-                on_battery: platform::power::is_on_battery(),
-                locked_or_sleeping: lock_watcher
-                    .as_mut()
-                    .map(|w| w.is_locked())
-                    .unwrap_or(false),
-                fullscreen_app: active.fullscreen,
-                maximized_app: active.maximized,
-                focused_app: active.focused,
-                other_audio: media_playing,
-            };
-        }
-        let action = crate::engine::playback_gate::decide(&policy, &playback_state);
+        let action = playback.action(started, || ewmh.check(&conn, root));
         let paused = action.halts();
         // Tell web pages about pause edges and frame-rate changes.
         for output in &mut outputs {
             let fps = output.settings.lock().unwrap().fps;
-            if let ContentRenderer::Frames(fs) = &output.renderer {
-                if let Some(tx) = fs.web_input() {
-                    if paused != output.web_paused {
-                        let _ = tx.try_send(crate::render::web::WebInputEvent::Paused(paused));
-                    }
-                    if fps != output.web_fps {
-                        let _ = tx.try_send(crate::render::web::WebInputEvent::Fps(fps));
-                    }
+            if let Some(tx) = output.renderer.web_input() {
+                if paused != output.web_paused {
+                    let _ = tx.try_send(crate::render::web::WebInputEvent::Paused(paused));
+                }
+                if fps != output.web_fps {
+                    let _ = tx.try_send(crate::render::web::WebInputEvent::Fps(fps));
                 }
             }
             output.web_paused = paused;
@@ -728,35 +630,15 @@ fn wallpaper_loop(
         // Live user-property edits for whatever each output shows: scenes
         // apply them in place (or rebuild), web pages get applyUserProperties.
         for output in &mut outputs {
-            if output.settings.lock().unwrap().property_edits.len() == output.props_seen {
-                continue;
-            }
             let resolved = content.resolve(output.named.name.as_deref());
-            let Some(dir) = resolved.project_dir().map(std::path::Path::to_path_buf) else {
-                output.props_seen = output.settings.lock().unwrap().property_edits.len();
+            let Some((dir, names)) =
+                pending_property_edits(&output.settings, &mut output.props_seen, &resolved)
+            else {
                 continue;
             };
-            let edits = output
-                .settings
-                .lock()
-                .unwrap()
-                .property_edits_since(&mut output.props_seen, &dir);
-            if edits.is_empty() {
-                continue;
-            }
-            let rebuild = match &mut output.renderer {
-                ContentRenderer::Scene(scene) => !scene.set_user_properties(&edits),
-                ContentRenderer::Frames(fs) => {
-                    if let Some(tx) = fs.web_input() {
-                        let json = crate::render::web::user_properties_subset(&dir, &edits);
-                        let _ = tx.try_send(crate::render::web::WebInputEvent::Properties(json));
-                    }
-                    false
-                }
-            };
-            if rebuild {
+            if !output.renderer.apply_properties(&dir, &names) {
                 let web = web_options(output.named.rect, &settings, output.named.name.as_deref());
-                match build_content_renderer(resolved, device.clone(), queue.clone(), web) {
+                match ContentRenderer::build(resolved, device.clone(), queue.clone(), true, web) {
                     Ok(r) => output.renderer = r,
                     Err(e) => {
                         tracing::error!(target: "wallpaper", "reloading output {:?}: {e}", output.named.name)
@@ -782,7 +664,7 @@ fn wallpaper_loop(
             for output in &mut outputs {
                 let resolved = content.resolve(output.named.name.as_deref());
                 let web = web_options(output.named.rect, &settings, output.named.name.as_deref());
-                match build_content_renderer(resolved, device.clone(), queue.clone(), web) {
+                match ContentRenderer::build(resolved, device.clone(), queue.clone(), true, web) {
                     Ok(r) => output.renderer = r,
                     Err(e) => {
                         tracing::error!(target: "wallpaper", "resuming output {:?}: {e}", output.named.name)
