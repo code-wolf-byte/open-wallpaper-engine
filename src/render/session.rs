@@ -16,8 +16,8 @@ use super::web::{WebInputEvent, WebOptions};
 use super::{FrameSource, RenderSettings, WallpaperContent};
 use crate::engine::gpu::renderer::GpuSceneInstance;
 use crate::engine::playback_gate::{self, PlaybackAction, PlaybackPolicy, PlaybackState};
-use crate::platform::power::{self, LockWatcher};
 use crate::services::media::{MediaWatcher, PlaybackState as MediaState};
+use crate::services::power::{self, LockWatcher};
 
 /// How often the playback conditions are re-checked. Each check is real I/O
 /// (sysfs reads, a D-Bus call, a window-manager query), so this stays well
