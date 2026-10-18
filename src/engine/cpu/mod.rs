@@ -2,6 +2,7 @@
 //! Production rendering is `engine::gpu::renderer`.
 
 pub mod animated;
+pub mod compose;
 pub mod effect;
 pub mod graph;
 pub mod material;
