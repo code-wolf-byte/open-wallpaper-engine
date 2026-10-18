@@ -58,7 +58,7 @@ pub enum CaptureSource {
 ///
 /// Global because the renderer builds its `AudioCapture` deep inside a scene
 /// load on its own thread, with no path to thread a setting through — the same
-/// reason `engine::properties` keeps its overrides this way.
+/// reason `workshop::properties` keeps its overrides this way.
 static PREFERRED: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
 /// Override automatic selection. Pass `None` to go back to automatic.
