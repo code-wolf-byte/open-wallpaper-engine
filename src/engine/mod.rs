@@ -7,7 +7,6 @@
 pub mod animated;
 pub mod assets;
 pub mod audio;
-pub mod blend;
 pub mod camera3d;
 pub mod camera_dynamics;
 pub mod effect;
