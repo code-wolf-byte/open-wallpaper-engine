@@ -308,7 +308,7 @@ impl General {
     /// Resolve the scene's fog parameters from the `g_Fog*` property surface.
     ///
     /// Returns `None` when both distance and height fog density are 0 / unset
-    /// (fog off). The caller (render.rs / gpu_renderer.rs) should only run
+    /// (fog off). The caller (model::resolve / gpu::renderer) should only run
     /// the fog pass when this returns `Some`.
     pub fn fog(&self) -> Option<crate::engine::gpu::lighting::Fog> {
         use crate::engine::gpu::lighting::Fog;
@@ -607,7 +607,7 @@ pub struct SceneObject {
     /// A static 3D mesh reference (`models/x/x.mdl`) — an alternative to
     /// `image` used by genuine 3D scenes for spheres/skyboxes/cylinders. NOT
     /// redundant with `image`: these objects carry no `image` at all, so
-    /// without this they're skipped entirely. See `engine::mesh3d`.
+    /// without this they're skipped entirely. See `engine::model::mesh3d`.
     #[serde(default)]
     pub model: Option<serde_json::Value>,
 }
@@ -624,7 +624,7 @@ impl SceneObject {
     }
 
     /// Resolve `(radius, intensity, color)` for a `light` object — `None` when
-    /// this isn't one. Shared by the 2D glow stand-in (`render.rs`) and the
+    /// this isn't one. Shared by the 2D glow stand-in (`model::resolve`) and the
     /// mesh3d per-pixel lighting pass (`Scene::lights`), so both treat a
     /// `light` object's fields identically.
     pub fn light_params(&self) -> Option<(f32, f32, [f32; 3])> {
@@ -669,7 +669,7 @@ impl SceneObject {
     /// folder, so they're unreachable here — this only resolves to
     /// something real for a wallpaper that ships its own cookie image
     /// relative to its own directory (same resolution rules as any other
-    /// texture reference — see `GpuSceneInstance::build` in gpu_renderer.rs).
+    /// texture reference — see `GpuSceneInstance::build` in gpu::renderer).
     pub fn cookie_texture_path(&self) -> Option<&str> {
         let on = self
             .usecookie
@@ -700,7 +700,7 @@ impl SceneObject {
     /// `(density, exponent)` for a volumetric light shaft, when
     /// `castvolumetrics` is truthy — `None` otherwise. See
     /// `GpuSceneInstance::build_volumetrics`/`record_volumetrics` in
-    /// gpu_renderer.rs for the consumer; defaults picked to give a
+    /// gpu::renderer for the consumer; defaults picked to give a
     /// visible-but-not-overwhelming shaft when a scene sets
     /// `castvolumetrics` without also tuning `density`/`volumetricsexponent`
     /// — unverified against real content, no downloaded Workshop light
@@ -762,7 +762,7 @@ impl SceneObject {
 /// discriminant and the endpoint field are both known). Not shadow-mapped
 /// (matches Point/Spot's own staged rollout — shadows for spot lights only
 /// shipped after point lights had already been working for a while) — no
-/// tube-light case exists in `engine::shadow` yet.
+/// tube-light case exists in `engine::gpu::shadow` yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LightType {
     Point,
