@@ -2,6 +2,7 @@ pub mod dynamic_value;
 pub mod objects;
 pub mod parser;
 pub mod property;
+pub mod scene;
 pub mod shader_model;
 
 pub use dynamic_value::{AnimatedValue, DynamicValue};
