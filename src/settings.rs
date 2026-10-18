@@ -59,13 +59,13 @@ pub struct WpSettings {
     pub fps: Option<u32>,
     /// How video, image and web wallpapers fit the screen; `None` = fill.
     #[serde(default)]
-    pub scaling: Option<crate::render::ScaleMode>,
+    pub scaling: Option<crate::content::ScaleMode>,
     /// The playlist `wp-engine run` plays, if any.
     #[serde(default)]
     pub active_playlist: Option<String>,
     /// Per-screen, span or clone; `None` = per-screen.
     #[serde(default)]
-    pub layout: Option<crate::render::ScreenLayout>,
+    pub layout: Option<crate::content::ScreenLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
