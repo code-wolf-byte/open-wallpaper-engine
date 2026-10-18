@@ -1314,7 +1314,7 @@ impl ParticleSystem {
     /// Build a running particle system for one scene object.
     ///
     /// `spawn_center` is the object's own scene position, already converted to
-    /// canvas pixel coordinates (see `render.rs`'s WE-origin-to-pixel
+    /// canvas pixel coordinates (see `model::resolve`'s WE-origin-to-pixel
     /// conversion) — a WE emitter's own `origin` field is a *local* offset
     /// from the object's position, not an absolute canvas coordinate.
     pub fn from_config(
@@ -4054,7 +4054,7 @@ fn value_as_f32(v: &serde_json::Value) -> Option<f32> {
     v.as_f64().map(|f| f as f32)
 }
 
-/// Public alias for callers outside this module (e.g. render.rs's
+/// Public alias for callers outside this module (e.g. model::resolve's
 /// control-point override plumbing).
 pub fn value_as_vec3_pub(v: &serde_json::Value) -> Option<[f32; 3]> {
     value_as_vec3(v)
