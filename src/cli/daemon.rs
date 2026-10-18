@@ -1,4 +1,5 @@
-//! Talking to the background daemon: `daemon`, `status`, `stop` and `playlist` (Linux; elsewhere they report the daemon is unavailable).
+//! Talking to the background daemon: `daemon`, `status`, `stop` and `playlist`
+//! (Linux; elsewhere they report the daemon is unavailable).
 
 use super::*;
 
