@@ -43,7 +43,7 @@ impl SceneAnimState {
         // ponytail: layers flatten to one image here, so an embedded-video
         // layer's stream handle is dropped and this path shows its first frame
         // forever. The live GPU path streams them properly
-        // (`gpu_renderer`'s per-frame `latest_frame` re-upload); this is only
+        // (`gpu::renderer`'s per-frame `latest_frame` re-upload); this is only
         // the fallback for when GPU init fails, and streaming here would mean a
         // Lanczos3 resize of a 4K frame every tick on the CPU. Carry the
         // `video` handle through and swap per frame if that fallback ever
@@ -194,7 +194,7 @@ fn load_particles(
 
     // WE origin is the object's center in absolute scene coordinates
     // (Y-up, (0,0) at bottom-left); convert to top-left pixel coords, matching
-    // render.rs's image-layer positioning.
+    // model::resolve's image-layer positioning.
     let origin = obj.parsed_origin();
     let spawn_center = [origin[0] as f32, height as f32 - origin[1] as f32];
 
@@ -229,7 +229,7 @@ fn load_particles(
 /// `"materials/presets/water_faucet.json"`) to its first pass's base
 /// texture (every sprite-sheet frame, if animated), following one level of
 /// `material`-field indirection in case the path points at a model JSON
-/// instead (mirrors `render.rs`'s `resolve_particle_sprite_dir`/`_pkg`, but
+/// instead (mirrors `model::resolve`'s `resolve_particle_sprite_dir`/`_pkg`, but
 /// via `AssetStore` since this loader doesn't have direct `dir`/`pkg` access).
 fn resolve_particle_sprite(assets: &AssetStore, material_path: &str) -> Option<ParticleSprite> {
     let mut val: serde_json::Value = assets.read_json(material_path).ok()?;
