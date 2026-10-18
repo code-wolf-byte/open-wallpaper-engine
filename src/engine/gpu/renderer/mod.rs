@@ -11,6 +11,17 @@
 //! - when scene bloom is enabled a threshold → blur chain runs over
 //!   quarter/eighth-res buffers (`_rt_4FrameBuffer` / `_rt_8FrameBuffer`)
 //!   and is added back onto the scene target.
+//!
+//! This file holds the types, constants and constructors; the behaviour is
+//! split by role:
+//! - `pipelines`: device-level state on [`GpuSceneRenderer`] (samplers, bind
+//!   group layouts, pipeline cache, pass-recording helpers)
+//! - `build`: turning a scene into a running [`GpuSceneInstance`]
+//! - `live`: changes while it runs (timelines, SceneScript, cursor events,
+//!   property edits, script-created objects)
+//! - `draw`: rendering a frame and presenting it
+//! - `lights`: shadow atlas, volumetrics, mesh lighting data
+//! - `params`: packing effect constants into uniform buffers
 
 use anyhow::{anyhow, Context, Result};
 use image::RgbaImage;
