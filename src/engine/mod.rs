@@ -17,7 +17,6 @@ pub mod material;
 pub mod media;
 pub mod mesh3d;
 pub mod model;
-pub mod noise;
 pub mod particle;
 pub mod pkg;
 pub mod playback_gate;
@@ -26,6 +25,7 @@ pub mod puppet;
 pub mod render;
 pub mod scene;
 pub mod script;
+pub mod sim;
 pub mod tex;
 pub mod timeline;
 
