@@ -1,3 +1,11 @@
+//! Wallpaper Engine GLSL to WGSL: [`translate_full`] assembles a pass's
+//! shader source, compiles it to SPIR-V with shaderc, and translates that to
+//! WGSL with Naga, collecting the uniforms the pass must bind.
+//!
+//! - `preprocess`: building the GLSL from the shader model
+//! - `rewrite`: fixes applied before compiling (unrolling, coercions)
+//! - `repair`: fixes driven by compile errors, and the SPIR-V/WGSL steps
+
 use crate::engine::model::ShaderModel;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
