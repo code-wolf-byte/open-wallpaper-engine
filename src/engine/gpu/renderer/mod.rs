@@ -23,9 +23,9 @@ use std::time::{Duration, Instant};
 use crate::engine::gpu::fbo::RenderTargetPool;
 use crate::engine::gpu::shaders::{effect_def, loader, resolver, transpiler};
 use crate::engine::model::{ShaderModel, WEBlending};
-use crate::engine::particle;
 use crate::engine::scene::{parse_value_bool, parse_value_f32};
 use crate::engine::sim::camera_dynamics::{CameraDynamics, CameraFrameDynamics};
+use crate::engine::sim::particle;
 use crate::platform::GpuDevice;
 
 const SHADER_SRC: &str = include_str!("gpu_shaders.wgsl");
