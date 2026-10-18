@@ -4,7 +4,7 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
 
-use super::content::WallpaperContent;
+use crate::content::wallpaper::WallpaperContent;
 
 /// A live source of RGBA frames for the Wayland renderer.
 ///
