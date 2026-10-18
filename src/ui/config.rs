@@ -4,8 +4,8 @@
 //! `settings.json`, the same file `wp-engine config` writes.
 
 use super::{StatusMsg, WpApp, DANGER, TEXT_MUTED};
+use crate::content::ScaleMode;
 use crate::platform::RenderQuality;
-use crate::render::ScaleMode;
 use crate::services::playback_gate::PlaybackAction;
 use crate::settings::{Playlist, WpSettings};
 use crate::workshop::properties::SceneProperty;
@@ -423,7 +423,7 @@ impl WpApp {
         let mut fps = self
             .saved
             .fps
-            .unwrap_or(crate::render::settings::DEFAULT_FPS);
+            .unwrap_or(crate::content::settings::DEFAULT_FPS);
         let r = ui.add(egui::Slider::new(&mut fps, 1..=240).text("Frame-rate cap"));
         if r.changed() {
             self.saved.fps = Some(fps);
