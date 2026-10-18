@@ -7,7 +7,6 @@
 pub mod assets;
 pub mod audio;
 pub mod cpu;
-pub mod effect;
 pub mod gpu;
 pub mod graph;
 pub mod material;

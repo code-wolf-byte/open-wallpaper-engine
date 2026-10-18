@@ -1957,7 +1957,7 @@ fn pass_constant_color(pass: &serde_json::Value) -> Option<[u8; 3]> {
         .get("color")
         .or_else(|| consts.get("Color"))?
         .as_str()?;
-    let c = crate::engine::effect::parse_color(s);
+    let c = crate::engine::cpu::effect::parse_color(s);
     Some([
         (c[0].clamp(0.0, 1.0) * 255.0) as u8,
         (c[1].clamp(0.0, 1.0) * 255.0) as u8,
