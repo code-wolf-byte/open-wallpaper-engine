@@ -15,7 +15,7 @@
 
 **Presents on**&nbsp;
 <img alt="Wayland via wlr-layer-shell" src="https://img.shields.io/badge/Wayland-layer--shell-FFBC00?style=flat-square">
-<img alt="X11 via root pixmap" src="https://img.shields.io/badge/X11-root_pixmap-F28834?style=flat-square">
+<img alt="X11 via desktop window or root pixmap" src="https://img.shields.io/badge/X11-desktop_window-F28834?style=flat-square">
 <img alt="macOS desktop window" src="https://img.shields.io/badge/macOS-desktop_window-333333?style=flat-square&logo=apple&logoColor=white">
 
 **Built on**&nbsp;
@@ -89,7 +89,7 @@ Presentation needs one of:
 | --- | --- |
 | Wayland | a compositor with `wlr-layer-shell` (Sway, Hyprland, river, labwc, wayfire, KDE, COSMIC, …) |
 | GNOME (Wayland) | the bundled Shell extension — see [GNOME](#gnome) |
-| X11 | any window manager |
+| X11 | any window manager or desktop (KDE, Xfce, GNOME, Cinnamon, MATE, …) |
 | macOS | no extra requirement |
 
 Windows is out of scope — see [Project status](#project-status).
@@ -318,7 +318,7 @@ built, and several are deliberately skipped as unreachable.
 - multiple monitors: a wallpaper per screen, one spanned across all of them,
   or one cloned onto each
 - presentation: Wayland layer-shell (direct `wgpu::Surface`, no readback),
-  X11 root pixmap, macOS desktop window, CPU/SHM fallback everywhere
+  X11 desktop window (root pixmap on bare WMs), macOS desktop window, CPU/SHM fallback everywhere
 - application lifecycle (`WallpaperApplication`, `--set-property`, signals)
 
 </details>
@@ -389,6 +389,9 @@ means the extension isn't enabled.
   rather than trusting the log when bisecting.
 - `WP_ENGINE_FORCE_SHM=1` — force the CPU/SHM presentation path
 - `WP_ENGINE_FORCE_X11=1` — take the X11 path even under a Wayland session
+- `WP_ENGINE_X11_MODE=root|window` — on X11, draw only on the root window
+  (bare window managers' default) or in a desktop window (the default where
+  the window manager supports EWMH desktop windows)
 - `WP_ENGINE_XDG_WALLPAPER=1` — use the GNOME-style window instead of layer-shell
 
 **A web wallpaper says the binary lacks web support.** It was built without

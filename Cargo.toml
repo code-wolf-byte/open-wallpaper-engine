@@ -107,7 +107,7 @@ calloop-wayland-source  = "0.2"
 # X11 display backend — root-window pixmap + RandR output discovery. Pure Rust
 # (no libX11 link), and already in the tree via winit, so declaring it direct
 # adds no build cost.
-x11rb                   = { version = "0.13", features = ["randr"] }
+x11rb                   = { version = "0.13", features = ["randr", "shape", "xfixes"] }
 
 # MPRIS media integration (engine::media) — pure-Rust DBus, no libdbus-1 link,
 # matching every other platform dependency's own no-C-library preference

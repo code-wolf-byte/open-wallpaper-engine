@@ -1,11 +1,14 @@
-//! X11 display backend — draws into the root window's background pixmap.
+//! X11 display backend — draws into a root-sized pixmap and shows it as the
+//! root window's background (the `_XROOTPMAP_ID` / `ESETROOT_PMAP_ID`
+//! convention `feh --bg` uses, as `X11Output.cpp` in the reference does).
 //!
-//! This mirrors `X11Output.cpp` in the reference rather than creating a
-//! `_NET_WM_WINDOW_TYPE_DESKTOP` window: every WM and DE honours the root
-//! pixmap plus the `_XROOTPMAP_ID` / `ESETROOT_PMAP_ID` convention (it is what
-//! `feh --bg` and `hsetroot` set), whereas a desktop-type window competes with
-//! whatever desktop surface GNOME/KDE/Xfce already draw and loses differently
-//! on each.
+//! Desktop environments cover the root with their own desktop (plasmashell,
+//! xfdesktop, Mutter's background actor, caja/nemo), so when the window
+//! manager supports EWMH desktop windows the same pixmap also backs a
+//! click-through `_NET_WM_WINDOW_TYPE_DESKTOP` window of our own, which the WM
+//! keeps beneath every application window. Bare window managers without that
+//! support (dwm, i3) would tile such a window, so they get the root only.
+//! `WP_ENGINE_X11_MODE=root|window` overrides the choice.
 //!
 //! Unlike the Wayland backend there is no direct-presentation path: X11 has no
 //! equivalent of handing the compositor a GPU surface for the desktop
@@ -22,9 +25,10 @@ use std::time::{Duration, Instant};
 use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateGCAux, Gcontext,
-    ImageFormat, KeyButMask, Pixmap, PropMode, Window,
+    Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateGCAux, CreateWindowAux,
+    Gcontext, ImageFormat, KeyButMask, Pixmap, PropMode, Screen, Window, WindowClass,
 };
+use x11rb::protocol::{shape, xfixes::ConnectionExt as _};
 use x11rb::rust_connection::RustConnection;
 
 use crate::engine::playback_gate::PlaybackAction;
@@ -389,6 +393,101 @@ fn read_atoms32(conn: &impl Connection, window: Window, property: Atom) -> Optio
     Some(values.collect())
 }
 
+// ── Desktop window ────────────────────────────────────────────────────────────
+
+/// Whether to show the wallpaper in our own desktop window (see the module
+/// doc): forced by `WP_ENGINE_X11_MODE`, otherwise when the window manager
+/// lists `_NET_WM_WINDOW_TYPE_DESKTOP` in `_NET_SUPPORTED`.
+fn use_desktop_window(conn: &impl Connection, root: Window, desktop_type: Atom) -> bool {
+    match std::env::var("WP_ENGINE_X11_MODE").as_deref() {
+        Ok("root") => false,
+        Ok("window") => true,
+        _ => conn
+            .intern_atom(false, b"_NET_SUPPORTED")
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| read_atoms32(conn, root, r.atom))
+            .is_some_and(|supported| supported.contains(&desktop_type)),
+    }
+}
+
+/// A root-sized desktop window whose background is `pixmap`: sticky, below
+/// everything, out of taskbars and pagers, and click-through so presses
+/// still reach the desktop icons and menus underneath (the cursor is polled
+/// globally anyway).
+fn create_desktop_window(conn: &RustConnection, screen: &Screen, pixmap: Pixmap) -> Result<Window> {
+    let win = conn.generate_id()?;
+    conn.create_window(
+        screen.root_depth,
+        win,
+        screen.root,
+        0,
+        0,
+        screen.width_in_pixels,
+        screen.height_in_pixels,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        screen.root_visual,
+        &CreateWindowAux::new().background_pixmap(pixmap),
+    )?;
+    let atom = |name: &[u8]| -> Result<Atom> { Ok(conn.intern_atom(false, name)?.reply()?.atom) };
+    conn.change_property32(
+        PropMode::REPLACE,
+        win,
+        atom(b"_NET_WM_WINDOW_TYPE")?,
+        AtomEnum::ATOM,
+        &[atom(b"_NET_WM_WINDOW_TYPE_DESKTOP")?],
+    )?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        win,
+        atom(b"_NET_WM_STATE")?,
+        AtomEnum::ATOM,
+        &[
+            atom(b"_NET_WM_STATE_BELOW")?,
+            atom(b"_NET_WM_STATE_STICKY")?,
+            atom(b"_NET_WM_STATE_SKIP_TASKBAR")?,
+            atom(b"_NET_WM_STATE_SKIP_PAGER")?,
+        ],
+    )?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        win,
+        atom(b"_NET_WM_DESKTOP")?,
+        AtomEnum::CARDINAL,
+        &[u32::MAX],
+    )?;
+    conn.change_property8(
+        PropMode::REPLACE,
+        win,
+        AtomEnum::WM_NAME,
+        AtomEnum::STRING,
+        b"wp-engine",
+    )?;
+    conn.change_property8(
+        PropMode::REPLACE,
+        win,
+        AtomEnum::WM_CLASS,
+        AtomEnum::STRING,
+        b"wp-engine\0wp-engine\0",
+    )?;
+    if let Err(e) = make_click_through(conn, win) {
+        tracing::warn!(target: "wallpaper", "no XFixes ({e}); desktop window will take clicks");
+    }
+    conn.map_window(win)?;
+    Ok(win)
+}
+
+/// An empty input shape: pointer events pass through to whatever is below.
+fn make_click_through(conn: &RustConnection, win: Window) -> Result<()> {
+    conn.xfixes_query_version(5, 0)?.reply()?;
+    let region = conn.generate_id()?;
+    conn.xfixes_create_region(region, &[])?;
+    conn.xfixes_set_window_shape_region(win, shape::SK::INPUT, 0, 0, region)?;
+    conn.xfixes_destroy_region(region)?;
+    Ok(())
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 /// Build the renderer for one output's resolved content — the X11 twin of
@@ -563,6 +662,19 @@ fn wallpaper_loop(
     let mut media_playing = false;
     let mut stopped = false;
     let ewmh = EwmhAtoms::intern(&conn)?;
+    let desktop_window = if use_desktop_window(&conn, root, ewmh.type_desktop) {
+        Some(create_desktop_window(&conn, screen, pixmap)?)
+    } else {
+        None
+    };
+    match desktop_window {
+        Some(win) => {
+            tracing::info!(target: "wallpaper", "X11: showing the wallpaper in desktop window {win:#x}")
+        }
+        None => {
+            tracing::info!(target: "wallpaper", "X11: showing the wallpaper on the root window")
+        }
+    }
     let mut lock_watcher = platform::power::LockWatcher::start();
     let mut playback_state = crate::engine::playback_gate::PlaybackState::default();
     let mut last_pause_check = Instant::now() - PAUSE_CHECK_INTERVAL;
@@ -727,8 +839,11 @@ fn wallpaper_loop(
                 root,
                 &ChangeWindowAttributesAux::new().background_pixmap(pixmap),
             )?;
-            // Repaint the root from its new background.
+            // Repaint the root (and our desktop window) from the new frame.
             conn.clear_area(false, root, 0, 0, 0, 0)?;
+            if let Some(win) = desktop_window {
+                conn.clear_area(false, win, 0, 0, 0, 0)?;
+            }
             conn.flush()?;
         }
 
@@ -766,9 +881,15 @@ fn wallpaper_loop(
                     ContentRenderer::Scene(scene) => {
                         scene.set_mouse(norm);
                         // The button mask is global: only count presses made
-                        // on the bare desktop (no window under the pointer).
+                        // on the bare desktop (no window, or a desktop window
+                        // — ours is click-through, so the DE's or none).
                         let mask: u16 = pointer.mask.into();
-                        if pointer.child == x11rb::NONE {
+                        let on_desktop = pointer.child == x11rb::NONE
+                            || Some(pointer.child) == desktop_window
+                            || (mask & u16::from(KeyButMask::BUTTON1) != 0
+                                && read_atoms32(&conn, pointer.child, ewmh.window_type)
+                                    .is_some_and(|t| t.contains(&ewmh.type_desktop)));
+                        if on_desktop {
                             scene.set_mouse_button(mask & u16::from(KeyButMask::BUTTON1) != 0);
                         } else {
                             scene.set_mouse_button(false);
