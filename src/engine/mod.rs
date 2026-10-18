@@ -13,7 +13,6 @@ pub mod graph;
 pub mod material;
 #[cfg(target_os = "linux")]
 pub mod media;
-pub mod mesh3d;
 pub mod model;
 pub mod pkg;
 pub mod playback_gate;
