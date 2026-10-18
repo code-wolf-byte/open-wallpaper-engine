@@ -272,7 +272,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     results.sort_by(|a, b| a.id.cmp(&b.id));
 
     // ── Write errors.txt ──────────────────────────────────────────────────────
-    let out_path = "src/tests/errors.txt";
+    // Generated output: target/ is already ignored and always exists after a build.
+    let out_path = "target/scan-wallpapers-errors.txt";
     let mut out = fs::File::create(out_path)?;
 
     for r in &results {
