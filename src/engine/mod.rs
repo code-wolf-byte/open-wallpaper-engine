@@ -11,7 +11,6 @@ pub mod camera3d;
 pub mod camera_dynamics;
 pub mod effect;
 pub mod gpu;
-pub mod gpu_renderer;
 pub mod graph;
 pub mod material;
 #[cfg(target_os = "linux")]
