@@ -107,7 +107,7 @@ calloop-wayland-source  = "0.2"
 # X11 display backend — root-window pixmap + RandR output discovery. Pure Rust
 # (no libX11 link), and already in the tree via winit, so declaring it direct
 # adds no build cost.
-x11rb                   = { version = "0.13", features = ["randr"] }
+x11rb                   = { version = "0.13", features = ["randr", "shape", "xfixes"] }
 
 # MPRIS media integration (engine::media) — pure-Rust DBus, no libdbus-1 link,
 # matching every other platform dependency's own no-C-library preference
@@ -115,6 +115,9 @@ x11rb                   = { version = "0.13", features = ["randr"] }
 # codebase otherwise has none of (every other platform loop is thread/poll
 # based — see the CEF thread, the X11/Wayland render loops).
 zbus                    = { version = "5", default-features = false, features = ["blocking-api"] }
+# Tray icon (StatusNotifierItem) for the daemon. Built on the zbus above;
+# async-io is already in the tree through it, so no tokio.
+ksni                    = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }
 
 # CEF (Chromium) for web wallpapers — optional, see the `web` feature. Pulled
 # in only when that feature is on, so the default build never downloads

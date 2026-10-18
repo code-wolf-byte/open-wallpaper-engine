@@ -3,8 +3,8 @@
 <p>
   <a href="LICENSE"><img alt="License: GPL-3.0-only" src="https://img.shields.io/badge/license-GPL--3.0--only-blue?style=flat-square"></a>
   <img alt="Written in Rust, 2021 edition" src="https://img.shields.io/badge/Rust-2021_edition-CE422B?style=flat-square&logo=rust&logoColor=white">
-  <img alt="Top language" src="https://img.shields.io/github/languages/top/code-wolf-byte/wp-engine?style=flat-square">
-  <img alt="Last commit" src="https://img.shields.io/github/last-commit/code-wolf-byte/wp-engine?style=flat-square">
+  <img alt="Top language" src="https://img.shields.io/github/languages/top/code-wolf-byte/open-wallpaper-engine?style=flat-square">
+  <img alt="Last commit" src="https://img.shields.io/github/last-commit/code-wolf-byte/open-wallpaper-engine?style=flat-square">
 </p>
 
 **Renders**&nbsp;
@@ -15,7 +15,7 @@
 
 **Presents on**&nbsp;
 <img alt="Wayland via wlr-layer-shell" src="https://img.shields.io/badge/Wayland-layer--shell-FFBC00?style=flat-square">
-<img alt="X11 via root pixmap" src="https://img.shields.io/badge/X11-root_pixmap-F28834?style=flat-square">
+<img alt="X11 via desktop window or root pixmap" src="https://img.shields.io/badge/X11-desktop_window-F28834?style=flat-square">
 <img alt="macOS desktop window" src="https://img.shields.io/badge/macOS-desktop_window-333333?style=flat-square&logo=apple&logoColor=white">
 
 **Built on**&nbsp;
@@ -87,8 +87,9 @@ Presentation needs one of:
 
 | Platform | Requirement |
 | --- | --- |
-| Wayland | a compositor with `wlr-layer-shell` (Sway, Hyprland, river, labwc, wayfire, …) |
-| X11 | any window manager |
+| Wayland | a compositor with `wlr-layer-shell` (Sway, Hyprland, river, labwc, wayfire, KDE, COSMIC, …) |
+| GNOME (Wayland) | the bundled Shell extension — see [GNOME](#gnome) |
+| X11 | any window manager or desktop (KDE, Xfce, GNOME, Cinnamon, MATE, …) |
 | macOS | no extra requirement |
 
 Windows is out of scope — see [Project status](#project-status).
@@ -112,8 +113,8 @@ brew install shaderc ffmpeg
 Then build:
 
 ```bash
-git clone https://github.com/code-wolf-byte/wp-engine
-cd wp-engine
+git clone https://github.com/code-wolf-byte/open-wallpaper-engine
+cd open-wallpaper-engine
 cargo build --release
 ```
 
@@ -145,6 +146,22 @@ reuse an existing CEF distribution instead of downloading one.
 Leave the feature off unless you need web wallpapers — the default build touches
 none of this, and without it web wallpapers report that the binary lacks web
 support rather than failing obscurely.
+
+### GNOME
+
+GNOME doesn't implement `wlr-layer-shell`, so there wp-engine opens one plain
+window per monitor and a small GNOME Shell extension (GNOME 45+) moves it into
+the desktop background. Install and enable it once, then log out and back in:
+
+```bash
+cp -r extras/gnome-shell-extension/wp-engine@code-wolf-byte.github.io \
+  ~/.local/share/gnome-shell/extensions/
+gnome-extensions enable wp-engine@code-wolf-byte.github.io
+```
+
+Without the extension the wallpaper shows up as an ordinary window.
+`WP_ENGINE_XDG_WALLPAPER=1` forces this window mode on any compositor, for
+testing.
 
 ## Usage
 
@@ -182,8 +199,16 @@ all hand their wallpaper to a single background daemon, replacing whatever it
 was showing, so the wallpaper keeps running after the terminal or GUI window
 closes. Pass `--foreground` to `set`/`set-file`/`run` to render in the current
 process until Ctrl-C instead. To start the wallpaper with your session, run
-`wp-engine run` (it restores your saved `config` setup) from your compositor's
-autostart, or run `wp-engine daemon` as a service and `wp-engine run` after it.
+`wp-engine autostart on` (an XDG autostart entry for `wp-engine run`, which
+restores your saved `config` setup), or run `wp-engine daemon` as a service and
+`wp-engine run` after it. The daemon shows a tray icon with playlist controls
+and a shortcut back to the GUI; set `WP_ENGINE_NO_TRAY=1` to hide it.
+
+The GUI follows Wallpaper Engine's own browser. Clicking a wallpaper applies it
+to the display picked under **Displays** (all of them by default), the right-hand
+panel edits its properties, the bar under the grid builds and plays playlists,
+and **⚙ Settings** holds playback rules, quality, frame rate, audio and
+autostart. **Cancel** restores what was showing when the window opened.
 The daemon's socket and lock live in `$XDG_RUNTIME_DIR/wp-engine/`; a daemon
 started in the background logs to `$XDG_STATE_HOME/wp-engine/daemon.log`.
 
@@ -192,16 +217,20 @@ started in the background logs to `$XDG_STATE_HOME/wp-engine/daemon.log`.
 | `list` | List installed Workshop wallpapers |
 | `set <id>` | Apply a wallpaper by Workshop ID |
 | `set-file <path>` | Apply a scene directory, video, image, or HTML file |
+| `playlist play <name>` | Rotate through a saved playlist (`next`, `previous`, `stop`) |
+| `config …` | Saved settings: properties, screens, playlists, playback rules, FPS, scaling |
+| `autostart on\|off` | Start `wp-engine run` at login |
 | `run` | Apply the saved `config` setup (per-screen wallpapers, default) |
 | `status` | Show what the background daemon is displaying |
 | `stop` | Remove the wallpaper and stop the background daemon |
 | `daemon` | Run the daemon in the foreground (normally auto-started) |
 | `info <id>` | Show a Workshop item's metadata |
 | `list-properties <id>` | Show the properties a wallpaper exposes |
-| `probe` | List GPU adapters visible to the process |
+| `probe` | List GPU adapters and screen names |
 | `pkg-info <path>` | Inspect or extract a `.pkg` archive |
 | `tex-info <path>` | Inspect a `.tex` texture |
 | `render-scene <id>` | Render one frame to a PNG |
+| `render-frame <id>` | Render a video, image or web wallpaper's frame to a PNG |
 | `preview-scene <id>` | Preview an animated scene in a window |
 | `test-scene <id>` | Check that a scene animates, headless |
 
@@ -215,6 +244,23 @@ Wallpapers expose their own settings — colours, speeds, toggles. List them wit
 `wp-engine list-properties <id>` and override them with `--set-property
 NAME=VALUE`, which is applied before `scene.json` is parsed.
 
+### Playback, playlists and display
+
+```bash
+# Pause behind fullscreen apps, mute while another app plays audio
+wp-engine config set-playback fullscreen pause
+wp-engine config set-playback audio mute
+wp-engine config set-fps 60
+wp-engine config set-scaling fit          # fill, fit, stretch, center
+wp-engine config set-layout span          # per-screen, span, clone
+
+# A playlist that changes every 30 minutes, played by `wp-engine run`
+wp-engine config set-playlist evening 1275921440 2156479578 --delay 30
+wp-engine config set-active-playlist evening
+```
+
+`wp-engine config --help` lists every setting.
+
 ### Environment variables
 
 | Variable | Effect |
@@ -222,6 +268,8 @@ NAME=VALUE`, which is applied before `scene.json` is parsed.
 | `WP_ENGINE_FORCE_X11=1` | Take the X11 path even under a Wayland session |
 | `WP_ENGINE_FORCE_SHM=1` | Force the CPU/SHM presentation path |
 | `WP_ENGINE_SKIP_EFFECTS=a,b` | Disable named effects |
+| `WP_ENGINE_NO_TRAY=1` | Run the daemon without a tray icon |
+| `WP_ENGINE_PAUSE_ON_{FOCUS,MAXIMIZED,FULLSCREEN,AUDIO,BATTERY,LOCK}` | Override a playback rule (`run`/`mute`/`pause`/`stop`) |
 | `CEF_PATH` | Reuse an existing CEF distribution instead of downloading one |
 | `SHADERC_LIB_DIR` | Where to find shaderc, if not on the default search path |
 | `RUST_LOG` | Standard `tracing` filter; overrides `-v` |
@@ -252,15 +300,27 @@ built, and several are deliberately skipped as unreachable.
 - puppet `.mdl` mesh loading with bones, skinning, and animation layers
 - text objects: system + bundled fonts, wrapping, alignment, backgrounds
 - light and sound objects
-- SceneScript property scripting (text, alpha, visible, scale, origin, angles)
+- SceneScript: persistent per-object scripts with `init`/`update`, the
+  `thisLayer`/`thisScene`/`engine`/`input`/`shared` APIs, cursor events,
+  sounds, texture animations, effect and material access, created layers
+- property animations (keyframed timelines with events)
+- presets (Workshop items that restyle another wallpaper)
 - audio reactivity: desktop capture → FFT → `g_AudioSpectrum*` uniforms
 - camera shake / fade / parallax, driven by the real cursor
 - 3D perspective scenes with meshes
-- video wallpapers, and embedded-video `.tex` layers, streamed with FFmpeg
-- web (HTML) wallpapers via CEF, with the WE browser API bridge
-  (`wallpaperPropertyListener`, `wallpaperRegisterAudioListener`)
+- composition/fullscreen layers that sample the scene behind them
+  (water, refraction, CRT effects)
+- video wallpapers with audio, and embedded-video `.tex` layers, streamed with
+  FFmpeg; fill/fit/stretch/center scaling
+- web (HTML) wallpapers via CEF at the output's resolution, with the WE browser
+  API bridge (properties, audio, media integration, mouse input)
+- playback rules (run/mute/pause/stop while another app is focused, maximized,
+  fullscreen or playing audio, on battery, or while locked), FPS cap
+- playlists: timer, time of day, day of week, or once per login
+- multiple monitors: a wallpaper per screen, one spanned across all of them,
+  or one cloned onto each
 - presentation: Wayland layer-shell (direct `wgpu::Surface`, no readback),
-  X11 root pixmap, macOS desktop window, CPU/SHM fallback everywhere
+  X11 desktop window (root pixmap on bare WMs), macOS desktop window, CPU/SHM fallback everywhere
 - application lifecycle (`WallpaperApplication`, `--set-property`, signals)
 
 </details>
@@ -268,13 +328,11 @@ built, and several are deliberately skipped as unreachable.
 <details>
 <summary><strong>Known gaps</strong></summary>
 
-- **screen-space backdrop capture** for refraction/distortion effects
-  (waterripple/waterflow): their hidden `g_Texture0` is meant to sample the scene
-  behind the layer, but we default it to the layer's own base texture, so water
-  effects distort themselves. Currently softened with a brightness band-aid.
-- MPRIS media integration, and the media/plugin halves of the web JS bridge
-- mouse/keyboard input forwarding into web wallpapers (they render, but do not
-  respond to the cursor); web wallpapers also render at a fixed 1080p
+- Workshop browsing and downloading
+- hardware video decoding
+- only one web wallpaper at a time; keyboard input isn't forwarded to web
+  wallpapers, and X11 doesn't forward the scroll wheel or middle button
+- playlist transitions (items switch with a hard cut)
 - per-object cameras (3 wallpapers in the local corpus)
 - normal-mapped lighting, shadows, volumetrics, GPU instancing, and a true depth
   buffer — all measured against the corpus and found to have zero or near-zero
@@ -313,8 +371,9 @@ cannot.
 
 ## Troubleshooting
 
-**Nothing appears on Wayland.** The compositor needs `wlr-layer-shell`. GNOME
-does not implement it; use the X11 path there with `WP_ENGINE_FORCE_X11=1`.
+**Nothing appears on Wayland.** The compositor needs `wlr-layer-shell`; on GNOME,
+install the [Shell extension](#gnome). A window titled "wp-engine wallpaper @…"
+means the extension isn't enabled.
 
 **A wallpaper renders wrongly.** Reach for the dumps before reading code:
 
@@ -332,6 +391,10 @@ does not implement it; use the X11 path there with `WP_ENGINE_FORCE_X11=1`.
   rather than trusting the log when bisecting.
 - `WP_ENGINE_FORCE_SHM=1` — force the CPU/SHM presentation path
 - `WP_ENGINE_FORCE_X11=1` — take the X11 path even under a Wayland session
+- `WP_ENGINE_X11_MODE=root|window` — on X11, draw only on the root window
+  (bare window managers' default) or in a desktop window (the default where
+  the window manager supports EWMH desktop windows)
+- `WP_ENGINE_XDG_WALLPAPER=1` — use the GNOME-style window instead of layer-shell
 
 **A web wallpaper says the binary lacks web support.** It was built without
 `--features web`; see [Installation](#installation).

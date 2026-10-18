@@ -5,6 +5,7 @@ pub mod engine;
 pub mod logging;
 pub mod platform;
 pub mod render;
+pub mod schedule;
 pub mod settings;
 pub mod ui;
 pub mod workshop;

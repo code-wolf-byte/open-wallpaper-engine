@@ -18,6 +18,11 @@ pub enum WallpaperType {
     Web,
     #[serde(alias = "Application")]
     Application,
+    /// A preset: a property set (plus its own `files/`) applied on top of
+    /// another workshop item named by `dependency`. Never spelled in
+    /// `project.json` — derived by [`Wallpaper::wallpaper_type`].
+    #[serde(skip)]
+    Preset,
     #[serde(other)]
     Unknown,
 }
@@ -29,6 +34,7 @@ impl std::fmt::Display for WallpaperType {
             WallpaperType::Scene => write!(f, "scene"),
             WallpaperType::Web => write!(f, "web"),
             WallpaperType::Application => write!(f, "application"),
+            WallpaperType::Preset => write!(f, "preset"),
             WallpaperType::Unknown => write!(f, "unknown"),
         }
     }
@@ -45,6 +51,11 @@ pub struct Project {
     pub tags: Option<Vec<String>>,
     pub description: Option<String>,
     pub contentrating: Option<String>,
+    /// Workshop ID of the item this one builds on (presets, and items that
+    /// reuse another item's assets).
+    pub dependency: Option<String>,
+    /// A preset's property values, applied over the dependency's defaults.
+    pub preset: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// A resolved Workshop wallpaper entry (project.json + its directory)
@@ -73,31 +84,69 @@ impl Wallpaper {
     }
 
     pub fn wallpaper_type(&self) -> &WallpaperType {
-        self.project
-            .wallpaper_type
-            .as_ref()
-            .unwrap_or(&WallpaperType::Unknown)
+        match &self.project.wallpaper_type {
+            Some(t) => t,
+            None if self.project.dependency.is_some() && self.project.preset.is_some() => {
+                &WallpaperType::Preset
+            }
+            None => &WallpaperType::Unknown,
+        }
     }
 }
 
-/// Locate Steam library roots by reading libraryfolders.vdf
+/// Steam install roots to look for, covering native, `~/.steam` symlink,
+/// Flatpak, Snap, and macOS installs.
+fn steam_install_candidates() -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    vec![
+        home.join(".local/share/Steam"),
+        home.join(".steam/steam"),
+        home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"),
+        home.join(".var/app/com.valvesoftware.Steam/data/Steam"),
+        home.join("snap/steam/common/.local/share/Steam"),
+        home.join("Library/Application Support/Steam"),
+    ]
+}
+
+/// Every `"path"` value in a `libraryfolders.vdf` — the libraries Steam has
+/// on other drives. A line-level scan is enough: the file is Valve KeyValues
+/// with one `"key" "value"` pair per line, and `path` only appears as a
+/// library's location.
+fn parse_library_folders(vdf: &str) -> Vec<PathBuf> {
+    vdf.lines()
+        .filter_map(|line| {
+            let mut quoted = line.split('"').skip(1).step_by(2);
+            match (quoted.next(), quoted.next()) {
+                (Some("path"), Some(value)) => Some(PathBuf::from(value.replace("\\\\", "\\"))),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Locate Steam library roots: every install found on disk, plus every
+/// library its `steamapps/libraryfolders.vdf` lists.
 fn find_steam_library_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
-
-    let candidates = [
-        dirs::home_dir().map(|h| h.join(".local/share/Steam")),
-        dirs::home_dir().map(|h| h.join(".steam/steam")),
-        dirs::home_dir().map(|h| h.join("Library/Application Support/Steam")),
-    ];
-
-    for candidate in candidates.into_iter().flatten() {
-        if !candidate.exists() {
-            continue;
+    let push = |p: PathBuf, roots: &mut Vec<PathBuf>| {
+        if !p.exists() {
+            return;
         }
         // Resolve symlinks so ~/.steam/steam (→ ~/.local/share/Steam) isn't scanned twice
-        let real = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+        let real = std::fs::canonicalize(&p).unwrap_or(p);
         if !roots.contains(&real) {
             roots.push(real);
+        }
+    };
+
+    for install in steam_install_candidates() {
+        push(install.clone(), &mut roots);
+        if let Ok(vdf) = std::fs::read_to_string(install.join("steamapps/libraryfolders.vdf")) {
+            for lib in parse_library_folders(&vdf) {
+                push(lib, &mut roots);
+            }
         }
     }
 
@@ -118,8 +167,23 @@ pub fn find_workshop_dirs() -> Vec<PathBuf> {
         .collect()
 }
 
+/// Find the directory of the workshop item `id`, looking beside `near`
+/// first (dependencies normally live in the same workshop folder), then in
+/// every known library.
+pub fn find_item_dir(id: &str, near: Option<&Path>) -> Option<PathBuf> {
+    if let Some(sibling) = near.and_then(|n| n.parent()).map(|p| p.join(id)) {
+        if sibling.join("project.json").exists() {
+            return Some(sibling);
+        }
+    }
+    find_workshop_dirs()
+        .into_iter()
+        .map(|d| d.join(id))
+        .find(|d| d.join("project.json").exists())
+}
+
 /// Load and parse a project.json inside a wallpaper directory
-fn load_project(wallpaper_dir: &Path) -> Result<Project> {
+pub fn load_project(wallpaper_dir: &Path) -> Result<Project> {
     let project_path = wallpaper_dir.join("project.json");
     let data = std::fs::read_to_string(&project_path)
         .with_context(|| format!("reading {}", project_path.display()))?;
@@ -180,4 +244,46 @@ pub fn scan_wallpapers() -> Vec<Wallpaper> {
 /// Find a single wallpaper by its Workshop ID
 pub fn find_by_id(id: &str) -> Option<Wallpaper> {
     scan_wallpapers().into_iter().find(|w| w.workshop_id == id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn library_folders_lists_every_path() {
+        let vdf = r#""libraryfolders"
+{
+	"0"
+	{
+		"path"		"/home/u/.local/share/Steam"
+		"label"		""
+	}
+	"1"
+	{
+		"path"		"/mnt/games/SteamLibrary"
+		"apps" { "431960" "1" }
+	}
+}"#;
+        assert_eq!(
+            parse_library_folders(vdf),
+            vec![
+                PathBuf::from("/home/u/.local/share/Steam"),
+                PathBuf::from("/mnt/games/SteamLibrary")
+            ]
+        );
+    }
+
+    #[test]
+    fn preset_type_is_derived_from_dependency_and_preset() {
+        let project: Project =
+            serde_json::from_str(r#"{"title":"p","dependency":"893418273","preset":{"a":1}}"#)
+                .unwrap();
+        let w = Wallpaper {
+            workshop_id: "1".into(),
+            path: PathBuf::from("/x/1"),
+            project,
+        };
+        assert_eq!(w.wallpaper_type(), &WallpaperType::Preset);
+    }
 }

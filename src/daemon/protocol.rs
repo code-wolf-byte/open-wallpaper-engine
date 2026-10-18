@@ -26,6 +26,10 @@ pub struct ApplySpec {
     pub quality: Option<String>,
     #[serde(default)]
     pub volume: Option<f32>,
+    #[serde(default)]
+    pub fps: Option<u32>,
+    #[serde(default)]
+    pub scaling: Option<crate::render::ScaleMode>,
     /// Per-screen quality, keyed like `screens`.
     #[serde(default)]
     pub screen_quality: HashMap<String, String>,
@@ -40,20 +44,31 @@ impl ApplySpec {
     /// client's.
     pub fn from_context(context: &ApplicationContext, title: Option<String>) -> Self {
         let absolute = |p: &PathBuf| std::path::absolute(p).unwrap_or_else(|_| p.clone());
-        let (quality, volume) = {
+        let (quality, volume, fps, scaling) = {
             let s = context.settings.lock().unwrap();
-            (s.quality, s.volume)
+            (s.quality, s.volume, s.fps, s.scaling)
         };
         Self {
             background: absolute(&context.background),
-            screens: context.screens.iter().map(|(k, p)| (k.clone(), absolute(p))).collect(),
+            screens: context
+                .screens
+                .iter()
+                .map(|(k, p)| (k.clone(), absolute(p)))
+                .collect(),
             properties: context.properties.clone(),
             quality: Some(quality.label().to_string()),
             volume: Some(volume),
+            fps: Some(fps),
+            scaling: Some(scaling),
             screen_quality: context
                 .screen_settings
                 .iter()
-                .map(|(screen, s)| (screen.clone(), s.lock().unwrap().quality.label().to_string()))
+                .map(|(screen, s)| {
+                    (
+                        screen.clone(),
+                        s.lock().unwrap().quality.label().to_string(),
+                    )
+                })
                 .collect(),
             title,
         }
@@ -73,13 +88,25 @@ impl ApplySpec {
             if let Some(v) = self.volume {
                 s.volume = v.clamp(0.0, 1.0);
             }
+            if let Some(f) = self.fps {
+                s.fps = f.clamp(1, 240);
+            }
+            if let Some(m) = self.scaling {
+                s.scaling = m;
+            }
         }
+        let (fps, scaling) = {
+            let s = context.settings.lock().unwrap();
+            (s.fps, s.scaling)
+        };
         for (screen, q) in self.screen_quality {
             if let Some(quality) = RenderQuality::parse(&q) {
                 context.screen_settings.insert(
                     screen,
                     std::sync::Arc::new(std::sync::Mutex::new(RenderSettings {
                         quality,
+                        fps,
+                        scaling,
                         ..Default::default()
                     })),
                 );
@@ -99,12 +126,37 @@ pub enum Request {
     /// Replace whatever is showing with this wallpaper.
     Apply(ApplySpec),
     /// Live-adjust the active wallpaper's default render quality.
-    SetQuality { quality: String },
+    SetQuality {
+        quality: String,
+    },
     /// Live-adjust the active wallpaper's volume (0.0–1.0).
-    SetVolume { volume: f32 },
+    SetVolume {
+        volume: f32,
+    },
+    /// Live-adjust the frame-rate cap (1–240).
+    SetFps {
+        fps: u32,
+    },
+    /// User properties of `wallpaper` (Workshop ID or folder) changed in the
+    /// saved settings; shown live wherever it is displayed.
+    PropertiesChanged {
+        wallpaper: String,
+        names: Vec<String>,
+    },
     /// Audio capture device for audio-reactive wallpapers; `None` =
     /// automatic. Takes effect on the next apply.
-    SetAudioDevice { device: Option<String> },
+    SetAudioDevice {
+        device: Option<String>,
+    },
+    /// Play a saved playlist (its items rotate per its mode).
+    PlayPlaylist {
+        name: String,
+    },
+    /// Skip the playing playlist to its next / previous item.
+    NextItem,
+    PreviousItem,
+    /// Stop rotating; the current wallpaper stays.
+    StopPlaylist,
     /// Remove the wallpaper but keep the daemon running.
     Clear,
     /// Remove the wallpaper and exit the daemon.
@@ -122,6 +174,9 @@ pub struct ActiveWallpaper {
 pub struct DaemonStatus {
     pub pid: u32,
     pub active: Option<ActiveWallpaper>,
+    /// `(playlist name, item index, item count)` while a playlist plays.
+    #[serde(default)]
+    pub playlist: Option<(String, usize, usize)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -30,6 +30,16 @@ pub enum WallpaperContent {
 }
 
 impl WallpaperContent {
+    /// The wallpaper folder user properties belong to, if any.
+    pub fn project_dir(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Scene { dir } => Some(dir),
+            Self::Web { html } => html.parent(),
+            Self::Video { path } => path.parent(),
+            Self::Static(_) => None,
+        }
+    }
+
     /// Parse a Workshop `Wallpaper` into the appropriate content variant.
     ///
     /// Returns `Err` for types that are not yet renderable (Scene, Web,
@@ -37,6 +47,7 @@ impl WallpaperContent {
     /// image-loading failure.
     pub fn from_wallpaper(w: &Wallpaper) -> Result<Self> {
         match w.wallpaper_type() {
+            WallpaperType::Preset => Self::from_preset_dir(&w.path),
             WallpaperType::Scene => {
                 let dir = w.path.clone();
                 if dir.join("scene.json").exists() || dir.join("scene.pkg").exists() {
@@ -77,6 +88,9 @@ impl WallpaperContent {
     /// (scene.json / scene.pkg / project.json) or a plain image/video file.
     #[tracing::instrument(target = "content", level = "debug", fields(path = %path.display()))]
     pub fn from_any_path(path: &Path) -> Result<Self> {
+        if path.is_dir() && Self::is_preset_dir(path) {
+            return Self::from_preset_dir(path);
+        }
         if path.is_dir() {
             if path.join("scene.json").exists() || path.join("scene.pkg").exists() {
                 tracing::debug!(target: "content", "resolved as scene wallpaper");
@@ -100,6 +114,42 @@ impl WallpaperContent {
             ));
         }
         Self::from_path(path)
+    }
+
+    fn is_preset_dir(dir: &Path) -> bool {
+        crate::workshop::load_project(dir)
+            .map(|p| p.wallpaper_type.is_none() && p.dependency.is_some() && p.preset.is_some())
+            .unwrap_or(false)
+    }
+
+    /// `dir` itself, or — for a preset item — the directory of the item it
+    /// builds on, after registering the preset's values as its overrides.
+    pub fn preset_base_dir(dir: &Path) -> Result<PathBuf> {
+        if !dir.is_dir() || !Self::is_preset_dir(dir) {
+            return Ok(dir.to_path_buf());
+        }
+        let project = crate::workshop::load_project(dir)?;
+        let dep = project
+            .dependency
+            .as_deref()
+            .ok_or_else(|| anyhow!("preset {} has no dependency", dir.display()))?;
+        let parent = crate::workshop::find_item_dir(dep, Some(dir)).ok_or_else(|| {
+            anyhow!(
+                "preset {} needs workshop item {dep}, which is not installed — subscribe to it first",
+                dir.display()
+            )
+        })?;
+        if let Some(preset) = &project.preset {
+            crate::engine::properties::register_preset(&parent, dir, preset);
+        }
+        tracing::info!(target: "content", "preset {} → base item {}", dir.display(), parent.display());
+        Ok(parent)
+    }
+
+    /// A preset item: the content of the item it builds on, with the
+    /// preset's values registered as that item's property overrides.
+    fn from_preset_dir(dir: &Path) -> Result<Self> {
+        Self::from_any_path(&Self::preset_base_dir(dir)?)
     }
 
     /// Detect content type from a raw file path, guessing by extension.
@@ -151,6 +201,39 @@ impl WallpaperContent {
 pub struct ScreenContent {
     pub by_output: std::collections::HashMap<String, WallpaperContent>,
     pub default: WallpaperContent,
+    /// Span or clone show `default` from one shared renderer and ignore
+    /// `by_output`.
+    pub layout: ScreenLayout,
+}
+
+/// How a wallpaper covers several monitors (Wallpaper Engine's layout
+/// setting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScreenLayout {
+    /// Each monitor runs its own wallpaper (`screens`, else the default).
+    #[default]
+    PerScreen,
+    /// One wallpaper stretched across the bounding box of all monitors.
+    Span,
+    /// One wallpaper rendered once and shown on every monitor.
+    Clone,
+}
+
+impl ScreenLayout {
+    pub const ALL: [Self; 3] = [Self::PerScreen, Self::Span, Self::Clone];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|l| l.label() == s.trim())
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PerScreen => "per-screen",
+            Self::Span => "span",
+            Self::Clone => "clone",
+        }
+    }
 }
 
 impl ScreenContent {
@@ -161,12 +244,16 @@ impl ScreenContent {
         Self {
             by_output: std::collections::HashMap::new(),
             default: content,
+            layout: ScreenLayout::PerScreen,
         }
     }
 
     /// The content to show on an output with this name (`None` when the
     /// platform can't identify the output, e.g. no xdg-output support).
     pub fn resolve(&self, output_name: Option<&str>) -> WallpaperContent {
+        if self.layout != ScreenLayout::PerScreen {
+            return self.default.clone();
+        }
         output_name
             .and_then(|name| self.by_output.get(name))
             .cloned()
@@ -206,6 +293,7 @@ mod tests {
         let content = ScreenContent {
             by_output,
             default: scene("default"),
+            layout: ScreenLayout::PerScreen,
         };
 
         assert_eq!(scene_dir(&content.resolve(Some("DP-1"))), "dp1-wallpaper");
@@ -224,9 +312,19 @@ mod tests {
         let content = ScreenContent {
             by_output,
             default: scene("default"),
+            layout: ScreenLayout::PerScreen,
         };
 
         assert_eq!(scene_dir(&content.resolve(Some("DP-1"))), "wallpaper-a");
         assert_eq!(scene_dir(&content.resolve(Some("HDMI-1"))), "wallpaper-b");
+    }
+
+    #[test]
+    fn span_and_clone_show_the_default_everywhere() {
+        let mut content = ScreenContent::single(scene("default"));
+        content.by_output.insert("DP-1".into(), scene("dp1"));
+        content.layout = ScreenLayout::Span;
+        assert_eq!(scene_dir(&content.resolve(Some("DP-1"))), "default");
+        assert_eq!(ScreenLayout::parse("clone"), Some(ScreenLayout::Clone));
     }
 }

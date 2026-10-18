@@ -1,11 +1,14 @@
-//! X11 display backend — draws into the root window's background pixmap.
+//! X11 display backend — draws into a root-sized pixmap and shows it as the
+//! root window's background (the `_XROOTPMAP_ID` / `ESETROOT_PMAP_ID`
+//! convention `feh --bg` uses, as `X11Output.cpp` in the reference does).
 //!
-//! This mirrors `X11Output.cpp` in the reference rather than creating a
-//! `_NET_WM_WINDOW_TYPE_DESKTOP` window: every WM and DE honours the root
-//! pixmap plus the `_XROOTPMAP_ID` / `ESETROOT_PMAP_ID` convention (it is what
-//! `feh --bg` and `hsetroot` set), whereas a desktop-type window competes with
-//! whatever desktop surface GNOME/KDE/Xfce already draw and loses differently
-//! on each.
+//! Desktop environments cover the root with their own desktop (plasmashell,
+//! xfdesktop, Mutter's background actor, caja/nemo), so when the window
+//! manager supports EWMH desktop windows the same pixmap also backs a
+//! click-through `_NET_WM_WINDOW_TYPE_DESKTOP` window of our own, which the WM
+//! keeps beneath every application window. Bare window managers without that
+//! support (dwm, i3) would tile such a window, so they get the root only.
+//! `WP_ENGINE_X11_MODE=root|window` overrides the choice.
 //!
 //! Unlike the Wayland backend there is no direct-presentation path: X11 has no
 //! equivalent of handing the compositor a GPU surface for the desktop
@@ -22,10 +25,13 @@ use std::time::{Duration, Instant};
 use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateGCAux, Gcontext,
-    ImageFormat, KeyButMask, Pixmap, PropMode, Window,
+    Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateGCAux, CreateWindowAux,
+    Gcontext, ImageFormat, KeyButMask, Pixmap, PropMode, Screen, Window, WindowClass,
 };
+use x11rb::protocol::{shape, xfixes::ConnectionExt as _};
 use x11rb::rust_connection::RustConnection;
+
+use crate::engine::playback_gate::PlaybackAction;
 use x11rb::wrapper::ConnectionExt as _;
 
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
@@ -34,7 +40,6 @@ use crate::platform;
 use crate::render::{FrameSource, RenderSettings, ScreenContent, ScreenSettings, WallpaperContent};
 
 /// Frames per second for animated content. Matches `FrameSource`'s own target.
-const TARGET_FPS: f32 = 30.0;
 
 /// How often to re-check playback-pause conditions (battery, session lock,
 /// fullscreen/maximized app) — see `engine::playback_gate`. Real I/O (sysfs
@@ -47,7 +52,11 @@ const PAUSE_CHECK_INTERVAL: Duration = Duration::from_millis(750);
 pub(super) struct X11Platform;
 
 impl DisplayPlatform for X11Platform {
-    fn spawn_wallpaper(&self, content: ScreenContent, settings: ScreenSettings) -> Result<WallpaperHandle> {
+    fn spawn_wallpaper(
+        &self,
+        content: ScreenContent,
+        settings: ScreenSettings,
+    ) -> Result<WallpaperHandle> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
 
@@ -99,10 +108,32 @@ pub(crate) struct NamedOutput {
     pub rect: OutputRect,
 }
 
+/// Names of the active outputs, for picking a screen to assign.
+pub fn output_names() -> Vec<String> {
+    let Ok((conn, screen_num)) = x11rb::connect(None) else {
+        return Vec::new();
+    };
+    let screen = &conn.setup().roots[screen_num];
+    discover_outputs(
+        &conn,
+        screen.root,
+        screen.width_in_pixels,
+        screen.height_in_pixels,
+    )
+    .into_iter()
+    .filter_map(|o| o.name)
+    .collect()
+}
+
 /// Enumerate connected+active RandR outputs (name + rectangle), falling back
 /// to the whole root window when RandR is missing or reports nothing usable
 /// (headless X, Xvfb, old servers).
-fn discover_outputs(conn: &RustConnection, root: Window, root_w: u16, root_h: u16) -> Vec<NamedOutput> {
+fn discover_outputs(
+    conn: &RustConnection,
+    root: Window,
+    root_w: u16,
+    root_h: u16,
+) -> Vec<NamedOutput> {
     let whole = vec![NamedOutput {
         name: None,
         rect: OutputRect {
@@ -281,38 +312,61 @@ struct EwmhAtoms {
     fullscreen: Atom,
     maximized_vert: Atom,
     maximized_horz: Atom,
+    window_type: Atom,
+    type_desktop: Atom,
+    type_dock: Atom,
+}
+
+/// The active window's state, for the playback policy.
+#[derive(Debug, Default, Clone, Copy)]
+struct ActiveWindow {
+    fullscreen: bool,
+    maximized: bool,
+    /// An application window (not the desktop or a panel) is active.
+    focused: bool,
 }
 
 impl EwmhAtoms {
     fn intern(conn: &impl Connection) -> Result<Self> {
-        let atom = |name: &[u8]| -> Result<Atom> { Ok(conn.intern_atom(false, name)?.reply()?.atom) };
+        let atom =
+            |name: &[u8]| -> Result<Atom> { Ok(conn.intern_atom(false, name)?.reply()?.atom) };
         Ok(Self {
             active_window: atom(b"_NET_ACTIVE_WINDOW")?,
             wm_state: atom(b"_NET_WM_STATE")?,
             fullscreen: atom(b"_NET_WM_STATE_FULLSCREEN")?,
             maximized_vert: atom(b"_NET_WM_STATE_MAXIMIZED_VERT")?,
             maximized_horz: atom(b"_NET_WM_STATE_MAXIMIZED_HORZ")?,
+            window_type: atom(b"_NET_WM_WINDOW_TYPE")?,
+            type_desktop: atom(b"_NET_WM_WINDOW_TYPE_DESKTOP")?,
+            type_dock: atom(b"_NET_WM_WINDOW_TYPE_DOCK")?,
         })
     }
 
-    /// `(fullscreen, maximized)` for whichever window `_NET_ACTIVE_WINDOW`
-    /// currently names, or `(false, false)` when there's no active window,
-    /// the window manager doesn't publish one, or any request fails — a WM
-    /// with no EWMH support at all must degrade to "never pauses," not
-    /// error the whole render loop.
-    fn check(&self, conn: &impl Connection, root: Window) -> (bool, bool) {
+    /// The state of whichever window `_NET_ACTIVE_WINDOW` names; all false
+    /// when there's no active window, the window manager doesn't publish
+    /// one, or a request fails — a WM without EWMH support degrades to
+    /// "never pauses" rather than erroring the render loop.
+    fn check(&self, conn: &impl Connection, root: Window) -> ActiveWindow {
         let Some(active) = read_window32(conn, root, self.active_window) else {
-            return (false, false);
+            return ActiveWindow::default();
         };
         if active == 0 || active == root {
-            return (false, false);
+            return ActiveWindow::default();
         }
+        let types = read_atoms32(conn, active, self.window_type).unwrap_or_default();
+        let focused = !types.contains(&self.type_desktop) && !types.contains(&self.type_dock);
         let Some(states) = read_atoms32(conn, active, self.wm_state) else {
-            return (false, false);
+            return ActiveWindow {
+                focused,
+                ..Default::default()
+            };
         };
-        let fullscreen = states.contains(&self.fullscreen);
-        let maximized = states.contains(&self.maximized_vert) && states.contains(&self.maximized_horz);
-        (fullscreen, maximized)
+        ActiveWindow {
+            fullscreen: states.contains(&self.fullscreen),
+            maximized: states.contains(&self.maximized_vert)
+                && states.contains(&self.maximized_horz),
+            focused,
+        }
     }
 }
 
@@ -339,13 +393,113 @@ fn read_atoms32(conn: &impl Connection, window: Window, property: Atom) -> Optio
     Some(values.collect())
 }
 
+// ── Desktop window ────────────────────────────────────────────────────────────
+
+/// Whether to show the wallpaper in our own desktop window (see the module
+/// doc): forced by `WP_ENGINE_X11_MODE`, otherwise when the window manager
+/// lists `_NET_WM_WINDOW_TYPE_DESKTOP` in `_NET_SUPPORTED`.
+fn use_desktop_window(conn: &impl Connection, root: Window, desktop_type: Atom) -> bool {
+    match std::env::var("WP_ENGINE_X11_MODE").as_deref() {
+        Ok("root") => false,
+        Ok("window") => true,
+        _ => conn
+            .intern_atom(false, b"_NET_SUPPORTED")
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| read_atoms32(conn, root, r.atom))
+            .is_some_and(|supported| supported.contains(&desktop_type)),
+    }
+}
+
+/// A root-sized desktop window whose background is `pixmap`: sticky, below
+/// everything, out of taskbars and pagers, and click-through so presses
+/// still reach the desktop icons and menus underneath (the cursor is polled
+/// globally anyway).
+fn create_desktop_window(conn: &RustConnection, screen: &Screen, pixmap: Pixmap) -> Result<Window> {
+    let win = conn.generate_id()?;
+    conn.create_window(
+        screen.root_depth,
+        win,
+        screen.root,
+        0,
+        0,
+        screen.width_in_pixels,
+        screen.height_in_pixels,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        screen.root_visual,
+        &CreateWindowAux::new().background_pixmap(pixmap),
+    )?;
+    let atom = |name: &[u8]| -> Result<Atom> { Ok(conn.intern_atom(false, name)?.reply()?.atom) };
+    conn.change_property32(
+        PropMode::REPLACE,
+        win,
+        atom(b"_NET_WM_WINDOW_TYPE")?,
+        AtomEnum::ATOM,
+        &[atom(b"_NET_WM_WINDOW_TYPE_DESKTOP")?],
+    )?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        win,
+        atom(b"_NET_WM_STATE")?,
+        AtomEnum::ATOM,
+        &[
+            atom(b"_NET_WM_STATE_BELOW")?,
+            atom(b"_NET_WM_STATE_STICKY")?,
+            atom(b"_NET_WM_STATE_SKIP_TASKBAR")?,
+            atom(b"_NET_WM_STATE_SKIP_PAGER")?,
+        ],
+    )?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        win,
+        atom(b"_NET_WM_DESKTOP")?,
+        AtomEnum::CARDINAL,
+        &[u32::MAX],
+    )?;
+    conn.change_property8(
+        PropMode::REPLACE,
+        win,
+        AtomEnum::WM_NAME,
+        AtomEnum::STRING,
+        b"wp-engine",
+    )?;
+    conn.change_property8(
+        PropMode::REPLACE,
+        win,
+        AtomEnum::WM_CLASS,
+        AtomEnum::STRING,
+        b"wp-engine\0wp-engine\0",
+    )?;
+    if let Err(e) = make_click_through(conn, win) {
+        tracing::warn!(target: "wallpaper", "no XFixes ({e}); desktop window will take clicks");
+    }
+    conn.map_window(win)?;
+    Ok(win)
+}
+
+/// An empty input shape: pointer events pass through to whatever is below.
+fn make_click_through(conn: &RustConnection, win: Window) -> Result<()> {
+    conn.xfixes_query_version(5, 0)?.reply()?;
+    let region = conn.generate_id()?;
+    conn.xfixes_create_region(region, &[])?;
+    conn.xfixes_set_window_shape_region(win, shape::SK::INPUT, 0, 0, region)?;
+    conn.xfixes_destroy_region(region)?;
+    Ok(())
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 /// Build the renderer for one output's resolved content — the X11 twin of
 /// the Wayland backend's `build_content_renderer`. Split out so each output
 /// gets its own independent `GpuSceneInstance`/`FrameSource` instead of one
 /// shared across the whole root pixmap.
-fn build_content_renderer(content: WallpaperContent, device: wgpu::Device, queue: wgpu::Queue) -> Result<ContentRenderer> {
+fn build_content_renderer(
+    content: WallpaperContent,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    web: crate::render::web::WebOptions,
+) -> Result<ContentRenderer> {
     Ok(match content {
         WallpaperContent::Scene { dir } => {
             match GpuSceneInstance::with_device(device, queue, &dir) {
@@ -358,8 +512,20 @@ fn build_content_renderer(content: WallpaperContent, device: wgpu::Device, queue
                 }
             }
         }
-        other => ContentRenderer::Frames(FrameSource::from_content(other)?),
+        other => ContentRenderer::Frames(FrameSource::from_content_with(other, web)?),
     })
+}
+
+/// A web wallpaper's page size and frame rate for one output.
+fn web_options(
+    rect: OutputRect,
+    settings: &ScreenSettings,
+    name: Option<&str>,
+) -> crate::render::web::WebOptions {
+    crate::render::web::WebOptions {
+        size: (rect.width as u32, rect.height as u32),
+        fps: settings.resolve(name).lock().unwrap().fps,
+    }
 }
 
 /// One monitor's independent render state: its own content, own `ContentRenderer`,
@@ -376,9 +542,18 @@ struct OutputInstance {
     settings: Arc<Mutex<RenderSettings>>,
     left_down: bool,
     right_down: bool,
+    /// Pause state and frame-rate cap last sent to a web page here.
+    web_paused: bool,
+    web_fps: u32,
+    /// How far into `settings.property_edits` this output has applied.
+    props_seen: usize,
 }
 
-fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, stop: Arc<AtomicBool>) -> Result<()> {
+fn wallpaper_loop(
+    content: ScreenContent,
+    settings: ScreenSettings,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
     let (conn, screen_num) =
         x11rb::connect(None).map_err(|e| anyhow!("cannot connect to X display: {e}"))?;
     let screen = &conn.setup().roots[screen_num];
@@ -396,7 +571,22 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, stop: Arc<At
     let gpu_scaler = platform::GpuScaler::from_device(gpu)
         .map_err(|e| anyhow!("GPU scaler init failed: {e}"))?;
 
-    let named_outputs = discover_outputs(&conn, root, root_w, root_h);
+    // Span: one renderer over the whole root window, which already is the
+    // bounding box of every monitor. ponytail: clone still runs one
+    // renderer per monitor here; share one if the duplicate work matters.
+    let named_outputs = if content.layout == crate::render::ScreenLayout::Span {
+        vec![NamedOutput {
+            name: None,
+            rect: OutputRect {
+                x: 0,
+                y: 0,
+                width: root_w,
+                height: root_h,
+            },
+        }]
+    } else {
+        discover_outputs(&conn, root, root_w, root_h)
+    };
     tracing::info!(
         target: "wallpaper",
         "X11 root pixmap {root_w}x{root_h}, depth {depth}, {} output(s)",
@@ -410,7 +600,8 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, stop: Arc<At
             .as_deref()
             .is_some_and(|n| content.by_output.contains_key(n));
         let resolved = content.resolve(named.name.as_deref());
-        match build_content_renderer(resolved, device.clone(), queue.clone()) {
+        let web = web_options(named.rect, &settings, named.name.as_deref());
+        match build_content_renderer(resolved, device.clone(), queue.clone(), web) {
             Ok(renderer) => {
                 tracing::info!(
                     target: "wallpaper",
@@ -419,12 +610,16 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, stop: Arc<At
                     if per_screen { "per-screen" } else { "default" }
                 );
                 let output_settings = settings.resolve(named.name.as_deref());
+                let props_seen = output_settings.lock().unwrap().property_edits.len();
                 outputs.push(OutputInstance {
                     named,
                     renderer,
                     settings: output_settings,
                     left_down: false,
                     right_down: false,
+                    web_paused: false,
+                    web_fps: web.fps,
+                    props_seen,
                 });
             }
             // Don't take down every other (working) output over one bad
@@ -458,13 +653,32 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, stop: Arc<At
     // `PAUSE_CHECK_INTERVAL` throttle rather than every frame, since both
     // involve real I/O (sysfs reads, a D-Bus round trip) a 30fps loop
     // shouldn't pay for every tick.
-    let pause_conditions = crate::engine::playback_gate::PauseConditions::from_env();
+    let policy = crate::engine::playback_gate::PlaybackPolicy::load();
+    let media = if policy.watches_audio() {
+        crate::engine::media::MediaWatcher::start()
+    } else {
+        None
+    };
+    let mut media_playing = false;
+    let mut stopped = false;
     let ewmh = EwmhAtoms::intern(&conn)?;
+    let desktop_window = if use_desktop_window(&conn, root, ewmh.type_desktop) {
+        Some(create_desktop_window(&conn, screen, pixmap)?)
+    } else {
+        None
+    };
+    match desktop_window {
+        Some(win) => {
+            tracing::info!(target: "wallpaper", "X11: showing the wallpaper in desktop window {win:#x}")
+        }
+        None => {
+            tracing::info!(target: "wallpaper", "X11: showing the wallpaper on the root window")
+        }
+    }
     let mut lock_watcher = platform::power::LockWatcher::start();
     let mut playback_state = crate::engine::playback_gate::PlaybackState::default();
     let mut last_pause_check = Instant::now() - PAUSE_CHECK_INTERVAL;
 
-    let frame_budget = Duration::from_secs_f32(1.0 / TARGET_FPS);
     // Any output still animating keeps the whole loop going; a genuinely
     // static desktop (every output static) holds the pixmap and sleeps.
     let animated = outputs.iter().any(|o| o.renderer.is_animated());
@@ -477,22 +691,119 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, stop: Arc<At
 
         if started.duration_since(last_pause_check) >= PAUSE_CHECK_INTERVAL {
             last_pause_check = started;
-            let (fullscreen_app, maximized_app) = ewmh.check(&conn, root);
+            let active = ewmh.check(&conn, root);
+            while let Some(info) = media.as_ref().and_then(|m| m.try_recv()) {
+                media_playing = info.playback_state == crate::engine::media::PlaybackState::Playing;
+            }
             playback_state = crate::engine::playback_gate::PlaybackState {
                 on_battery: platform::power::is_on_battery(),
                 locked_or_sleeping: lock_watcher
                     .as_mut()
                     .map(|w| w.is_locked())
                     .unwrap_or(false),
-                fullscreen_app,
-                maximized_app,
+                fullscreen_app: active.fullscreen,
+                maximized_app: active.maximized,
+                focused_app: active.focused,
+                other_audio: media_playing,
             };
         }
-        let paused = crate::engine::playback_gate::should_pause(&pause_conditions, &playback_state);
+        let action = crate::engine::playback_gate::decide(&policy, &playback_state);
+        let paused = action.halts();
+        // Tell web pages about pause edges and frame-rate changes.
+        for output in &mut outputs {
+            let fps = output.settings.lock().unwrap().fps;
+            if let ContentRenderer::Frames(fs) = &output.renderer {
+                if let Some(tx) = fs.web_input() {
+                    if paused != output.web_paused {
+                        let _ = tx.try_send(crate::render::web::WebInputEvent::Paused(paused));
+                    }
+                    if fps != output.web_fps {
+                        let _ = tx.try_send(crate::render::web::WebInputEvent::Fps(fps));
+                    }
+                }
+            }
+            output.web_paused = paused;
+            output.web_fps = fps;
+        }
+        // Live user-property edits for whatever each output shows: scenes
+        // apply them in place (or rebuild), web pages get applyUserProperties.
+        for output in &mut outputs {
+            if output.settings.lock().unwrap().property_edits.len() == output.props_seen {
+                continue;
+            }
+            let resolved = content.resolve(output.named.name.as_deref());
+            let Some(dir) = resolved.project_dir().map(std::path::Path::to_path_buf) else {
+                output.props_seen = output.settings.lock().unwrap().property_edits.len();
+                continue;
+            };
+            let edits = output
+                .settings
+                .lock()
+                .unwrap()
+                .property_edits_since(&mut output.props_seen, &dir);
+            if edits.is_empty() {
+                continue;
+            }
+            let rebuild = match &mut output.renderer {
+                ContentRenderer::Scene(scene) => !scene.set_user_properties(&edits),
+                ContentRenderer::Frames(fs) => {
+                    if let Some(tx) = fs.web_input() {
+                        let json = crate::render::web::user_properties_subset(&dir, &edits);
+                        let _ = tx.try_send(crate::render::web::WebInputEvent::Properties(json));
+                    }
+                    false
+                }
+            };
+            if rebuild {
+                let web = web_options(output.named.rect, &settings, output.named.name.as_deref());
+                match build_content_renderer(resolved, device.clone(), queue.clone(), web) {
+                    Ok(r) => output.renderer = r,
+                    Err(e) => {
+                        tracing::error!(target: "wallpaper", "reloading output {:?}: {e}", output.named.name)
+                    }
+                }
+            }
+        }
+        crate::engine::audio::set_muted(action >= PlaybackAction::Mute);
+        crate::engine::audio::set_master_volume(settings.default.lock().unwrap().volume);
+
+        // Stop: drop each output's renderer (scene GPU resources, decoder
+        // threads), keeping its last frame on the pixmap; rebuild on resume.
+        if action == PlaybackAction::Stop && !stopped {
+            stopped = true;
+            for output in &mut outputs {
+                let last = output.renderer.next_frame().ok();
+                let still = last.unwrap_or_else(|| Arc::new(image::RgbaImage::new(1, 1)));
+                output.renderer = ContentRenderer::Frames(FrameSource::Static(still));
+            }
+            tracing::info!(target: "wallpaper", "playback stopped; renderer released");
+        } else if action != PlaybackAction::Stop && stopped {
+            stopped = false;
+            for output in &mut outputs {
+                let resolved = content.resolve(output.named.name.as_deref());
+                let web = web_options(output.named.rect, &settings, output.named.name.as_deref());
+                match build_content_renderer(resolved, device.clone(), queue.clone(), web) {
+                    Ok(r) => output.renderer = r,
+                    Err(e) => {
+                        tracing::error!(target: "wallpaper", "resuming output {:?}: {e}", output.named.name)
+                    }
+                }
+            }
+            tracing::info!(target: "wallpaper", "playback resumed");
+        }
 
         if !paused {
             for output in &mut outputs {
-                let quality = output.settings.lock().unwrap().quality;
+                let (quality, scaling) = {
+                    let s = output.settings.lock().unwrap();
+                    (s.quality, s.scaling)
+                };
+                // Scenes size themselves; the fit modes are for video, image
+                // and web content.
+                let mode = match &output.renderer {
+                    ContentRenderer::Scene(_) => crate::render::ScaleMode::Stretch,
+                    ContentRenderer::Frames(_) => scaling,
+                };
                 let frame = output.renderer.next_frame()?;
                 // `GpuScaler` emits ARGB8888-LE, i.e. bytes [B, G, R, A] — already
                 // the byte order a Z_PIXMAP wants on a little-endian server, and
@@ -503,6 +814,7 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, stop: Arc<At
                     output.named.rect.width as u32,
                     output.named.rect.height as u32,
                     quality,
+                    mode,
                 );
                 put_image_chunked(&conn, pixmap, gc, depth, output.named.rect, &pixels)?;
             }
@@ -527,8 +839,11 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, stop: Arc<At
                 root,
                 &ChangeWindowAttributesAux::new().background_pixmap(pixmap),
             )?;
-            // Repaint the root from its new background.
+            // Repaint the root (and our desktop window) from the new frame.
             conn.clear_area(false, root, 0, 0, 0, 0)?;
+            if let Some(win) = desktop_window {
+                conn.clear_area(false, win, 0, 0, 0, 0)?;
+            }
             conn.flush()?;
         }
 
@@ -563,7 +878,23 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, stop: Arc<At
                     ((py - rect.y as i32) as f32 / rect.height.max(1) as f32).clamp(0.0, 1.0),
                 ];
                 match &mut output.renderer {
-                    ContentRenderer::Scene(scene) => scene.set_mouse(norm),
+                    ContentRenderer::Scene(scene) => {
+                        scene.set_mouse(norm);
+                        // The button mask is global: only count presses made
+                        // on the bare desktop (no window, or a desktop window
+                        // — ours is click-through, so the DE's or none).
+                        let mask: u16 = pointer.mask.into();
+                        let on_desktop = pointer.child == x11rb::NONE
+                            || Some(pointer.child) == desktop_window
+                            || (mask & u16::from(KeyButMask::BUTTON1) != 0
+                                && read_atoms32(&conn, pointer.child, ewmh.window_type)
+                                    .is_some_and(|t| t.contains(&ewmh.type_desktop)));
+                        if on_desktop {
+                            scene.set_mouse_button(mask & u16::from(KeyButMask::BUTTON1) != 0);
+                        } else {
+                            scene.set_mouse_button(false);
+                        }
+                    }
                     ContentRenderer::Frames(fs) => {
                         // Polled, not event-driven (see `OutputInstance`'s own
                         // doc comment) — mirrors the C++ reference's own
@@ -603,7 +934,11 @@ fn wallpaper_loop(content: ScreenContent, settings: ScreenSettings, stop: Arc<At
 
         // Paused: no point looping at frame rate just to re-check the same
         // throttled conditions — sleep for that same interval instead.
-        let budget = if paused { PAUSE_CHECK_INTERVAL } else { frame_budget };
+        let budget = if paused {
+            PAUSE_CHECK_INTERVAL
+        } else {
+            settings.default.lock().unwrap().frame_interval()
+        };
         if let Some(rest) = budget.checked_sub(started.elapsed()) {
             thread::sleep(rest);
         }

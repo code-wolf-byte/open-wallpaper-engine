@@ -19,13 +19,9 @@
 //! drives different content *and* independent render quality per output now
 //! (see `render::ScreenContent`/`render::ScreenSettings`) — different
 //! outputs can show different wallpapers at different quality levels.
-//! `playlists` is still data-only: fully persisted and listable via
-//! `wp-engine config`, but there's no playback-rotation timer anywhere in
-//! the codebase yet, so only each playlist's first item is ever reachable
-//! through `run` today. `volume` has no per-wallpaper override here at all
-//! — `RenderSettings::volume` itself is documented as "not yet applied" (no
-//! audio-mixing code reads it), so persisting a per-wallpaper value for a
-//! setting that doesn't do anything yet would be silently misleading.
+//! `playlists` are played by the daemon (`crate::schedule`): `wp-engine
+//! playlist play NAME`, or `run` when `active_playlist` is set. `volume` is
+//! a single master level (`RenderSettings::volume`), not per wallpaper.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -37,15 +33,14 @@ pub struct WpSettings {
     #[serde(default)]
     pub properties: BTreeMap<String, BTreeMap<String, String>>,
     /// Named screen → wallpaper assignment (e.g. `"DP-1"` → workshop ID or
-    /// path). See the module doc: persisted, not yet renderer-driven.
+    /// path), used by `wp-engine run`.
     #[serde(default)]
     pub screens: BTreeMap<String, String>,
     /// The wallpaper `wp-engine run` falls back to when no screen-specific
     /// assignment applies.
     #[serde(default)]
     pub default_background: Option<String>,
-    /// Named playlists. See the module doc: persisted, not yet
-    /// renderer-driven (no rotation timer exists yet).
+    /// Named playlists, played by the daemon (see `schedule`).
     #[serde(default)]
     pub playlists: BTreeMap<String, Playlist>,
     /// Per-wallpaper render-quality override, keyed by [`normalize_key`] —
@@ -55,6 +50,22 @@ pub struct WpSettings {
     /// the level names ever change.
     #[serde(default)]
     pub quality: BTreeMap<String, String>,
+    /// What happens while another application is focused, maximized,
+    /// fullscreen or playing audio, on battery, or while locked.
+    #[serde(default)]
+    pub playback: crate::engine::playback_gate::PlaybackPolicy,
+    /// Frame-rate cap for animated wallpapers; `None` = the default (30).
+    #[serde(default)]
+    pub fps: Option<u32>,
+    /// How video, image and web wallpapers fit the screen; `None` = fill.
+    #[serde(default)]
+    pub scaling: Option<crate::render::ScaleMode>,
+    /// The playlist `wp-engine run` plays, if any.
+    #[serde(default)]
+    pub active_playlist: Option<String>,
+    /// Per-screen, span or clone; `None` = per-screen.
+    #[serde(default)]
+    pub layout: Option<crate::render::ScreenLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,14 +73,14 @@ pub struct Playlist {
     pub items: Vec<String>,
     #[serde(default = "default_delay_minutes")]
     pub delay_minutes: u32,
-    /// `"timer"` (advance every `delay_minutes`) — the only mode with
-    /// anywhere to plug into yet; mirrors the real client's/linux-
-    /// wallpaperengine's `mode`/`order` fields structurally so a playback
-    /// scheduler has a ready-made schema to consume later.
+    /// `timer`, `daytime`, `dayofweek` or `login` — see `schedule`.
     #[serde(default = "default_mode")]
     pub mode: String,
     #[serde(default = "default_order")]
     pub order: String,
+    /// `daytime` mode: when each item starts, `"HH:MM"`, parallel to `items`.
+    #[serde(default)]
+    pub times: Vec<String>,
 }
 
 fn default_delay_minutes() -> u32 {
@@ -109,6 +120,43 @@ pub fn normalize_key(id_or_path: &str) -> String {
         .unwrap_or_else(|_| id_or_path.to_string())
 }
 
+/// XDG autostart entry that runs `wp-engine run` at login.
+pub fn autostart_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("autostart")
+        .join("wp-engine.desktop")
+}
+
+pub fn autostart_enabled() -> bool {
+    autostart_path().exists()
+}
+
+/// Write or remove the autostart entry. It points at this executable, so
+/// it follows wherever the binary was installed.
+pub fn set_autostart(enabled: bool) -> anyhow::Result<()> {
+    let path = autostart_path();
+    if !enabled {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        };
+    }
+    let exe = std::env::current_exe()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(
+        &path,
+        format!(
+            "[Desktop Entry]\nType=Application\nName=wp-engine\nComment=Animated wallpapers\n\
+             Exec=\"{}\" run\nX-GNOME-Autostart-enabled=true\n",
+            exe.display()
+        ),
+    )?;
+    Ok(())
+}
+
 impl WpSettings {
     /// Loads from [`settings_path`]. A missing file is the common case (a
     /// fresh install) — returns defaults silently. A present-but-corrupt
@@ -146,11 +194,32 @@ impl WpSettings {
     }
 
     /// Saved property overrides for one wallpaper, empty when it has none.
-    pub fn property_overrides(&self, id_or_path: &str) -> std::collections::HashMap<String, String> {
+    pub fn property_overrides(
+        &self,
+        id_or_path: &str,
+    ) -> std::collections::HashMap<String, String> {
         self.properties
             .get(&normalize_key(id_or_path))
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default()
+    }
+
+    /// Saved overrides for the wallpaper in `dir`, whichever key they were
+    /// saved under: its Workshop ID (the folder name) or its canonical path.
+    pub fn property_overrides_for_dir(
+        &self,
+        dir: &Path,
+    ) -> std::collections::HashMap<String, String> {
+        let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let keys = [
+            dir.file_name().map(|n| n.to_string_lossy().into_owned()),
+            Some(canonical.display().to_string()),
+        ];
+        keys.iter()
+            .flatten()
+            .filter_map(|k| self.properties.get(k))
+            .flat_map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .collect()
     }
 
     pub fn set_property(&mut self, id_or_path: &str, name: &str, value: &str) {
@@ -177,7 +246,8 @@ impl WpSettings {
     }
 
     pub fn set_screen(&mut self, screen: &str, id_or_path: &str) {
-        self.screens.insert(screen.to_string(), id_or_path.to_string());
+        self.screens
+            .insert(screen.to_string(), id_or_path.to_string());
     }
 
     /// Returns whether a screen assignment actually existed to remove.
@@ -251,10 +321,14 @@ mod tests {
         settings.set_property("no-such-wallpaper-id", "color", "1 0 0");
         settings.set_screen("DP-1", "no-such-wallpaper-id");
         settings.set_default_background("no-such-wallpaper-id");
-        settings.set_quality("no-such-wallpaper-id", crate::platform::RenderQuality::Medium);
+        settings.set_quality(
+            "no-such-wallpaper-id",
+            crate::platform::RenderQuality::Medium,
+        );
         settings.playlists.insert(
             "morning".to_string(),
             Playlist {
+                times: Vec::new(),
                 items: vec!["a".to_string(), "b".to_string()],
                 delay_minutes: 30,
                 mode: "timer".to_string(),
@@ -282,6 +356,25 @@ mod tests {
             Some(&"2".to_string())
         );
         assert!(settings.property_overrides("wallpaper-c").is_empty());
+    }
+
+    /// The GUI saves Workshop items under their ID; loading goes by folder.
+    #[test]
+    fn overrides_for_dir_match_the_workshop_id_folder_name() {
+        let mut settings = WpSettings::default();
+        settings
+            .properties
+            .entry("123456".into())
+            .or_default()
+            .insert("speed".into(), "3".into());
+        let dir = Path::new("/nonexistent/431960/123456");
+        assert_eq!(
+            settings.property_overrides_for_dir(dir).get("speed"),
+            Some(&"3".to_string())
+        );
+        assert!(settings
+            .property_overrides_for_dir(Path::new("/nonexistent/other"))
+            .is_empty());
     }
 
     #[test]
@@ -318,7 +411,10 @@ mod tests {
         settings.set_quality("w", RenderQuality::Low);
         assert_eq!(settings.quality_override("w"), Some(RenderQuality::Low));
         // Stored as the label string, not some opaque encoding — inspect it directly.
-        assert_eq!(settings.quality.get(&normalize_key("w")), Some(&"Low".to_string()));
+        assert_eq!(
+            settings.quality.get(&normalize_key("w")),
+            Some(&"Low".to_string())
+        );
 
         settings.set_quality("w", RenderQuality::Ultra);
         assert_eq!(settings.quality_override("w"), Some(RenderQuality::Ultra));

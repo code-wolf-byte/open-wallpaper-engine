@@ -100,6 +100,27 @@ enum Command {
         #[arg(long = "set-property", value_name = "NAME=VALUE")]
         properties: Vec<String>,
     },
+    /// Render a video, image or web wallpaper's frame to a PNG at a given
+    /// size (for debugging)
+    RenderFrame {
+        /// Workshop ID, directory, or file
+        id_or_path: String,
+        #[arg(long, default_value = "frame_output.png")]
+        output: PathBuf,
+        #[arg(long, default_value_t = 1920)]
+        width: u32,
+        #[arg(long, default_value_t = 1080)]
+        height: u32,
+        /// Frame rate handed to web pages
+        #[arg(long, default_value_t = 30)]
+        fps: u32,
+        /// Keep rendering this long before saving the latest frame
+        #[arg(long, default_value_t = 2.0)]
+        seconds: f32,
+        /// Override a user property: NAME=VALUE (repeatable)
+        #[arg(long = "set-property", value_name = "NAME=VALUE")]
+        properties: Vec<String>,
+    },
     /// Preview an animated scene wallpaper in a window (for testing animation)
     PreviewScene {
         /// Workshop ID or directory path
@@ -140,6 +161,28 @@ enum Command {
     Status,
     /// Remove the wallpaper and stop the background daemon
     Stop,
+    /// Control playlist playback in the background daemon
+    Playlist {
+        #[command(subcommand)]
+        action: PlaylistAction,
+    },
+    /// Start `wp-engine run` at login: on, off, or show the current state
+    Autostart {
+        #[arg(value_parser = ["on", "off", "status"], default_value = "status")]
+        state: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlaylistAction {
+    /// Start playing a saved playlist (see `config set-playlist`)
+    Play { name: String },
+    /// Skip to the next item
+    Next,
+    /// Go back to the previous item
+    Previous,
+    /// Stop rotating, keeping the current wallpaper
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -173,13 +216,35 @@ enum ConfigAction {
         items: Vec<String>,
         #[arg(long, default_value_t = 60)]
         delay: u32,
+        /// timer (every --delay minutes), daytime (each item at its --times
+        /// entry), dayofweek (item N on weekday N, Monday first), or login
+        /// (next item each time playback starts)
         #[arg(long, default_value = "timer")]
         mode: String,
+        /// sequential or random
         #[arg(long, default_value = "sequential")]
         order: String,
+        /// daytime mode: comma-separated start times, one per item ("07:00,19:30")
+        #[arg(long, value_delimiter = ',')]
+        times: Vec<String>,
     },
+    /// Make `wp-engine run` play this playlist (omit NAME to clear)
+    SetActivePlaylist { name: Option<String> },
     /// Remove a playlist
     RemovePlaylist { name: String },
+    /// Set what happens while a condition holds: CONDITION is focus,
+    /// maximized, fullscreen, audio, battery or lock; ACTION is run, mute,
+    /// pause or stop (pause and free memory)
+    SetPlayback { condition: String, action: String },
+    /// Cap the frame rate of animated wallpapers (1-240)
+    SetFps { fps: u32 },
+    /// How video, image and web wallpapers fit the screen: fill (crop,
+    /// default), fit (black bars), stretch, or center
+    SetScaling { mode: String },
+    /// How one wallpaper covers several monitors: per-screen (default; see
+    /// set-screen), span (stretched across all of them) or clone (the same
+    /// picture on each)
+    SetLayout { layout: String },
 }
 
 fn main() {
@@ -201,12 +266,20 @@ fn main() {
         // No subcommand → open GUI
         None => run_ui(),
         Some(Command::List { r#type }) => cmd_list(r#type),
-        Some(Command::Set { id, properties, quality, save, foreground }) => {
-            cmd_set(&id, properties, quality, save, foreground)
-        }
-        Some(Command::SetFile { path, properties, quality, save, foreground }) => {
-            cmd_set_file(&path, properties, quality, save, foreground)
-        }
+        Some(Command::Set {
+            id,
+            properties,
+            quality,
+            save,
+            foreground,
+        }) => cmd_set(&id, properties, quality, save, foreground),
+        Some(Command::SetFile {
+            path,
+            properties,
+            quality,
+            save,
+            foreground,
+        }) => cmd_set_file(&path, properties, quality, save, foreground),
         Some(Command::ListProperties { id }) => cmd_list_properties(&id),
         Some(Command::Info { id }) => cmd_info(&id),
         Some(Command::Probe) => cmd_probe(),
@@ -223,11 +296,29 @@ fn main() {
             height,
         }) => cmd_preview_scene(&id_or_path, width, height),
         Some(Command::TestScene { id_or_path, frames }) => cmd_test_scene(&id_or_path, frames),
+        Some(Command::RenderFrame {
+            id_or_path,
+            output,
+            width,
+            height,
+            fps,
+            seconds,
+            properties,
+        }) => cmd_render_frame(
+            &id_or_path,
+            &output,
+            (width, height),
+            fps,
+            seconds,
+            properties,
+        ),
         Some(Command::Config { action }) => cmd_config(action),
         Some(Command::Run { foreground }) => cmd_run(foreground),
         Some(Command::Daemon) => cmd_daemon(),
         Some(Command::Status) => cmd_status(),
         Some(Command::Stop) => cmd_stop(),
+        Some(Command::Playlist { action }) => cmd_playlist(action),
+        Some(Command::Autostart { state }) => cmd_autostart(&state),
     };
 
     if let Err(e) = result {
@@ -370,8 +461,9 @@ fn apply_saved_settings(
     let saved_quality = settings.quality_override(id_or_path);
     let cli_quality_parsed = cli_quality
         .map(|s| {
-            wp_engine::platform::RenderQuality::parse(s)
-                .ok_or_else(|| anyhow!("invalid --quality '{s}' (expected Ultra, High, Medium, or Low)"))
+            wp_engine::platform::RenderQuality::parse(s).ok_or_else(|| {
+                anyhow!("invalid --quality '{s}' (expected Ultra, High, Medium, or Low)")
+            })
         })
         .transpose()?;
     if let Some(q) = cli_quality_parsed.or(saved_quality) {
@@ -389,7 +481,10 @@ fn apply_saved_settings(
             saved_anything = true;
         }
         if !cli_properties.is_empty() {
-            println!("Saved {} property override(s) for next time", cli_properties.len());
+            println!(
+                "Saved {} property override(s) for next time",
+                cli_properties.len()
+            );
         }
         if let Some(q) = cli_quality_parsed {
             settings.set_quality(id_or_path, q);
@@ -461,6 +556,8 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
     use wp_engine::settings::{Playlist, WpSettings};
 
     let mut settings = WpSettings::load();
+    // Property edits to show live on a running daemon once saved.
+    let mut live: Option<(String, Vec<String>)> = None;
 
     match action {
         ConfigAction::Show => {
@@ -474,15 +571,19 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
             return Ok(());
         }
         ConfigAction::SetProperty { id, properties } => {
+            let mut names = Vec::new();
             for arg in &properties {
                 let (name, value) = engine::properties::parse_property_arg(arg);
                 println!("{id}: {name} = {value}");
                 settings.set_property(&id, &name, &value);
+                names.push(name);
             }
+            live = Some((id, names));
         }
         ConfigAction::UnsetProperty { id, name } => {
             if settings.unset_property(&id, &name) {
                 println!("Removed {id}: {name}");
+                live = Some((id, vec![name]));
             } else {
                 println!("No saved override for {id}: {name}");
                 return Ok(());
@@ -525,7 +626,29 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
             delay,
             mode,
             order,
+            times,
         } => {
+            if !["timer", "daytime", "dayofweek", "login"].contains(&mode.as_str()) {
+                return Err(anyhow!(
+                    "invalid mode '{mode}' (expected timer, daytime, dayofweek or login)"
+                ));
+            }
+            if !["sequential", "random"].contains(&order.as_str()) {
+                return Err(anyhow!(
+                    "invalid order '{order}' (expected sequential or random)"
+                ));
+            }
+            if mode == "daytime" {
+                if times.len() != items.len() {
+                    return Err(anyhow!("daytime mode needs one --times entry per item"));
+                }
+                if let Some(bad) = times
+                    .iter()
+                    .find(|t| wp_engine::schedule::parse_time_of_day(t).is_none())
+                {
+                    return Err(anyhow!("invalid time '{bad}' (expected HH:MM)"));
+                }
+            }
             println!("Playlist '{name}': {} item(s)", items.len());
             settings.playlists.insert(
                 name,
@@ -534,8 +657,55 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
                     delay_minutes: delay,
                     mode,
                     order,
+                    times,
                 },
             );
+        }
+        ConfigAction::SetActivePlaylist { name } => {
+            if let Some(n) = &name {
+                if !settings.playlists.contains_key(n) {
+                    return Err(anyhow!("no playlist named '{n}'"));
+                }
+                println!("`wp-engine run` plays playlist '{n}'");
+            } else {
+                println!("No active playlist");
+            }
+            settings.active_playlist = name;
+        }
+        ConfigAction::SetPlayback { condition, action } => {
+            let a = wp_engine::engine::playback_gate::PlaybackAction::parse(&action).ok_or_else(
+                || anyhow!("invalid action '{action}' (expected run, mute, pause or stop)"),
+            )?;
+            if !settings.playback.set(&condition, a) {
+                return Err(anyhow!(
+                    "invalid condition '{condition}' (expected focus, maximized, fullscreen, audio, battery or lock)"
+                ));
+            }
+            println!("While {condition}: {}", a.label());
+        }
+        ConfigAction::SetScaling { mode } => {
+            let m = wp_engine::render::ScaleMode::parse(&mode).ok_or_else(|| {
+                anyhow!("invalid mode '{mode}' (expected fill, fit, stretch or center)")
+            })?;
+            settings.scaling = Some(m);
+            println!("Scaling: {}", m.label());
+        }
+        ConfigAction::SetLayout { layout } => {
+            let l = wp_engine::render::ScreenLayout::parse(&layout).ok_or_else(|| {
+                anyhow!("invalid layout '{layout}' (expected per-screen, span or clone)")
+            })?;
+            settings.layout = Some(l);
+            println!(
+                "Layout: {} (applies the next time a wallpaper is set)",
+                l.label()
+            );
+        }
+        ConfigAction::SetFps { fps } => {
+            if !(1..=240).contains(&fps) {
+                return Err(anyhow!("fps must be between 1 and 240"));
+            }
+            settings.fps = Some(fps);
+            println!("Frame-rate cap: {fps} fps");
         }
         ConfigAction::RemovePlaylist { name } => {
             if settings.playlists.remove(&name).is_some() {
@@ -548,6 +718,12 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
     }
 
     settings.save()?;
+    if let Some((wallpaper, names)) = live.filter(|_| wp_engine::daemon::is_running()) {
+        let _ = wp_engine::daemon::request(&wp_engine::daemon::Request::PropertiesChanged {
+            wallpaper,
+            names,
+        });
+    }
     Ok(())
 }
 
@@ -568,6 +744,26 @@ fn resolve_id_or_path(id_or_path: &str) -> Result<PathBuf> {
     }
 }
 
+/// [`resolve_id_or_path`] for the scene tools: a preset item resolves to the
+/// item it builds on, with the preset's values registered as overrides.
+fn cmd_autostart(state: &str) -> Result<()> {
+    if state != "status" {
+        wp_engine::settings::set_autostart(state == "on")?;
+    }
+    if wp_engine::settings::autostart_enabled() {
+        let path = wp_engine::settings::autostart_path();
+        println!("Autostart on ({})", path.display());
+    } else {
+        println!("Autostart off");
+    }
+    Ok(())
+}
+
+fn resolve_scene_dir(id_or_path: &str) -> Result<PathBuf> {
+    let dir = resolve_id_or_path(id_or_path)?;
+    wp_engine::render::WallpaperContent::preset_base_dir(&dir)
+}
+
 /// Runs using persisted settings (`wp-engine config` to set them up first):
 /// every `screens` entry gets its own independent wallpaper *and* its own
 /// independent render quality on its own output (real per-screen rendering
@@ -579,18 +775,30 @@ fn resolve_id_or_path(id_or_path: &str) -> Result<PathBuf> {
 /// `engine::properties`), so only the *default* background's saved
 /// overrides are applied — a per-screen wallpaper's own saved overrides
 /// aren't isolated from each other yet if two different screens' wallpapers
-/// happen to declare a property with the same name. Playlists are still
-/// data-only (no rotation timer exists) — only each playlist's first item
-/// is ever actually reachable through `run` today.
+/// happen to declare a property with the same name. With an active
+/// playlist (`config set-active-playlist`), the daemon plays that instead.
 fn cmd_run(foreground: bool) -> Result<()> {
     let settings = wp_engine::settings::WpSettings::load();
+
+    #[cfg(target_os = "linux")]
+    if let (Some(name), false) = (&settings.active_playlist, foreground) {
+        cmd_playlist(PlaylistAction::Play { name: name.clone() })?;
+        println!("Playing playlist '{name}' (background daemon).");
+        return Ok(());
+    }
 
     let default_id_or_path = settings
         .screens
         .values()
         .next()
         .or(settings.default_background.as_ref())
-        .or_else(|| settings.playlists.values().next().and_then(|p| p.items.first()))
+        .or_else(|| {
+            settings
+                .playlists
+                .values()
+                .next()
+                .and_then(|p| p.items.first())
+        })
         .ok_or_else(|| {
             anyhow!(
                 "no saved wallpaper — use `wp-engine config set-screen`/`set-default`/\
@@ -622,6 +830,7 @@ fn cmd_run(foreground: bool) -> Result<()> {
                         screen.clone(),
                         Arc::new(Mutex::new(wp_engine::render::RenderSettings {
                             quality: q,
+                            fps: context.settings.lock().unwrap().fps,
                             ..Default::default()
                         })),
                     );
@@ -692,6 +901,9 @@ fn cmd_status() -> Result<()> {
         }
         None => println!("Wallpaper: none"),
     }
+    if let Some((name, index, count)) = status.playlist {
+        println!("Playlist: {name} (item {} of {count})", index + 1);
+    }
     Ok(())
 }
 
@@ -710,6 +922,32 @@ fn cmd_stop() -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn cmd_daemon() -> Result<()> {
     Err(anyhow!("the background daemon is Linux-only"))
+}
+
+#[cfg(target_os = "linux")]
+fn cmd_playlist(action: PlaylistAction) -> Result<()> {
+    use wp_engine::daemon::{self, Request, Response};
+    let req = match &action {
+        PlaylistAction::Play { name } => Request::PlayPlaylist { name: name.clone() },
+        PlaylistAction::Next => Request::NextItem,
+        PlaylistAction::Previous => Request::PreviousItem,
+        PlaylistAction::Stop => Request::StopPlaylist,
+    };
+    let reply = if matches!(action, PlaylistAction::Play { .. }) {
+        daemon::request_or_spawn(&req)?
+    } else {
+        daemon::request(&req)?
+    };
+    if let Response::Error { message } = reply {
+        return Err(anyhow!(message));
+    }
+    println!("OK");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cmd_playlist(_action: PlaylistAction) -> Result<()> {
+    cmd_daemon()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -741,6 +979,13 @@ fn cmd_probe() -> Result<()> {
         );
     }
     println!("\n{} adapter(s) found\n", adapters.len());
+    let outputs = platform::display::output_names();
+    if !outputs.is_empty() {
+        println!(
+            "Screens (for `config set-screen`): {}\n",
+            outputs.join(", ")
+        );
+    }
 
     // ── 2. Open the best device to confirm driver access works ───────────────
     print!("Opening best device... ");
@@ -854,14 +1099,7 @@ fn cmd_render_scene(
         .collect();
     engine::properties::set_global_overrides(overrides);
 
-    let dir = std::path::PathBuf::from(id_or_path);
-    let dir = if dir.exists() {
-        dir
-    } else {
-        workshop::find_by_id(id_or_path)
-            .map(|w| w.path)
-            .ok_or_else(|| anyhow!("not a directory and workshop item '{id_or_path}' not found"))?
-    };
+    let dir = resolve_scene_dir(id_or_path)?;
     println!("Loading scene from {}...", dir.display());
     let graph = engine::SceneGraph::from_directory(&dir)?;
     println!("Scene graph: {}", graph.stats().summary());
@@ -897,17 +1135,46 @@ fn cmd_render_scene(
     Ok(())
 }
 
+fn cmd_render_frame(
+    id_or_path: &str,
+    output: &std::path::Path,
+    size: (u32, u32),
+    fps: u32,
+    seconds: f32,
+    properties: Vec<String>,
+) -> Result<()> {
+    engine::properties::set_global_overrides(
+        properties
+            .iter()
+            .map(|p| engine::properties::parse_property_arg(p))
+            .collect(),
+    );
+    let path = resolve_id_or_path(id_or_path)?;
+    let content = wp_engine::render::WallpaperContent::from_any_path(&path)?;
+    let mut source = wp_engine::render::FrameSource::from_content_with(
+        content,
+        wp_engine::render::web::WebOptions { size, fps },
+    )?;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs_f32(seconds.max(0.0));
+    while std::time::Instant::now() < until {
+        source.try_advance();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let frame = source.current_frame();
+    frame.save(output)?;
+    println!(
+        "Saved {}x{} frame to {}",
+        frame.width(),
+        frame.height(),
+        output.display()
+    );
+    Ok(())
+}
+
 fn cmd_test_scene(id_or_path: &str, num_frames: usize) -> Result<()> {
     use std::sync::{mpsc::sync_channel, Arc};
 
-    let dir = std::path::PathBuf::from(id_or_path);
-    let dir = if dir.exists() {
-        dir
-    } else {
-        workshop::find_by_id(id_or_path)
-            .map(|w| w.path)
-            .ok_or_else(|| anyhow!("not a directory and workshop item '{id_or_path}' not found"))?
-    };
+    let dir = resolve_scene_dir(id_or_path)?;
 
     println!(
         "GPU scene animation test: collecting {num_frames} frames from {}",
@@ -1013,14 +1280,7 @@ fn cmd_preview_scene(id_or_path: &str, width: u32, height: u32) -> Result<()> {
     use minifb::{Key, Window, WindowOptions};
     use std::sync::{mpsc::sync_channel, Arc};
 
-    let dir = std::path::PathBuf::from(id_or_path);
-    let dir = if dir.exists() {
-        dir
-    } else {
-        workshop::find_by_id(id_or_path)
-            .map(|w| w.path)
-            .ok_or_else(|| anyhow!("not a directory and workshop item '{id_or_path}' not found"))?
-    };
+    let dir = resolve_scene_dir(id_or_path)?;
 
     println!("Loading scene from {}...", dir.display());
     let (tx, rx) = sync_channel::<Arc<image::RgbaImage>>(2);

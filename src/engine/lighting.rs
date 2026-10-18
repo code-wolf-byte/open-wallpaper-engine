@@ -183,7 +183,11 @@ pub fn geometric_schlick(ndotv: f32, roughness: f32) -> f32 {
 /// ```
 pub fn fresnel_schlick(cos_theta: f32, f0: [f32; 3]) -> [f32; 3] {
     let t = (1.0 - cos_theta).powf(5.0);
-    [f0[0] + (1.0 - f0[0]) * t, f0[1] + (1.0 - f0[1]) * t, f0[2] + (1.0 - f0[2]) * t]
+    [
+        f0[0] + (1.0 - f0[0]) * t,
+        f0[1] + (1.0 - f0[1]) * t,
+        f0[2] + (1.0 - f0[2]) * t,
+    ]
 }
 
 // ── Per-type PBR lighting ──────────────────────────────────────────────────
@@ -291,7 +295,8 @@ pub fn pbr_point(
         origin[1] - world_pos[1],
         origin[2] - world_pos[2],
     ];
-    let dist2 = (to_light[0] * to_light[0] + to_light[1] * to_light[1] + to_light[2] * to_light[2]).max(0.0001);
+    let dist2 = (to_light[0] * to_light[0] + to_light[1] * to_light[1] + to_light[2] * to_light[2])
+        .max(0.0001);
     let dist = dist2.sqrt();
     let l = [to_light[0] / dist, to_light[1] / dist, to_light[2] / dist];
     // Inverse-square attenuation: color.rgb * intensity / dist²
@@ -336,19 +341,34 @@ pub fn pbr_spot(
         world_pos[1] - origin[1],
         world_pos[2] - origin[2],
     ];
-    let dist2 = (to_surface[0] * to_surface[0] + to_surface[1] * to_surface[1] + to_surface[2] * to_surface[2]).max(0.0001);
+    let dist2 = (to_surface[0] * to_surface[0]
+        + to_surface[1] * to_surface[1]
+        + to_surface[2] * to_surface[2])
+        .max(0.0001);
     let dist = dist2.sqrt();
 
     // l: direction from surface toward the light (for BRDF)
-    let l = [-to_surface[0] / dist, -to_surface[1] / dist, -to_surface[2] / dist];
+    let l = [
+        -to_surface[0] / dist,
+        -to_surface[1] / dist,
+        -to_surface[2] / dist,
+    ];
 
     // Angular falloff: dot(light→surface, spot_direction)
-    let to_surf_norm = [to_surface[0] / dist, to_surface[1] / dist, to_surface[2] / dist];
+    let to_surf_norm = [
+        to_surface[0] / dist,
+        to_surface[1] / dist,
+        to_surface[2] / dist,
+    ];
     let cos_angle = dot3(to_surf_norm, norm3(direction)).max(0.0);
     let spot_factor = cos_angle.powf(exponent.max(1.0));
 
     let atten = color[3] / dist2;
-    let light_rgb = [color[0] * atten * spot_factor, color[1] * atten * spot_factor, color[2] * atten * spot_factor];
+    let light_rgb = [
+        color[0] * atten * spot_factor,
+        color[1] * atten * spot_factor,
+        color[2] * atten * spot_factor,
+    ];
 
     let f0 = [
         specular_tint[0] * metallic + (1.0 - metallic) * 0.04,
@@ -405,7 +425,8 @@ pub fn pbr_tube(
         closest[1] - world_pos[1],
         closest[2] - world_pos[2],
     ];
-    let dist2 = (to_light[0] * to_light[0] + to_light[1] * to_light[1] + to_light[2] * to_light[2]).max(0.0001);
+    let dist2 = (to_light[0] * to_light[0] + to_light[1] * to_light[1] + to_light[2] * to_light[2])
+        .max(0.0001);
     let dist = dist2.sqrt();
     let l = [to_light[0] / dist, to_light[1] / dist, to_light[2] / dist];
 
@@ -556,30 +577,84 @@ impl Light {
         shadow_factor: f32,
     ) -> [f32; 3] {
         match self {
-            Light::Directional { direction, color, intensity } => pbr_directional(
-                n, v, albedo,
+            Light::Directional {
+                direction,
+                color,
+                intensity,
+            } => pbr_directional(
+                n,
+                v,
+                albedo,
                 *direction,
-                [color[0] * *intensity, color[1] * *intensity, color[2] * *intensity],
-                specular_tint, ambient, roughness, metallic, shadow_factor,
+                [
+                    color[0] * *intensity,
+                    color[1] * *intensity,
+                    color[2] * *intensity,
+                ],
+                specular_tint,
+                ambient,
+                roughness,
+                metallic,
+                shadow_factor,
             ),
-            Light::Point { origin, color, intensity, .. } => pbr_point(
-                n, v, world_pos, albedo,
+            Light::Point {
+                origin,
+                color,
+                intensity,
+                ..
+            } => pbr_point(
+                n,
+                v,
+                world_pos,
+                albedo,
                 [origin[0], origin[1], origin[2], *intensity],
                 [color[0], color[1], color[2], *intensity],
-                specular_tint, ambient, roughness, metallic, shadow_factor,
+                specular_tint,
+                ambient,
+                roughness,
+                metallic,
+                shadow_factor,
             ),
-            Light::Spot { origin, direction, exponent, color, intensity, .. } => pbr_spot(
-                n, v, world_pos, albedo,
-                *origin, *direction, *exponent,
+            Light::Spot {
+                origin,
+                direction,
+                exponent,
+                color,
+                intensity,
+                ..
+            } => pbr_spot(
+                n,
+                v,
+                world_pos,
+                albedo,
+                *origin,
+                *direction,
+                *exponent,
                 [color[0], color[1], color[2], *intensity],
-                specular_tint, ambient, roughness, metallic, shadow_factor,
+                specular_tint,
+                ambient,
+                roughness,
+                metallic,
+                shadow_factor,
             ),
-            Light::Tube { origin_a, origin_b, color, intensity } => pbr_tube(
-                n, v, world_pos, albedo,
+            Light::Tube {
+                origin_a,
+                origin_b,
+                color,
+                intensity,
+            } => pbr_tube(
+                n,
+                v,
+                world_pos,
+                albedo,
                 [origin_a[0], origin_a[1], origin_a[2], 1.0],
                 [origin_b[0], origin_b[1], origin_b[2], *intensity],
                 [color[0], color[1], color[2], *intensity],
-                specular_tint, ambient, roughness, metallic, shadow_factor,
+                specular_tint,
+                ambient,
+                roughness,
+                metallic,
+                shadow_factor,
             ),
         }
     }
@@ -624,7 +699,7 @@ mod tests {
     fn directional_light_straight_on() {
         // Surface facing light, no shadow: should produce non-zero lit output
         let result = pbr_directional(
-            [0.0, 1.0, 0.0], // N: facing +Y
+            [0.0, 1.0, 0.0],  // N: facing +Y
             [0.0, 0.0, -1.0], // V: looking at -Z (toward camera)
             [1.0, 1.0, 1.0],  // albedo: white
             [0.0, 1.0, 0.0],  // L: from +Y (same as N → NdotL = 1)
@@ -636,8 +711,14 @@ mod tests {
             1.0,              // unshadowed
         );
         // Should be brighter than ambient alone
-        assert!(result[0] > 0.1, "spec+diff should exceed ambient: got {result:?}");
-        assert!(result[0] < 10.0, "should not be unreasonably large: got {result:?}");
+        assert!(
+            result[0] > 0.1,
+            "spec+diff should exceed ambient: got {result:?}"
+        );
+        assert!(
+            result[0] < 10.0,
+            "should not be unreasonably large: got {result:?}"
+        );
     }
 
     #[test]
@@ -657,7 +738,10 @@ mod tests {
         );
         // NdotL = 0 → diffuse = 0, spec ≈ 0 (H not aligned)
         // Result should be ~0 (within floating point tolerance)
-        assert!(result[0] < 0.05, "90° light should produce near-zero: got {result:?}");
+        assert!(
+            result[0] < 0.05,
+            "90° light should produce near-zero: got {result:?}"
+        );
     }
 
     #[test]
@@ -672,7 +756,9 @@ mod tests {
             [1.0, 1.0, 1.0, 1.0], // colour white, intensity 1
             [1.0, 1.0, 1.0],
             [0.0; 3],
-            0.5, 0.0, 1.0,
+            0.5,
+            0.0,
+            1.0,
         );
 
         // Surface at (0, 0, 2) → dist = 2, atten = 1/4
@@ -685,10 +771,15 @@ mod tests {
             [1.0, 1.0, 1.0, 1.0],
             [1.0, 1.0, 1.0],
             [0.0; 3],
-            0.5, 0.0, 1.0,
+            0.5,
+            0.0,
+            1.0,
         );
 
-        assert!(r_near[0] > r_far[0], "near should be brighter than far: near={r_near:?} far={r_far:?}");
+        assert!(
+            r_near[0] > r_far[0],
+            "near should be brighter than far: near={r_near:?} far={r_far:?}"
+        );
         // Ratio should be approximately 4 (1/d²)
         let ratio = r_near[0] / r_far[0].max(1e-6);
         assert!((ratio - 4.0).abs() < 1.0, "ratio ≈ 4, got {ratio}");
@@ -696,7 +787,10 @@ mod tests {
 
     #[test]
     fn fog_factor_zero_when_disabled() {
-        let fog = Fog { distance_density: 0.0, ..Default::default() };
+        let fog = Fog {
+            distance_density: 0.0,
+            ..Default::default()
+        };
         assert_eq!(fog_factor([0.0, 0.0, -100.0], &fog), 0.0);
     }
 
@@ -709,7 +803,10 @@ mod tests {
         };
         let f_near = fog_factor([0.0, 0.0, -10.0], &fog);
         let f_far = fog_factor([0.0, 0.0, -100.0], &fog);
-        assert!(f_near < f_far, "far should be more fogged: near={f_near} far={f_far}");
+        assert!(
+            f_near < f_far,
+            "far should be more fogged: near={f_near} far={f_far}"
+        );
         assert!((0.0..1.0).contains(&f_near));
         assert!((0.0..1.0).contains(&f_far));
     }
@@ -717,7 +814,7 @@ mod tests {
     #[test]
     fn fog_apply_blends_to_fog_color() {
         let fog = Fog {
-            distance_density: 10.0, // very dense → f ≈ 1 at dist=10
+            distance_density: 10.0,          // very dense → f ≈ 1 at dist=10
             distance_color: [1.0, 0.0, 0.0], // red fog
             ..Default::default()
         };
@@ -733,7 +830,7 @@ mod tests {
         let fog = Fog {
             height_density: 0.1,
             height_color: [0.0, 0.0, 1.0],
-            height_offset: 5.0,  // fog starts below y=5, denser as you go lower
+            height_offset: 5.0, // fog starts below y=5, denser as you go lower
             height_exponent: 1.0,
             ..Default::default()
         };
@@ -746,10 +843,22 @@ mod tests {
         // At y=-5 (below offset by 10): more fog
         let f_further_below = fog_factor([0.0, -5.0, -10.0], &fog);
 
-        assert!(f_above < 0.01, "above offset should be nearly clear: got {f_above}");
-        assert!(f_at_offset < 0.01, "at offset should be nearly clear: got {f_at_offset}");
-        assert!(f_below > f_at_offset, "below offset should be fogged: got {f_below} vs {f_at_offset}");
-        assert!(f_further_below > f_below, "further below should be more fogged: got {f_further_below} vs {f_below}");
+        assert!(
+            f_above < 0.01,
+            "above offset should be nearly clear: got {f_above}"
+        );
+        assert!(
+            f_at_offset < 0.01,
+            "at offset should be nearly clear: got {f_at_offset}"
+        );
+        assert!(
+            f_below > f_at_offset,
+            "below offset should be fogged: got {f_below} vs {f_at_offset}"
+        );
+        assert!(
+            f_further_below > f_below,
+            "further below should be more fogged: got {f_further_below} vs {f_below}"
+        );
     }
 
     #[test]
@@ -765,12 +874,14 @@ mod tests {
             [0.0, 1.0, 0.0],
             [1.0, 1.0, 1.0],
             [0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],  // spot dir +Y
+            [0.0, 1.0, 0.0], // spot dir +Y
             2.0,
             [1.0, 1.0, 1.0, 1.0],
             [1.0, 1.0, 1.0],
             [0.0; 3],
-            0.5, 0.0, 1.0,
+            0.5,
+            0.0,
+            1.0,
         );
 
         // Surface B: at (1, 1, 0) → 45° off axis → cos = 1/√2 → dimmer
@@ -785,11 +896,19 @@ mod tests {
             [1.0, 1.0, 1.0, 1.0],
             [1.0, 1.0, 1.0],
             [0.0; 3],
-            0.5, 0.0, 1.0,
+            0.5,
+            0.0,
+            1.0,
         );
 
-        assert!(r_center[0] > 0.0, "center should produce light: got {r_center:?}");
-        assert!(r_center[0] > r_edge[0], "center should be brighter than edge: center={r_center:?} edge={r_edge:?}");
+        assert!(
+            r_center[0] > 0.0,
+            "center should produce light: got {r_center:?}"
+        );
+        assert!(
+            r_center[0] > r_edge[0],
+            "center should be brighter than edge: center={r_center:?} edge={r_edge:?}"
+        );
     }
 
     #[test]
@@ -800,16 +919,18 @@ mod tests {
         // Eye at (2, 0, 0) → V = (1, 0, 0) → NdV = -1 → clamped to 0.001.
         // Diffuse should still produce light.
         let r = pbr_tube(
-            [-1.0, 0.0, 0.0],   // N faces the tube
-            [1.0, 0.0, 0.0],   // V toward eye
-            [1.0, 0.0, 0.0],   // surface pos
+            [-1.0, 0.0, 0.0], // N faces the tube
+            [1.0, 0.0, 0.0],  // V toward eye
+            [1.0, 0.0, 0.0],  // surface pos
             [1.0, 1.0, 1.0],
             [0.0, 0.0, 0.0, 1.0], // A
             [0.0, 0.0, 2.0, 1.0], // B (w=1 intensity)
             [1.0, 1.0, 1.0, 1.0],
             [1.0, 1.0, 1.0],
             [0.0; 3],
-            0.5, 0.0, 1.0,
+            0.5,
+            0.0,
+            1.0,
         );
         assert!(r[0] > 0.0, "tube light should produce light: got {r:?}");
     }

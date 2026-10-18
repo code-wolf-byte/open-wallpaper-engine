@@ -27,8 +27,8 @@ const MARKER_SIZE: usize = 9;
 /// `[u32 unknown][u32 vertexBytes]` prefix before the vertex data.
 const MESH_HEADER_SIZE: usize = 8;
 /// Vertex layouts by format version: position is always 3xf32 at offset 0,
-/// UV is 2xf32 at the tail, skinning data in between (ignored, like the
-/// reference). MDLV0021/0023 use 80-byte vertices (UV at 72) — the only
+/// UV is 2xf32 at the tail, skinning data (indices + weights, 32 bytes)
+/// right before it. MDLV0021/0023 use 80-byte vertices (UV at 72) — the only
 /// versions the reference accepts; MDLV0016 (older workshop content, e.g.
 /// 2952574984) uses 52-byte vertices (UV at 44), reverse-engineered from
 /// real data since the reference just rejects it. Some MDLV0013 files
@@ -176,9 +176,11 @@ fn parse_mesh_block(
         let vertex_count = vertex_bytes / stride;
         let mut positions = Vec::with_capacity(vertex_count);
         let mut uvs = Vec::with_capacity(vertex_count);
-        // Skinning data sits between position (12 bytes) and the UV tail
-        // when the stride leaves the 32 bytes it needs.
+        // Skinning data (4 u32 bone indices + 4 f32 weights) sits right
+        // before the UV tail: offset 12 in 52-byte vertices, 40 in 80-byte
+        // ones, which carry a normal and tangent after the position.
         let has_skin = uv_offset >= 12 + 32;
+        let skin = uv_offset.saturating_sub(32);
         let mut bone_indices = Vec::with_capacity(if has_skin { vertex_count } else { 0 });
         let mut weights = Vec::with_capacity(if has_skin { vertex_count } else { 0 });
         for i in 0..vertex_count {
@@ -190,16 +192,16 @@ fn parse_mesh_block(
             ]);
             if has_skin {
                 bone_indices.push([
-                    u32_at(data, v + 12)?,
-                    u32_at(data, v + 16)?,
-                    u32_at(data, v + 20)?,
-                    u32_at(data, v + 24)?,
+                    u32_at(data, v + skin)?,
+                    u32_at(data, v + skin + 4)?,
+                    u32_at(data, v + skin + 8)?,
+                    u32_at(data, v + skin + 12)?,
                 ]);
                 weights.push([
-                    f32_at(data, v + 28)?,
-                    f32_at(data, v + 32)?,
-                    f32_at(data, v + 36)?,
-                    f32_at(data, v + 40)?,
+                    f32_at(data, v + skin + 16)?,
+                    f32_at(data, v + skin + 20)?,
+                    f32_at(data, v + skin + 24)?,
+                    f32_at(data, v + skin + 28)?,
                 ]);
             }
         }
@@ -610,8 +612,9 @@ impl PuppetModel {
     }
 
     /// Blend one bone's local TRS across the animation layers: the first
-    /// resolvable layer is the base, then each subsequent override lerps and
-    /// each additive adds its delta-from-its-own-frame-0, weighted by `blend`.
+    /// resolvable override layer is the base (an additive first layer starts
+    /// from its own frame 0), then each subsequent override lerps and each
+    /// additive adds its delta-from-its-own-frame-0, weighted by `blend`.
     fn blended_local(&self, layers: &[AnimLayer], bone: usize, t: f32) -> BoneFrame {
         let mut accum: Option<BoneFrame> = None;
         for layer in layers {
@@ -621,24 +624,24 @@ impl PuppetModel {
             let track = anim.tracks.get(bone).map(Vec::as_slice).unwrap_or(&[]);
             let frame = (t * layer.rate * anim.fps).rem_euclid(anim.frame_count as f32);
             let cur = sample_track(track, frame);
-            match &mut accum {
-                None => accum = Some(cur),
-                Some(a) => {
-                    let w = layer.blend.clamp(0.0, 1.0);
-                    if layer.additive {
-                        let rest = sample_track(track, 0.0);
-                        for i in 0..3 {
-                            a.position[i] += (cur.position[i] - rest.position[i]) * w;
-                            a.angles[i] += (cur.angles[i] - rest.angles[i]) * w;
-                            a.scale[i] += (cur.scale[i] - rest.scale[i]) * w;
-                        }
-                    } else {
-                        for i in 0..3 {
-                            a.position[i] += (cur.position[i] - a.position[i]) * w;
-                            a.angles[i] += (cur.angles[i] - a.angles[i]) * w;
-                            a.scale[i] += (cur.scale[i] - a.scale[i]) * w;
-                        }
-                    }
+            if accum.is_none() && !layer.additive {
+                accum = Some(cur);
+                continue;
+            }
+            let rest = sample_track(track, 0.0);
+            let a = accum.get_or_insert(rest);
+            let w = layer.blend.clamp(0.0, 1.0);
+            if layer.additive {
+                for i in 0..3 {
+                    a.position[i] += (cur.position[i] - rest.position[i]) * w;
+                    a.angles[i] += (cur.angles[i] - rest.angles[i]) * w;
+                    a.scale[i] += (cur.scale[i] - rest.scale[i]) * w;
+                }
+            } else {
+                for i in 0..3 {
+                    a.position[i] += (cur.position[i] - a.position[i]) * w;
+                    a.angles[i] += (cur.angles[i] - a.angles[i]) * w;
+                    a.scale[i] += (cur.scale[i] - a.scale[i]) * w;
                 }
             }
         }
@@ -865,6 +868,11 @@ mod tests {
             let mut v = [0u8; STRIDE];
             v[0..4].copy_from_slice(&positions[i][0].to_le_bytes());
             v[4..8].copy_from_slice(&positions[i][1].to_le_bytes());
+            // Normal (0,0,1) after the position, then bone index i at
+            // weight 1 at offset 40/56, as real 80-byte vertices lay out.
+            v[20..24].copy_from_slice(&1.0f32.to_le_bytes());
+            v[40..44].copy_from_slice(&(i as u32).to_le_bytes());
+            v[56..60].copy_from_slice(&1.0f32.to_le_bytes());
             v[UV..UV + 4].copy_from_slice(&uvs[i][0].to_le_bytes());
             v[UV + 4..UV + 8].copy_from_slice(&uvs[i][1].to_le_bytes());
             d.extend_from_slice(&v);
@@ -887,6 +895,10 @@ mod tests {
         assert_eq!(mesh.positions.len(), 3);
         assert_eq!(mesh.indices, vec![0, 1, 2]);
         assert_eq!(mesh.uvs[2], [0.5, 0.0]);
+        // Skinning comes from just before the UV, not the normal after the
+        // position (3598808038's knight had its head skinned to the arm).
+        assert_eq!(mesh.bone_indices[2], [2, 0, 0, 0]);
+        assert_eq!(mesh.weights[2], [1.0, 0.0, 0.0, 0.0]);
     }
 
     /// MDLS bone records start with a name string. It is usually empty, so
@@ -1091,6 +1103,19 @@ mod tests {
         let skinned = model.skinned_positions(&pose);
         assert!((skinned[0][0] - 50.0).abs() < 1e-3, "{skinned:?}");
         assert!((skinned[0][1] - 80.0).abs() < 1e-3, "{skinned:?}");
+
+        // An additive first layer still honours its blend: half the +60 y
+        // delta on top of rest (3598808038's knight is all additive layers).
+        let half = [AnimLayer {
+            anim_idx: 1,
+            additive: true,
+            blend: 0.5,
+            rate: 1.0,
+        }];
+        let pose = model.pose_at_layers(&half, 1.0).unwrap();
+        let skinned = model.skinned_positions(&pose);
+        assert!((skinned[0][0] - 10.0).abs() < 1e-3, "{skinned:?}");
+        assert!((skinned[0][1] - 50.0).abs() < 1e-3, "{skinned:?}");
     }
 
     /// Child bones must inherit their parent's animated transform.

@@ -214,7 +214,10 @@ impl PerspectiveCamera {
             1.0 / scale[1].max(1e-6),
             1.0 / scale[2].max(1e-6),
         ];
-        mat4_mul(&self.view, &model_matrix([0.0, 0.0, 0.0], angles, inv_scale))
+        mat4_mul(
+            &self.view,
+            &model_matrix([0.0, 0.0, 0.0], angles, inv_scale),
+        )
     }
 }
 
@@ -357,7 +360,11 @@ mod tests {
 
     #[test]
     fn mat4_inverse_of_identity_is_identity() {
-        assert!(mat4_approx_eq(&mat4_inverse(&identity()), &identity(), 1e-6));
+        assert!(mat4_approx_eq(
+            &mat4_inverse(&identity()),
+            &identity(),
+            1e-6
+        ));
     }
 
     #[test]
@@ -382,11 +389,15 @@ mod tests {
 
         let world = [1.5, -0.5, 2.0, 1.0f32];
         // Project world -> clip -> NDC.
-        let clip: [f32; 4] =
-            std::array::from_fn(|row| (0..4).map(|k| vp[k][row] * world[k]).sum());
+        let clip: [f32; 4] = std::array::from_fn(|row| (0..4).map(|k| vp[k][row] * world[k]).sum());
         let ndc = [clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3], 1.0];
         // Unproject NDC -> clip (undo the perspective divide with the same w) -> world.
-        let unclip = [ndc[0] * clip[3], ndc[1] * clip[3], ndc[2] * clip[3], clip[3]];
+        let unclip = [
+            ndc[0] * clip[3],
+            ndc[1] * clip[3],
+            ndc[2] * clip[3],
+            clip[3],
+        ];
         let back: [f32; 4] =
             std::array::from_fn(|row| (0..4).map(|k| inv[k][row] * unclip[k]).sum());
         for i in 0..3 {
@@ -489,7 +500,10 @@ mod tests {
             m[0][1] * n[0] + m[1][1] * n[1] + m[2][1] * n[2],
             m[0][2] * n[0] + m[1][2] * n[1] + m[2][2] * n[2],
         ];
-        assert!((got[0] - 0.5).abs() < 1e-5, "expected 1/scale.x = 0.5, got {got:?}");
+        assert!(
+            (got[0] - 0.5).abs() < 1e-5,
+            "expected 1/scale.x = 0.5, got {got:?}"
+        );
         assert!(got[1].abs() < 1e-5 && got[2].abs() < 1e-5, "got {got:?}");
     }
 
@@ -505,12 +519,18 @@ mod tests {
         let got = cam.to_view_direction(d);
         for p in [[0.0, 0.0, 0.0], [4.0, -2.0, 9.0], [-100.0, 3.0, 0.0]] {
             let want = [
-                cam.to_view_space([p[0] + d[0], p[1] + d[1], p[2] + d[2]])[0] - cam.to_view_space(p)[0],
-                cam.to_view_space([p[0] + d[0], p[1] + d[1], p[2] + d[2]])[1] - cam.to_view_space(p)[1],
-                cam.to_view_space([p[0] + d[0], p[1] + d[1], p[2] + d[2]])[2] - cam.to_view_space(p)[2],
+                cam.to_view_space([p[0] + d[0], p[1] + d[1], p[2] + d[2]])[0]
+                    - cam.to_view_space(p)[0],
+                cam.to_view_space([p[0] + d[0], p[1] + d[1], p[2] + d[2]])[1]
+                    - cam.to_view_space(p)[1],
+                cam.to_view_space([p[0] + d[0], p[1] + d[1], p[2] + d[2]])[2]
+                    - cam.to_view_space(p)[2],
             ];
             for i in 0..3 {
-                assert!((got[i] - want[i]).abs() < 1e-4, "axis {i}: got {got:?} want {want:?} (p={p:?})");
+                assert!(
+                    (got[i] - want[i]).abs() < 1e-4,
+                    "axis {i}: got {got:?} want {want:?} (p={p:?})"
+                );
             }
         }
     }

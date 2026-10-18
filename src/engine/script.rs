@@ -1,30 +1,59 @@
-//! JavaScript evaluation for SceneScript-driven properties, backed by the
-//! [`boa_engine`] interpreter.
+//! SceneScript: Wallpaper Engine's per-object JavaScript, run in a persistent
+//! [`boa_engine`] realm.
 //!
-//! Wallpaper Engine lets any animated property carry a small script with a
-//! `function update(value) { ... return value; }` that runs each frame. We
-//! evaluate it in a real JS engine so full expressions, locals, conditionals,
-//! loops and `Math.*` all work — not just the arithmetic the previous
-//! hand-rolled parser handled. The exposed API mirrors what those scripts
-//! reference:
+//! Each scene object gets one long-lived layer proxy (`thisLayer`), and each
+//! script attached to it is compiled once into an instance whose module-level
+//! state persists for the life of the wallpaper: `init(value)` runs once,
+//! `update(value)` every frame, and the event handlers (`cursorClick`,
+//! `applyUserProperties`, the `media*` callbacks…) when their event fires.
+//! The JS side of the API lives in `scenescript_runtime.js`.
 //!
-//! - `value` — the property's current value (also passed as the `update` arg)
-//! - `engine.runtime` — seconds since the wallpaper started
-//! - `engine.timeOfDay` — fractional hours in `[0, 24)`
-//! - `Math.*` — the standard library (native to boa)
-//! - `WEMath.smoothStep(a, b, x)` — WE's smoothstep helper
+//! A frame is two calls into JS: [`ScriptHost::frame`] runs timers and every
+//! instance's `update`, then [`ScriptHost::collect`] returns one diff of every
+//! layer property, command (sound play/pause, layer creation…) and log line
+//! the scripts produced, for the renderer to apply.
 //!
-//! NOTE: each call spins up a fresh [`Context`]. That is fine for evaluating
-//! independent property scripts, but a per-frame render loop wants a persistent
-//! context (globals, the `update` closure, and the realm reused across frames);
-//! that is the next milestone and will live behind a `ScriptContext` type.
+//! Units: scene.json stores angles in radians, but scripts see degrees, so
+//! angles are converted at this boundary in both directions.
 
 use boa_engine::{Context, Source};
+use serde_json::Value;
+use std::path::PathBuf;
 
-pub struct ScriptEnv {
-    pub runtime: f32,
-    pub time_of_day: f32,
-}
+const RUNTIME_JS: &str = include_str!("scenescript_runtime.js");
+
+/// Handlers a script module may export. The factory wrapper returns each one
+/// that the script defines.
+const EXPORTS: &[&str] = &[
+    "init",
+    "update",
+    "destroy",
+    "applyUserProperties",
+    "resizeScreen",
+    "cursorClick",
+    "cursorDown",
+    "cursorUp",
+    "cursorMove",
+    "cursorEnter",
+    "cursorLeave",
+    "mediaPlaybackChanged",
+    "mediaPropertiesChanged",
+    "mediaThumbnailChanged",
+    "mediaTimelineChanged",
+    "mediaStatusChanged",
+    "animationEvent",
+    "scriptProperties",
+];
+
+/// The cursor events a layer can receive.
+pub const CURSOR_EVENTS: &[&str] = &[
+    "cursorClick",
+    "cursorDown",
+    "cursorUp",
+    "cursorMove",
+    "cursorEnter",
+    "cursorLeave",
+];
 
 /// Format an `f32` as a JS numeric literal, mapping non-finite values to `0`
 /// so a stray `inf`/`NaN` can't inject invalid tokens into the source.
@@ -36,353 +65,457 @@ fn js_num(v: f32) -> String {
     }
 }
 
-/// Format a `&str` as a JS string literal (proper escaping via
-/// `serde_json`'s compatible-with-JS escaping rules — same trick
-/// [`ScriptContext::eval_update_string`] already relies on).
+fn js_vec(v: &[f32]) -> String {
+    v.iter().map(|c| js_num(*c)).collect::<Vec<_>>().join(" ")
+}
+
+/// Format a `&str` as a JS string literal (serde_json's escaping is valid JS).
 fn js_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
-/// One scene object's current name/id/transform, as fed to
-/// [`ScriptContext::set_layers`] for `thisScene.getLayer(...)` to search.
-/// `name`/`id` of `None` never match a script's `getLayer` lookup (mirrors
-/// how a nameless/idless object can't be looked up in real WE either).
-pub struct LayerSnapshot<'a> {
-    pub name: Option<&'a str>,
+/// Initial state of one scene object's layer proxy.
+#[derive(Debug, Clone, Default)]
+pub struct ObjectInit {
+    pub name: Option<String>,
     pub id: Option<i64>,
     pub origin: [f32; 3],
+    /// Radians, as stored in scene.json.
     pub angles: [f32; 3],
     pub scale: [f32; 3],
+    pub size: [f32; 3],
+    pub color: [f32; 3],
+    pub visible: bool,
+    pub alpha: f32,
+    pub brightness: f32,
+    pub text: Option<String>,
+    pub pointsize: f32,
+    pub volume: f32,
+    pub parallax_depth: [f32; 2],
+    /// Index of the parent object, for `getParent()`.
+    pub parent_index: Option<usize>,
+    /// Spritesheet frame count, for `getTextureAnimation().getFrameCount()`.
+    pub frame_count: u32,
+    /// The object's scene.json entry, for `thisScene.getInitialLayerConfig`
+    /// and `createLayer` copies.
+    pub raw: Option<Value>,
 }
 
-/// The WE scripting globals, declared ahead of the user script.
-fn prelude(current_value: f32, env: &ScriptEnv) -> String {
+/// What scripts changed on one object since the last [`ScriptHost::collect`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ObjectChange {
+    pub origin: Option<[f32; 3]>,
+    /// Radians.
+    pub angles: Option<[f32; 3]>,
+    pub scale: Option<[f32; 3]>,
+    pub color: Option<[f32; 3]>,
+    pub visible: Option<bool>,
+    pub alpha: Option<f32>,
+    pub brightness: Option<f32>,
+    pub text: Option<String>,
+    pub pointsize: Option<f32>,
+    pub volume: Option<f32>,
+    pub rate: Option<f32>,
+    pub frame: Option<u32>,
+    pub propagation_disabled: Option<bool>,
+    /// Extra declared properties (shader constants, particle overrides…),
+    /// keyed as declared via [`ScriptHost::attach`].
+    pub extra: serde_json::Map<String, Value>,
+}
+
+/// A side effect a script requested.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScriptCommand {
+    /// `play`/`pause`/`stop` on a sound layer.
+    Sound { index: usize, op: String },
+    /// `play`/`pause`/`stop` on a layer's spritesheet animation.
+    TextureAnimation { index: usize, op: String },
+    /// Control of a property timeline animation (`getAnimation(prop)`).
+    Animation {
+        index: usize,
+        property: String,
+        op: String,
+        frame: Option<f32>,
+    },
+    /// Move a layer to a new draw position.
+    Sort { index: usize, to: usize },
+    /// `thisScene.createLayer(config)` — the new object's index and config.
+    Create { index: usize, config: Value },
+    /// `thisScene.destroyLayer(layer)`.
+    Destroy { index: usize },
+    /// `engine.openUserShortcut(name)`.
+    Shortcut(String),
+}
+
+#[derive(Debug, Default)]
+pub struct ScriptChanges {
+    pub objects: Vec<(usize, ObjectChange)>,
+    pub commands: Vec<ScriptCommand>,
+}
+
+impl ScriptChanges {
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty() && self.commands.is_empty()
+    }
+}
+
+/// Real workshop scripts are ES modules (`import * as WEMath from 'WEMath'`,
+/// `export function update(value)`), but boa runs them here as function
+/// bodies, where `import`/`export` are syntax errors — and the modules they
+/// import are realm globals anyway. Imports become plain bindings; `export`
+/// is peeled off declarations.
+fn module_to_body(script: &str) -> String {
+    let mut out = Vec::new();
+    for line in script.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("import ") {
+            out.push(import_to_bindings(rest));
+        } else if let Some(rest) = t.strip_prefix("export default ") {
+            out.push(rest.to_string());
+        } else if let Some(rest) = t.strip_prefix("export ") {
+            out.push(rest.to_string());
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    // Minified modules pack statements onto one line; peel the inner
+    // `export`s at their statement boundary too. `export` is reserved, so it
+    // only appears as a keyword outside strings and comments.
+    out.join("\n")
+        .replace(";export ", ";")
+        .replace("}export ", "}")
+}
+
+/// `* as X from 'Mod'` → `var X = Mod;`, `{ a, b as c } from 'Mod'` →
+/// `var a = Mod.a, c = Mod.b;`. Anything else is dropped.
+fn import_to_bindings(rest: &str) -> String {
+    let rest = rest.trim().trim_end_matches(';');
+    let Some((what, from)) = rest.rsplit_once(" from ") else {
+        return String::new();
+    };
+    let module = from.trim().trim_matches(|c| c == '\'' || c == '"');
+    if !module
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || module.is_empty()
+    {
+        return String::new();
+    }
+    let what = what.trim();
+    if let Some(alias) = what.strip_prefix("* as ") {
+        let alias = alias.trim();
+        return if alias == module {
+            String::new()
+        } else {
+            format!("var {alias} = {module};")
+        };
+    }
+    if let Some(list) = what.strip_prefix('{').and_then(|w| w.strip_suffix('}')) {
+        let bindings: Vec<String> = list
+            .split(',')
+            .filter_map(|item| {
+                let item = item.trim();
+                if item.is_empty() {
+                    return None;
+                }
+                let (name, alias) = match item.split_once(" as ") {
+                    Some((n, a)) => (n.trim(), a.trim()),
+                    None => (item, item),
+                };
+                Some(format!("{alias} = {module}.{name}"))
+            })
+            .collect();
+        if !bindings.is_empty() {
+            return format!("var {};", bindings.join(", "));
+        }
+    }
+    String::new()
+}
+
+/// The factory `__wp_register_instance` calls: the script body, then an
+/// object of whichever handlers it defined.
+fn factory_source(script: &str) -> String {
+    let exports = EXPORTS
+        .iter()
+        .map(|e| format!("{e}: (typeof {e} !== 'undefined') ? {e} : undefined"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "var value = {v};\n\
-         var engine = {{ runtime: {r}, timeOfDay: {t} }};\n\
-         var WEMath = {{ smoothStep: function(a, b, x) {{ \
-             var t = Math.min(Math.max((x - a) / (b - a), 0), 1); \
-             return t * t * (3 - 2 * t); \
-         }} }};\n",
-        v = js_num(current_value),
-        r = js_num(env.runtime),
-        t = js_num(env.time_of_day),
+        "function (thisLayer) {{\n{body}\n;return {{ {exports} }};\n}}",
+        body = module_to_body(script)
     )
 }
 
-/// Run a SceneScript `update(value)` and return its numeric result, or `None`
-/// if the script has no `update`, throws, or doesn't yield a finite number —
-/// callers then keep the property's current value.
-pub fn eval_update(script: &str, current_value: f32, env: &ScriptEnv) -> Option<f32> {
-    let source = format!(
-        "{prelude}\n{script}\n; (typeof update === 'function') ? update(value) : value;",
-        prelude = prelude(current_value, env),
-    );
-
-    let mut context = Context::default();
-    let result = context.eval(Source::from_bytes(source.as_bytes())).ok()?;
-    let n = result.to_number(&mut context).ok()?;
-    n.is_finite().then_some(n as f32)
+/// Fraction of the local day elapsed, `[0, 1)` — `engine.timeOfDay`.
+pub fn local_time_of_day() -> f32 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let offset = local_utc_offset_secs(now as i64);
+    let secs = (now + offset as f64).rem_euclid(86_400.0);
+    (secs / 86_400.0) as f32
 }
 
-/// WE exposes an object/attachment scripting API on every scene object
-/// (`thisLayer`, and anything `thisScene.getLayer(...)` returns): xref'd from
-/// the binary as 11 functions/properties all registered from one method
-/// table (`lookAt`, `lookAtYaw`, `rotateObjectSpace`, `setParent`,
-/// `parallaxDepth`, `getTransformMatrix`, `getAttachmentOrigin`,
-/// `getAttachmentAngles`, `getAttachmentIndex`, `getAttachmentMatrix`,
-/// `disablepropagation` — see the Ghidra report's object-attachment
-/// follow-up). wp-engine had none of this before; `thisLayer`/`thisScene`
-/// were static stubs.
-///
-/// No real downloaded Workshop content calls any of these (searched the
-/// local corpus), and the vendored C++ reference doesn't implement this API
-/// either (`parallaxDepth` there is only a parsed, non-scripted property) —
-/// so beyond the names and the fact that they're one object's method table,
-/// there's no ground truth for the exact semantics. This is an honest
-/// best-effort implementation grounded in wp-engine's *own* transform
-/// conventions (the same additive-Euler rotation composition
-/// `render::Xform::compose` already uses for the static scene.json `parent`
-/// field, and `camera3d::model_matrix`'s own Rz·Ry·Rx convention for
-/// `getTransformMatrix`), not a verified match to the original binary.
-///
-/// No skeleton/bone/attachment-point data exists anywhere in this engine (or
-/// in the C++ reference), so the `getAttachment*` family can't resolve a
-/// real socket: `getAttachmentIndex` always reports "not found" (-1), and
-/// `getAttachmentOrigin`/`Angles`/`Matrix` always resolve to the queried
-/// object's own root transform regardless of `index`. `setParent` only
-/// takes effect on `thisLayer` itself (the object whose own script is
-/// running) — this engine has no live scene-graph re-parenting, so mutating
-/// an object obtained via `getLayer` doesn't feed back into rendering.
-const OBJECT_ATTACHMENT_API_JS: &str = r#"
-function wpRotateEuler(v, angles) {
-    var sx = Math.sin(angles.x), cx = Math.cos(angles.x);
-    var sy = Math.sin(angles.y), cy = Math.cos(angles.y);
-    var sz = Math.sin(angles.z), cz = Math.cos(angles.z);
-    var x1 = v.x, y1 = cx * v.y - sx * v.z, z1 = sx * v.y + cx * v.z;
-    var x2 = cy * x1 + sy * z1, y2 = y1, z2 = -sy * x1 + cy * z1;
-    var x3 = cz * x2 - sz * y2, y3 = sz * x2 + cz * y2, z3 = z2;
-    return new Vec3(x3, y3, z3);
-}
-
-function wpBuildMatrix(origin, angles, scale) {
-    var sx = Math.sin(angles.x), cx = Math.cos(angles.x);
-    var sy = Math.sin(angles.y), cy = Math.cos(angles.y);
-    var sz = Math.sin(angles.z), cz = Math.cos(angles.z);
-    var r00 = cz*cy,               r10 = sz*cy,               r20 = -sy;
-    var r01 = cz*sy*sx - sz*cx,    r11 = sz*sy*sx + cz*cx,    r21 = cy*sx;
-    var r02 = cz*sy*cx + sz*sx,    r12 = sz*sy*cx - cz*sx,    r22 = cy*cx;
-    return [
-        r00*scale.x, r10*scale.x, r20*scale.x, 0,
-        r01*scale.y, r11*scale.y, r21*scale.y, 0,
-        r02*scale.z, r12*scale.z, r22*scale.z, 0,
-        origin.x, origin.y, origin.z, 1
-    ];
-}
-
-function wpMakeSceneObject(name, id, origin, angles, scale, parallaxDepth) {
-    var obj = {
-        name: name || '',
-        id: (id === null || id === undefined) ? -1 : id,
-        origin: origin, angles: angles, scale: scale,
-        parallaxDepth: parallaxDepth || new Vec3(0, 0, 0),
-        visible: true, pointsize: 32, font: '', text: '', __frame: -1,
-        __propagationDisabled: false,
-        getTextureAnimation: function() {
-            return {
-                setFrame: function(f) { obj.__frame = f; },
-                setFrameByName: function() {},
-                getFrameCount: function() { return 1; }
-            };
-        },
-        getTransformMatrix: function() {
-            return wpBuildMatrix(obj.origin, obj.angles, obj.scale);
-        },
-        // Faces `target` (world position) by solving yaw (angles.y) and
-        // pitch (angles.x) directly from wpBuildMatrix's own Rz*Ry*Rx
-        // convention. Roll (angles.z) is left untouched — a full
-        // look-at-with-roll decomposition needs a target "up" vector this
-        // API doesn't supply.
-        lookAt: function(target) {
-            var d = target.subtract(obj.origin);
-            var len = Math.sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
-            if (len > 1e-6) {
-                obj.angles.y = Math.atan2(d.x, d.z);
-                obj.angles.x = Math.asin(Math.max(-1, Math.min(1, -d.y / len)));
-            }
-            return obj.angles;
-        },
-        lookAtYaw: function(target) {
-            var d = target.subtract(obj.origin);
-            if (Math.abs(d.x) > 1e-6 || Math.abs(d.z) > 1e-6) {
-                obj.angles.y = Math.atan2(d.x, d.z);
-            }
-            return obj.angles;
-        },
-        // Additive, matching `Xform::compose`'s own simplified Euler-sum
-        // rotation model — this engine never composes rotations as true
-        // matrices (see render.rs), so staying additive here keeps this
-        // consistent with every other rotation composition in the codebase.
-        rotateObjectSpace: function(x, y, z) {
-            obj.angles.x += x; obj.angles.y += y; obj.angles.z += z;
-            return obj.angles;
-        },
-        // Treats this object's own origin/angles/scale as a local offset and
-        // composes them onto `parent`'s current transform, via the exact
-        // rule `Xform::compose`/`apply_point` already use for this engine's
-        // static scene.json `parent` field.
-        setParent: function(parent) {
-            if (!parent) { return obj; }
-            var scaledLocal = new Vec3(obj.origin.x * parent.scale.x, obj.origin.y * parent.scale.y, obj.origin.z * parent.scale.z);
-            var rotated = wpRotateEuler(scaledLocal, parent.angles);
-            obj.origin = rotated.add(parent.origin);
-            obj.angles = new Vec3(obj.angles.x + parent.angles.x, obj.angles.y + parent.angles.y, obj.angles.z + parent.angles.z);
-            obj.scale = new Vec3(obj.scale.x * parent.scale.x, obj.scale.y * parent.scale.y, obj.scale.z * parent.scale.z);
-            return obj;
-        },
-        getAttachmentOrigin: function(index) { return obj.origin.copy(); },
-        getAttachmentAngles: function(index) { return obj.angles.copy(); },
-        getAttachmentMatrix: function(index) { return obj.getTransformMatrix(); },
-        getAttachmentIndex: function(attachmentName) { return -1; },
-        disablepropagation: function() { obj.__propagationDisabled = true; }
-    };
-    return obj;
-}
-
-var __wp_layers = [];
-var thisLayer = wpMakeSceneObject('', -1, new Vec3(0,0,0), new Vec3(0,0,0), new Vec3(1,1,1), new Vec3(0,0,0));
-var thisScene = {
-    createLayer: function() { return { visible: false, origin: new Vec3(0,0,0), angles: new Vec3(0,0,0), scale: new Vec3(1,1,1), text: '' }; },
-    sortLayer: function() {},
-    getLayerIndex: function() { return 0; },
-    // Searches the snapshot `set_layers` refreshes once per frame. `null`
-    // when not found, matching WE's own documented behavior.
-    getLayer: function(nameOrId) {
-        for (var i = 0; i < __wp_layers.length; i++) {
-            if (__wp_layers[i].name === nameOrId || __wp_layers[i].id === nameOrId) {
-                return __wp_layers[i];
-            }
-        }
-        return null;
+#[cfg(unix)]
+fn local_utc_offset_secs(t: i64) -> i64 {
+    let time = t as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: localtime_r writes only into `tm`, which outlives the call.
+    let ok = unsafe { !libc::localtime_r(&time, &mut tm).is_null() };
+    if ok {
+        tm.tm_gmtoff
+    } else {
+        0
     }
-};
-"#;
-
-/// A persistent JS runtime for the render loop: the realm, intrinsics, and the
-/// WE globals (`engine`, `WEMath`, `value`, `update`) are created once and
-/// reused across frames, so a per-frame tick only mutates `engine.*` and runs
-/// each property's `update`. This avoids rebuilding the entire JS realm on
-/// every property, every frame (what the free [`eval_update`] does).
-pub struct ScriptContext {
-    context: Context,
 }
 
-impl Default for ScriptContext {
+#[cfg(not(unix))]
+fn local_utc_offset_secs(_t: i64) -> i64 {
+    0
+}
+
+/// The persistent SceneScript runtime for one loaded scene.
+pub struct ScriptHost {
+    context: Context,
+    storage_path: Option<PathBuf>,
+    instances: usize,
+}
+
+impl Default for ScriptHost {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Real workshop scripts are authored as ES modules: `import * as WEMath
-/// from 'WEMath'`, `export function update(value)`, `export let
-/// __workshopId`, `export var scriptProperties = createScriptProperties()…`.
-/// boa evaluates our snippets in script (non-module) mode where `import`/
-/// `export` are syntax errors — and the WE globals they import already exist
-/// in our realm anyway. Strip module syntax line-by-line: drop `import`
-/// lines, peel `export ` off declarations.
-fn strip_module_syntax(script: &str) -> String {
-    let out = script
-        .lines()
-        .map(|line| {
-            let t = line.trim_start();
-            if t.starts_with("import ") {
-                ""
-            } else if let Some(rest) = t.strip_prefix("export ") {
-                rest
-            } else {
-                line
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    // Minified/concatenated modules pack several statements per line, e.g.
-    // `"use strict";export var x=…;…;export function update(){}` — the
-    // line-start peel above misses those inner `export`s. Strip them at their
-    // statement boundary (after `;` or `}`) too. `export` is a reserved word,
-    // so it can only appear as a statement keyword outside strings/comments,
-    // which these date/clock scripts don't contain.
-    out.replace(";export ", ";").replace("}export ", "}")
-}
-
-/// Wrap a user script in an IIFE so it can be re-evaluated every frame in
-/// the persistent realm: top-level `let`/`const` become function-scoped
-/// (re-declaring a global `let` would throw on the second frame), `update`
-/// and `scriptProperties` stay local to the closure, and WE's startup call
-/// to `applyUserProperties(props)` (which initializes script config like
-/// delimiters from the property defaults) runs before `update`. Trade-off:
-/// module-level state does not persist across frames — fine for the
-/// clock/date scripts that dominate real content.
-fn iife_body(script: &str, authored_props: Option<&serde_json::Value>) -> String {
-    // The scene JSON's `scriptproperties` object holds the values the author
-    // chose in the editor (e.g. this clock instance shows hours only) —
-    // merged over the script's own builder defaults before `init()` runs.
-    let merge_props = authored_props
-        .filter(|v| v.is_object())
-        .map(|v| {
-            format!(
-                ";if (typeof scriptProperties !== 'undefined') {{ var __wp_p = {v}; for (var __wp_k in __wp_p) {{ scriptProperties[__wp_k] = __wp_p[__wp_k]; }} }}"
-            )
-        })
-        .unwrap_or_default();
-    format!(
-        "(function() {{\n{script}\n{merge_props}\n;if (typeof init === 'function') {{ try {{ init(); }} catch (e) {{}} }}\nif (typeof applyUserProperties === 'function' && typeof scriptProperties !== 'undefined') {{ try {{ applyUserProperties(scriptProperties); }} catch (e) {{}} }}\nreturn (typeof update === 'function') ? update(value) : value;\n}})();",
-        script = strip_module_syntax(script),
-    )
-}
-
-impl ScriptContext {
+impl ScriptHost {
     pub fn new() -> Self {
         let mut context = Context::default();
-        // Declare the globals once. `value`/`update` are reset per evaluation;
-        // `engine`/`WEMath` persist and are mutated by `set_time`.
-        //
-        // `createScriptProperties()` mirrors WE's chainable builder: every
-        // `add*` records the property's default under its name on the same
-        // object the script keeps (`scriptProperties.showHours` etc.), since
-        // we have no editor UI feeding user-chosen values yet.
-        let _ = context.eval(Source::from_bytes(
-            "var value;\n\
-             var update;\n\
-             var engine = { runtime: 0, timeOfDay: 0, frametime: 0, registerTimeEvent: function(){}, userProperties: {} };\n\
-             var shared = {};\n\
-             var console = { log: function(){}, warn: function(){}, error: function(){} };\n\
-             function createScriptProperties() {\n\
-                 var api = {};\n\
-                 function add(def) { if (def && def.name !== undefined) { api[def.name] = def.value; } return api; }\n\
-                 ['addCheckbox','addSlider','addText','addTextInput','addCombo','addColorPicker','addFile','addDirectory','addBool'].forEach(function(m) { api[m] = add; });\n\
-                 api.finish = function() { return api; };\n\
-                 return api;\n\
-             }\n\
-             var WEMath = { \
-                 smoothStep: function(a, b, x) { \
-                     var t = Math.min(Math.max((x - a) / (b - a), 0), 1); \
-                     return t * t * (3 - 2 * t); \
-                 }, \
-                 mix: function(a, b, t) { return a + (b - a) * t; }, \
-                 clamp: function(x, a, b) { return Math.min(Math.max(x, a), b); }, \
-                 frac: function(x) { return x - Math.floor(x); } \
-             };\n\
-             function Vec3(x, y, z) { this.x = x || 0; this.y = y || 0; this.z = z || 0; }\n\
-             Vec3.prototype.copy = function() { return new Vec3(this.x, this.y, this.z); };\n\
-             Vec3.prototype.add = function(o) { return new Vec3(this.x + o.x, this.y + o.y, this.z + o.z); };\n\
-             Vec3.prototype.subtract = function(o) { return new Vec3(this.x - o.x, this.y - o.y, this.z - o.z); };\n\
-             Vec3.prototype.multiply = function(o) { var s = (typeof o === 'number'); return new Vec3(this.x * (s ? o : o.x), this.y * (s ? o : o.y), this.z * (s ? o : o.z)); };\n\
-             Vec3.prototype.divide = function(o) { var s = (typeof o === 'number'); return new Vec3(this.x / (s ? o : o.x), this.y / (s ? o : o.y), this.z / (s ? o : o.z)); };\n\
-             var input = { cursorWorldPosition: new Vec3(0,0,0), cursorPosition: new Vec3(0,0,0) };\n\
-             var media = { available: false, playbackState: 0, title: '', artist: '', album: '', position: 0, duration: 0, artUrl: null };",
-        ));
-        // The object-attachment scripting API (`lookAt`, `setParent`,
-        // `getAttachmentX`, `getTransformMatrix`, `disablepropagation` —
-        // see `OBJECT_ATTACHMENT_API_JS`'s own doc comment) is sizeable
-        // enough to keep as its own eval rather than folding into the
-        // block above.
-        let _ = context.eval(Source::from_bytes(OBJECT_ATTACHMENT_API_JS.as_bytes()));
-        Self { context }
+        if let Err(e) = context.eval(Source::from_bytes(RUNTIME_JS.as_bytes())) {
+            tracing::error!(target: "script", "SceneScript runtime failed to load: {e}");
+        }
+        Self {
+            context,
+            storage_path: None,
+            instances: 0,
+        }
     }
 
-    /// Update the clock globals for the current frame. Call once per frame
-    /// before evaluating this frame's property scripts. `frametime` is the
-    /// delta since the previous frame in seconds (real transform scripts read
-    /// `engine.frametime` to make motion frame-rate independent).
-    pub fn set_time(&mut self, runtime: f32, time_of_day: f32, frametime: f32) {
+    /// Persist `localStorage` to `path` (a JSON object), loading what's there.
+    pub fn with_storage(mut self, path: PathBuf) -> Self {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if serde_json::from_str::<serde_json::Map<String, Value>>(&text).is_ok() {
+                self.run(&format!("__wp.storage = {text};"));
+            }
+        }
+        self.storage_path = Some(path);
+        self
+    }
+
+    /// The `localStorage` file for the wallpaper at `dir`.
+    pub fn storage_path_for(dir: &std::path::Path) -> Option<PathBuf> {
+        let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let name = key.file_name()?.to_string_lossy().to_string();
+        Some(
+            dirs::data_dir()?
+                .join("wp-engine")
+                .join("storage")
+                .join(format!("{name}.json")),
+        )
+    }
+
+    fn run(&mut self, src: &str) -> Option<boa_engine::JsValue> {
+        match self.context.eval(Source::from_bytes(src.as_bytes())) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::debug!(target: "script", "eval failed: {e}");
+                None
+            }
+        }
+    }
+
+    fn run_string(&mut self, src: &str) -> Option<String> {
+        let v = self.run(src)?;
+        v.as_string().map(|s| s.to_std_string_escaped())
+    }
+
+    /// Whether any script was attached — callers can skip per-frame script
+    /// work entirely when not.
+    pub fn has_scripts(&self) -> bool {
+        self.instances > 0
+    }
+
+    /// Create the persistent layer proxy for scene object `index`.
+    pub fn register_object(&mut self, index: usize, init: &ObjectInit) {
+        let deg = 180.0 / std::f32::consts::PI;
+        let angles = init.angles.map(|a| a * deg);
+        let config = serde_json::json!({
+            "raw": init.raw.clone().unwrap_or(Value::Null),
+            "parentIndex": init.parent_index.map(|p| p as i64).unwrap_or(-1),
+            "frameCount": init.frame_count.max(1),
+        });
         let src = format!(
-            "engine.runtime = {}; engine.timeOfDay = {}; engine.frametime = {};",
-            js_num(runtime),
-            js_num(time_of_day),
-            js_num(frametime),
+            "__wp_register_object({index}, {{ name: {name}, id: {id}, origin: {origin}, angles: {angles}, \
+             scale: {scale}, size: {size}, color: {color}, visible: {visible}, alpha: {alpha}, \
+             brightness: {brightness}, text: {text}, pointsize: {pointsize}, volume: {volume}, \
+             parallaxDepth: {parallax}, config: {config} }});",
+            name = js_str(init.name.as_deref().unwrap_or("")),
+            id = init.id.map(|v| v.to_string()).unwrap_or_else(|| "-1".into()),
+            origin = js_str(&js_vec(&init.origin)),
+            angles = js_str(&js_vec(&angles)),
+            scale = js_str(&js_vec(&init.scale)),
+            size = js_str(&js_vec(&init.size)),
+            color = js_str(&js_vec(&init.color)),
+            visible = init.visible,
+            alpha = js_num(init.alpha),
+            brightness = js_num(init.brightness),
+            text = js_str(init.text.as_deref().unwrap_or("")),
+            pointsize = js_num(init.pointsize),
+            volume = js_num(init.volume),
+            parallax = js_str(&js_vec(&init.parallax_depth)),
+            config = config,
         );
-        let _ = self.context.eval(Source::from_bytes(src.as_bytes()));
+        self.run(&src);
     }
 
-    /// Refresh the `media` global (currently-playing track info — see
-    /// `engine::media`) for this frame.
-    ///
-    /// The real engine pushes media changes as events, calling
-    /// `mediaPropertiesChanged`/`mediaPlaybackChanged`/`mediaTimelineChanged`/
-    /// `mediaThumbnailChanged` as *named exports* on every loaded script
-    /// module (confirmed from the vendored C++ reference's
-    /// `ScriptEngine::notifyMediaUpdate`) — this codebase's SceneScript
-    /// engine has no equivalent "loaded modules with named exports" concept
-    /// to broadcast to (see `ScriptContext`'s own module doc: it evaluates
-    /// one property's `update(value)` at a time). Exposing `media` as a
-    /// plain read-model global instead — queryable from any property
-    /// script's own body — is an honest adaptation to how this engine's
-    /// scripts actually run, not an attempt at the reference's exact
-    /// push-callback dispatch shape. Album-art color fields
-    /// (`primaryColor` etc.) aren't included here at all: the reference's
-    /// own values for those are hardcoded defaults too (its own `// TODO:
-    /// PROCESS THESE COLORS INSTEAD OF HARDCODING THEM`), so there's
-    /// nothing real to expose yet.
+    /// Declare an extra scriptable property on an object (a shader constant,
+    /// a particle override…) so scripts can read and write it by `key`.
+    /// `kind` is `"number"`, `"bool"`, `"string"`, `"vec2"`, `"vec3"` or
+    /// `"vec4"`; `value` is its initial value.
+    pub fn declare_property(&mut self, index: usize, key: &str, kind: &str, value: &Value) {
+        let src = format!(
+            "(function(){{ var l = __wp.objects[{index}]; if (l) {{ l.__declare({key}, {kind}, {value}); }} }})();",
+            key = js_str(key),
+            kind = js_str(kind),
+        );
+        self.run(&src);
+    }
+
+    /// Compile `script` as an instance attached to object `index`. With
+    /// `property`, its `update(value)` drives that property each frame;
+    /// without, it only receives events. `authored_props` is the scene's
+    /// `scriptproperties` object, merged over the script's own defaults.
+    /// Returns false when the script failed to compile.
+    pub fn attach(
+        &mut self,
+        index: usize,
+        property: Option<&str>,
+        script: &str,
+        authored_props: Option<&Value>,
+    ) -> bool {
+        let src = format!(
+            "__wp_register_instance({index}, {prop}, null, {authored}, {factory});",
+            prop = property.map(js_str).unwrap_or_else(|| "null".into()),
+            authored = authored_props
+                .filter(|v| v.is_object())
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".into()),
+            factory = factory_source(script),
+        );
+        match self.context.eval(Source::from_bytes(src.as_bytes())) {
+            Ok(v) if v.as_number().is_some_and(|n| n >= 0.0) => {
+                self.instances += 1;
+                true
+            }
+            Ok(_) => false,
+            Err(e) => {
+                tracing::warn!(
+                    target: "script",
+                    "script on object {index} ({}) failed to compile: {e}",
+                    property.unwrap_or("events")
+                );
+                false
+            }
+        }
+    }
+
+    /// Scene-wide values scripts read: `engine.canvasSize` (scene size),
+    /// `engine.screenResolution`, and the wallpaper's user property values.
+    pub fn set_scene_info(&mut self, canvas: [f32; 2], screen: [u32; 2], user_props: &Value) {
+        let src = format!(
+            "engine.canvasSize = new Vec2({}, {}); engine.screenResolution = new Vec2({}, {}); engine.userProperties = {};",
+            js_num(canvas[0]),
+            js_num(canvas[1]),
+            screen[0],
+            screen[1],
+            if user_props.is_object() { user_props.to_string() } else { "{}".into() },
+        );
+        self.run(&src);
+    }
+
+    /// Expose scene.json's `general` settings (`bloom`, `camerashake`,
+    /// `clearcolor`…) on `thisScene`, unwrapping `{"value": …}` entries.
+    /// Read-only: changing them from a script has no effect yet.
+    pub fn set_scene_general(&mut self, general: &Value) {
+        let Some(m) = general.as_object() else {
+            return;
+        };
+        let mut flat = serde_json::Map::new();
+        for (k, v) in m {
+            let v = match v {
+                Value::Object(o) => o.get("value").cloned().unwrap_or(Value::Null),
+                other => other.clone(),
+            };
+            if !v.is_null() && !k.starts_with("__") {
+                flat.insert(k.clone(), v);
+            }
+        }
+        self.run(&format!(
+            "(function(g) {{ for (var k in g) {{ if (typeof thisScene[k] !== 'function') {{ thisScene[k] = __wp_raw_value(g[k]); }} }} }})({});",
+            Value::Object(flat)
+        ));
+    }
+
+    /// Live user-property change: updates `engine.userProperties` and calls
+    /// every instance's `applyUserProperties(changed)`.
+    pub fn apply_user_properties(&mut self, changed: &Value) {
+        if changed.is_object() {
+            self.run(&format!("__wp_set_user_properties({changed});"));
+        }
+    }
+
+    /// Cursor state for `input.*`: scene-space position, screen pixels, and
+    /// whether the left button is held.
+    pub fn set_cursor(&mut self, world: [f32; 2], screen: [f32; 2], left_down: bool) {
+        let src = format!(
+            "input.cursorWorldPosition = new Vec3({}, {}, 0); input.cursorScreenPosition = new Vec2({}, {}); input.cursorLeftDown = {left_down};",
+            js_num(world[0]),
+            js_num(world[1]),
+            js_num(screen[0]),
+            js_num(screen[1]),
+        );
+        self.run(&src);
+    }
+
+    /// Whether a script called `engine.registerAudioBuffers`.
+    pub fn wants_audio(&mut self) -> bool {
+        self.run("__wp.audioWanted")
+            .map(|v| v.to_boolean())
+            .unwrap_or(false)
+    }
+
+    /// Feed this frame's spectrum to registered audio buffers.
+    pub fn set_audio(&mut self, bands: [&[f32]; 6]) {
+        let arr = |b: &[f32]| {
+            format!(
+                "[{}]",
+                b.iter().map(|v| js_num(*v)).collect::<Vec<_>>().join(",")
+            )
+        };
+        let src = format!(
+            "__wp_set_audio({}, {}, {}, {}, {}, {});",
+            arr(bands[0]),
+            arr(bands[1]),
+            arr(bands[2]),
+            arr(bands[3]),
+            arr(bands[4]),
+            arr(bands[5]),
+        );
+        self.run(&src);
+    }
+
+    /// Update the `media` global and fire the `media*Changed` handlers.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_media(
         &mut self,
         available: bool,
@@ -399,608 +532,649 @@ impl ScriptContext {
             "media.available = {available}; media.playbackState = {playback_state}; \
              media.title = {title}; media.artist = {artist}; media.album = {album}; \
              media.position = {position_us}; media.duration = {duration_us}; \
-             media.artUrl = {art_url_js};",
+             media.artUrl = {art_url_js}; \
+             __wp_dispatch(-1, 'mediaPropertiesChanged', {{ title: media.title, artist: media.artist, albumTitle: media.album }}); \
+             __wp_dispatch(-1, 'mediaPlaybackChanged', {{ state: media.playbackState }}); \
+             __wp_dispatch(-1, 'mediaTimelineChanged', {{ position: media.position / 1e6, duration: media.duration / 1e6 }}); \
+             __wp_dispatch(-1, 'mediaStatusChanged', {{ enabled: media.available }});",
             title = js_str(title),
             artist = js_str(artist),
             album = js_str(album),
         );
-        let _ = self.context.eval(Source::from_bytes(src.as_bytes()));
+        self.run(&src);
     }
 
-    /// Refresh `thisLayer` to the scene object about to have its own
-    /// SceneScripts evaluated — the object-attachment API (`lookAt`,
-    /// `setParent`, `getTransformMatrix`, etc., see
-    /// [`OBJECT_ATTACHMENT_API_JS`]) reads and mutates whatever `thisLayer`
-    /// currently holds, so callers must call this before evaluating that
-    /// object's `origin`/`angles`/`scale`/`visible`/etc. scripts. Replaces
-    /// `thisLayer` wholesale (a fresh `wpMakeSceneObject` call) rather than
-    /// mutating fields in place, so a previous object's `disablepropagation`
-    /// flag or attachment state can't leak into the next.
-    pub fn set_current_object(
-        &mut self,
-        name: Option<&str>,
-        id: Option<i64>,
-        origin: [f32; 3],
-        angles: [f32; 3],
-        scale: [f32; 3],
-        parallax_depth: [f32; 2],
-    ) {
+    /// Fire `event` (e.g. `"cursorClick"`) on the scripts of object `index`.
+    /// `world` is the cursor's scene-space position.
+    pub fn dispatch_cursor(&mut self, index: usize, event: &str, world: [f32; 2]) {
         let src = format!(
-            "thisLayer = wpMakeSceneObject({name}, {id}, new Vec3({ox},{oy},{oz}), new Vec3({ax},{ay},{az}), new Vec3({sx},{sy},{sz}), new Vec3({px},{py},0));",
-            name = js_str(name.unwrap_or("")),
-            id = id.map(|v| v.to_string()).unwrap_or_else(|| "-1".to_string()),
-            ox = js_num(origin[0]), oy = js_num(origin[1]), oz = js_num(origin[2]),
-            ax = js_num(angles[0]), ay = js_num(angles[1]), az = js_num(angles[2]),
-            sx = js_num(scale[0]), sy = js_num(scale[1]), sz = js_num(scale[2]),
-            px = js_num(parallax_depth[0]), py = js_num(parallax_depth[1]),
+            "__wp_dispatch({index}, {event}, {{ worldPosition: new Vec3({x}, {y}, 0) }});",
+            event = js_str(event),
+            x = js_num(world[0]),
+            y = js_num(world[1]),
         );
-        let _ = self.context.eval(Source::from_bytes(src.as_bytes()));
+        self.run(&src);
     }
 
-    /// Refresh `thisScene`'s object registry — `getLayer(nameOrId)` searches
-    /// this. Call once per frame (not once per object) with every scene
-    /// object's current name/id/origin/angles/scale.
-    pub fn set_layers(&mut self, layers: &[LayerSnapshot]) {
-        let mut src = String::from("__wp_layers = [");
-        for l in layers {
-            src.push_str(&format!(
-                "wpMakeSceneObject({name}, {id}, new Vec3({ox},{oy},{oz}), new Vec3({ax},{ay},{az}), new Vec3({sx},{sy},{sz}), new Vec3(0,0,0)),",
-                name = js_str(l.name.unwrap_or("")),
-                id = l.id.map(|v| v.to_string()).unwrap_or_else(|| "-1".to_string()),
-                ox = js_num(l.origin[0]), oy = js_num(l.origin[1]), oz = js_num(l.origin[2]),
-                ax = js_num(l.angles[0]), ay = js_num(l.angles[1]), az = js_num(l.angles[2]),
-                sx = js_num(l.scale[0]), sy = js_num(l.scale[1]), sz = js_num(l.scale[2]),
-            ));
-        }
-        src.push_str("];");
-        let _ = self.context.eval(Source::from_bytes(src.as_bytes()));
-    }
-
-    /// Whether the object last set via [`Self::set_current_object`] called
-    /// `disablepropagation()` on itself. Call right after evaluating that
-    /// object's scripts, before the next `set_current_object` overwrites
-    /// `thisLayer`.
-    pub fn take_propagation_disabled(&mut self) -> bool {
-        self.context
-            .eval(Source::from_bytes(b"thisLayer.__propagationDisabled"))
-            .ok()
-            .map(|v| v.to_boolean())
-            .unwrap_or(false)
-    }
-
-    /// Evaluate a Vec3-valued property's `update(value)` (WE `origin`/`scale`/
-    /// `angles`): `value` is passed as a `Vec3(x, y, z)` and the returned Vec3
-    /// is read back. `None` when the script throws or yields a non-finite/
-    /// non-Vec3 result, so callers keep the property's base value.
-    ///
-    /// The result is marshalled through a `"x y z"` string rather than boa's
-    /// object-field API — same plumbing as [`Self::eval_update_string`], and
-    /// it sidesteps the accessor churn across boa versions.
-    pub fn eval_update_vec3(&mut self, script: &str, base: [f32; 3]) -> Option<[f32; 3]> {
-        let _ = self
-            .context
-            .eval(Source::from_bytes(b"update = undefined;"));
-        let src = format!(
-            "value = new Vec3({x}, {y}, {z});\nvar __out = {body};\n\
-             (__out && typeof __out === 'object') ? (__out.x + ' ' + __out.y + ' ' + __out.z) : ''",
-            x = js_num(base[0]),
-            y = js_num(base[1]),
-            z = js_num(base[2]),
-            body = iife_body(script, None),
-        );
-        let result = self.context.eval(Source::from_bytes(src.as_bytes())).ok()?;
-        let s = result
-            .to_string(&mut self.context)
-            .ok()?
-            .to_std_string_escaped();
-        let parts: Vec<f32> = s
-            .split_whitespace()
-            .filter_map(|p| p.parse().ok())
-            .collect();
-        (parts.len() == 3 && parts.iter().all(|v| v.is_finite()))
-            .then(|| [parts[0], parts[1], parts[2]])
-    }
-
-    /// Evaluate a boolean-valued property's `update(value)` (WE `visible`):
-    /// `value` is passed as `0`/`1` and the truthy result maps back to a bool.
-    /// `None` when the script throws, so callers keep the base visibility.
-    pub fn eval_update_bool(&mut self, script: &str, base: bool) -> Option<bool> {
-        self.eval_update(script, if base { 1.0 } else { 0.0 })
-            .map(|n| n >= 0.5)
-    }
-
-    /// Evaluate one property's `update(value)` against the persistent context,
-    /// returning its finite numeric result or `None` (no `update`, threw, or
-    /// non-finite) so the caller keeps the property's current value.
-    ///
-    /// `update` is reset before the user script runs so a previous property's
-    /// leftover `update` can't leak into a script that doesn't define its own.
-    pub fn eval_update(&mut self, script: &str, current_value: f32) -> Option<f32> {
-        // Reset in its own program: a function-declaration hoist in the user
-        // script must win, which it can't if the reset shared the same program.
-        let _ = self
-            .context
-            .eval(Source::from_bytes(b"update = undefined;"));
-        let src = format!(
-            "value = {v};\n{body}",
-            v = js_num(current_value),
-            body = iife_body(script, None),
-        );
-        let result = self.context.eval(Source::from_bytes(src.as_bytes())).ok()?;
-        let n = result.to_number(&mut self.context).ok()?;
-        n.is_finite().then_some(n as f32)
-    }
-
-    /// Evaluate a text object's `update(value)`, returning its string result —
-    /// the dominant script kind in real content (clocks, dates, countdowns:
-    /// 42 of the 58 script-using wallpapers in the local corpus). `None` when
-    /// the script throws or has no usable `update`, so callers keep the
-    /// previous text.
-    pub fn eval_update_string(
-        &mut self,
-        script: &str,
-        current_value: &str,
-        authored_props: Option<&serde_json::Value>,
-    ) -> Option<String> {
-        let _ = self
-            .context
-            .eval(Source::from_bytes(b"update = undefined;"));
-        // serde_json string-escapes into a valid JS string literal.
-        let quoted = serde_json::to_string(current_value).ok()?;
-        let src = format!(
-            "value = {quoted};\n{body}",
-            body = iife_body(script, authored_props)
-        );
-        let result = self.context.eval(Source::from_bytes(src.as_bytes())).ok()?;
-        // A script that returns `undefined`/`null` (e.g. reads an unstubbed
-        // scene API) stringifies to the literal "undefined"/"null" — keep the
-        // caller's current text instead of rendering that.
-        if result.is_undefined() || result.is_null() {
-            return None;
-        }
-        let js_str = result.to_string(&mut self.context).ok()?;
-        Some(js_str.to_std_string_escaped())
-    }
-
-    /// Evaluate a script for its `thisLayer.getTextureAnimation().setFrame(n)`
-    /// side effect (spritesheet frame selection — e.g. an AM/PM clock cell picked
-    /// by `getHours()`). Returns the selected frame index, or `None` if the
-    /// script set none. `set_time` should be called first so `Date`/`timeOfDay`
-    /// reflect the intended clock.
-    pub fn eval_frame(&mut self, script: &str) -> Option<u32> {
-        let _ = self.context.eval(Source::from_bytes(
-            b"update = undefined; thisLayer.__frame = -1;",
+    /// Fire `handler(event)` on the scripts of object `index`.
+    pub fn dispatch_event(&mut self, index: usize, handler: &str, event: &Value) {
+        self.run(&format!(
+            "__wp_dispatch({index}, {}, {event});",
+            js_str(handler)
         ));
-        // Frame scripts hang the setFrame off `update`; run with a truthy `value`
-        // (these are usually `visible` scripts that just return the value back).
-        let src = format!("value = true;\n{body}", body = iife_body(script, None));
-        let _ = self.context.eval(Source::from_bytes(src.as_bytes()));
-        let frame = self
-            .context
-            .eval(Source::from_bytes(b"thisLayer.__frame"))
-            .ok()?
-            .to_number(&mut self.context)
-            .ok()?;
-        (frame.is_finite() && frame >= 0.0).then_some(frame as u32)
+    }
+
+    /// Set a layer property from outside the scripts (a keyframe animation)
+    /// so scripts read the current value; not reported back by `collect`.
+    /// Angles are radians here, like everywhere on the Rust side.
+    pub fn sync_property(&mut self, index: usize, key: &str, value: &Value) {
+        let value = if key == "angles" {
+            match value.as_array() {
+                Some(a) => Value::Array(
+                    a.iter()
+                        .map(|v| serde_json::json!(v.as_f64().unwrap_or(0.0).to_degrees()))
+                        .collect(),
+                ),
+                None => value.clone(),
+            }
+        } else {
+            value.clone()
+        };
+        self.run(&format!(
+            "(function(l, k, v) {{ if (l) {{ if (Array.isArray(v)) {{ v = v.join(' '); }} l.__s[k] = __wp_coerce(k, l.__kinds[k], v); }} }})(__wp.objects[{index}], {}, {value});",
+            js_str(key)
+        ));
+    }
+
+    /// Objects with at least one handler among `events`.
+    pub fn objects_with_handlers(&mut self, events: &[&str]) -> Vec<usize> {
+        let list = serde_json::to_string(events).unwrap_or_else(|_| "[]".into());
+        self.run_string(&format!("JSON.stringify(__wp_handler_objects({list}))"))
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Run timers and every instance's `init`/`update` for this frame.
+    /// `time_of_day` is `[0, 1)` — see [`local_time_of_day`].
+    pub fn frame(&mut self, runtime: f32, time_of_day: f32, frametime: f32) {
+        self.run(&format!(
+            "__wp_frame({}, {}, {});",
+            js_num(runtime),
+            js_num(time_of_day),
+            js_num(frametime)
+        ));
+    }
+
+    /// Everything scripts changed since the last call.
+    pub fn collect(&mut self) -> ScriptChanges {
+        let Some(json) = self.run_string("__wp_collect()") else {
+            return ScriptChanges::default();
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&json) else {
+            return ScriptChanges::default();
+        };
+        for line in v["logs"].as_array().into_iter().flatten() {
+            if let Some(line) = line.as_str() {
+                if cfg!(test) && std::env::var_os("WP_SCRIPT_SCENE").is_some() {
+                    eprintln!("{line}");
+                }
+                if line.starts_with("error") {
+                    tracing::warn!(target: "script", "{line}");
+                } else {
+                    tracing::debug!(target: "script", "{line}");
+                }
+            }
+        }
+        if let (Some(storage), Some(path)) = (v.get("storage"), &self.storage_path) {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::write(path, storage.to_string()) {
+                tracing::warn!(target: "script", "saving localStorage to {}: {e}", path.display());
+            }
+        }
+        ScriptChanges {
+            objects: v["objects"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(parse_object_change)
+                .collect(),
+            commands: v["commands"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(parse_command)
+                .collect(),
+        }
     }
 }
 
-pub fn eval_script_opt(script: Option<&str>, current_value: f32, env: &ScriptEnv) -> f32 {
-    match script {
-        Some(s) => eval_update(s, current_value, env).unwrap_or(current_value),
-        None => current_value,
+/// Run `script` once against a single object, as on its first frame, and
+/// return what it changed — for load-time values (a clock's initial text, a
+/// spritesheet frame picked by the hour).
+pub fn evaluate_once(
+    property: &str,
+    script: &str,
+    init: &ObjectInit,
+    authored_props: Option<&Value>,
+) -> ObjectChange {
+    let mut host = ScriptHost::new();
+    host.register_object(0, init);
+    if !host.attach(0, Some(property), script, authored_props) {
+        return ObjectChange::default();
+    }
+    host.frame(0.0, local_time_of_day(), 0.0);
+    host.collect()
+        .objects
+        .into_iter()
+        .find(|(i, _)| *i == 0)
+        .map(|(_, c)| c)
+        .unwrap_or_default()
+}
+
+fn vec3(v: &Value) -> Option<[f32; 3]> {
+    let a = v.as_array()?;
+    let f = |i: usize| a.get(i).and_then(|x| x.as_f64()).map(|x| x as f32);
+    let out = [f(0)?, f(1)?, f(2)?];
+    out.iter().all(|c| c.is_finite()).then_some(out)
+}
+
+fn parse_object_change(entry: &Value) -> Option<(usize, ObjectChange)> {
+    let index = entry.get(0)?.as_u64()? as usize;
+    let map = entry.get(1)?.as_object()?;
+    let rad = std::f32::consts::PI / 180.0;
+    let mut c = ObjectChange::default();
+    for (k, v) in map {
+        let num = || v.as_f64().map(|n| n as f32).filter(|n| n.is_finite());
+        match k.as_str() {
+            "origin" => c.origin = vec3(v),
+            "angles" => c.angles = vec3(v).map(|a| a.map(|d| d * rad)),
+            "scale" => c.scale = vec3(v),
+            "color" => c.color = vec3(v),
+            "visible" => c.visible = v.as_bool(),
+            "alpha" => c.alpha = num(),
+            "brightness" => c.brightness = num(),
+            "text" => c.text = v.as_str().map(str::to_string),
+            "pointsize" => c.pointsize = num(),
+            "volume" => c.volume = num(),
+            "rate" => c.rate = num(),
+            "frame" => c.frame = v.as_f64().filter(|f| *f >= 0.0).map(|f| f as u32),
+            "propagationDisabled" => c.propagation_disabled = v.as_bool(),
+            "size" | "parallaxDepth" | "font" => {}
+            _ => {
+                c.extra.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    Some((index, c))
+}
+
+fn parse_command(cmd: &Value) -> Option<ScriptCommand> {
+    let a = cmd.as_array()?;
+    let kind = a.first()?.as_str()?;
+    let index = a.get(1).and_then(|v| v.as_i64()).unwrap_or(-1);
+    let idx = || (index >= 0).then_some(index as usize);
+    let s = |i: usize| a.get(i).and_then(|v| v.as_str()).map(str::to_string);
+    Some(match kind {
+        "sound" => ScriptCommand::Sound {
+            index: idx()?,
+            op: s(2)?,
+        },
+        "texanim" => ScriptCommand::TextureAnimation {
+            index: idx()?,
+            op: s(2)?,
+        },
+        "anim" => ScriptCommand::Animation {
+            index: idx()?,
+            property: s(2)?,
+            op: s(3)?,
+            frame: a.get(4).and_then(|v| v.as_f64()).map(|f| f as f32),
+        },
+        "sort" => ScriptCommand::Sort {
+            index: idx()?,
+            to: a.get(2)?.as_f64()?.max(0.0) as usize,
+        },
+        "create" => ScriptCommand::Create {
+            index: idx()?,
+            config: a.get(2).cloned().unwrap_or(Value::Null),
+        },
+        "destroy" => ScriptCommand::Destroy { index: idx()? },
+        "shortcut" => ScriptCommand::Shortcut(s(2)?),
+        _ => return None,
+    })
+}
+
+/// The scripting kind of a scene.json value: `"number"`, `"bool"`,
+/// `"vec2"`/`"vec3"`/`"vec4"` (numeric strings like `"1 0 0"`), or `"string"`.
+pub fn value_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(s) => {
+            let parts: Vec<&str> = s.split_whitespace().collect();
+            let numeric = parts.iter().all(|p| p.parse::<f64>().is_ok());
+            match (numeric, parts.len()) {
+                (true, 1) => "number",
+                (true, 2) => "vec2",
+                (true, 3) => "vec3",
+                (true, 4) => "vec4",
+                _ => "string",
+            }
+        }
+        _ => "number",
     }
 }
 
-pub fn eval_vec3_script_opt(
-    animated: &crate::engine::model::AnimatedValue,
-    env: &ScriptEnv,
-) -> [f32; 3] {
-    // Default to [1.0; 3] so scale and color don't zero-out the output when missing
-    let base = animated.as_vec3().unwrap_or([1.0; 3]);
-    match &animated.script {
-        None => base,
-        Some(script) => [
-            eval_update(script, base[0], env).unwrap_or(base[0]),
-            eval_update(script, base[1], env).unwrap_or(base[1]),
-            eval_update(script, base[2], env).unwrap_or(base[2]),
-        ],
-    }
+/// The `(property, script, scriptproperties)` triples of a scene.json value
+/// shaped `{"value": …, "script": "…", "scriptproperties": {…}}`.
+pub fn scripted(value: Option<&Value>) -> Option<(&str, Option<&Value>)> {
+    let m = value?.as_object()?;
+    let script = m.get("script")?.as_str()?;
+    Some((script, m.get("scriptproperties")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn env(runtime: f32, time_of_day: f32) -> ScriptEnv {
-        ScriptEnv {
-            runtime,
-            time_of_day,
-        }
-    }
-
-    #[test]
-    fn returns_current_value_when_no_update_function() {
-        let out = eval_update("var x = 3;", 7.0, &env(0.0, 0.0));
-        assert_eq!(out, Some(7.0));
-    }
-
-    #[test]
-    fn simple_arithmetic_update() {
-        let script = "function update(value) { return value * 2 + 1; }";
-        assert_eq!(eval_update(script, 5.0, &env(0.0, 0.0)), Some(11.0));
-    }
-
-    #[test]
-    fn reads_engine_runtime() {
-        let script = "function update(value) { return engine.runtime; }";
-        assert_eq!(eval_update(script, 0.0, &env(4.5, 0.0)), Some(4.5));
-    }
-
-    #[test]
-    fn multi_statement_body_with_locals_and_math() {
-        // The old hand-rolled parser could only handle a single `return <expr>`.
-        let script = "function update(value) {\n\
-                          var a = Math.floor(value);\n\
-                          var b = Math.sin(0) + 1;\n\
-                          return a * b;\n\
-                      }";
-        assert_eq!(eval_update(script, 3.7, &env(0.0, 0.0)), Some(3.0));
-    }
-
-    #[test]
-    fn conditional_and_loop() {
-        let script = "function update(value) {\n\
-                          var sum = 0;\n\
-                          for (var i = 0; i < 4; i++) { sum += i; }\n\
-                          return value > 0 ? sum : -sum;\n\
-                      }";
-        assert_eq!(eval_update(script, 1.0, &env(0.0, 0.0)), Some(6.0));
-        assert_eq!(eval_update(script, -1.0, &env(0.0, 0.0)), Some(-6.0));
-    }
-
-    #[test]
-    fn wemath_smoothstep_matches_definition() {
-        let script = "function update(value) { return WEMath.smoothStep(0, 1, value); }";
-        // midpoint of smoothstep is exactly 0.5
-        assert_eq!(eval_update(script, 0.5, &env(0.0, 0.0)), Some(0.5));
-        // clamps below/above the edges
-        assert_eq!(eval_update(script, -1.0, &env(0.0, 0.0)), Some(0.0));
-        assert_eq!(eval_update(script, 2.0, &env(0.0, 0.0)), Some(1.0));
-    }
-
-    #[test]
-    fn throwing_script_falls_back_to_current_value() {
-        let script = "function update(value) { return nonexistent.field; }";
-        assert_eq!(eval_update(script, 9.0, &env(0.0, 0.0)), None);
-        assert_eq!(eval_script_opt(Some(script), 9.0, &env(0.0, 0.0)), 9.0);
-    }
-
-    #[test]
-    fn persistent_context_reevaluates_across_frames() {
-        let mut ctx = ScriptContext::new();
-        let script = "function update(value) { return engine.runtime * 2; }";
-
-        ctx.set_time(1.0, 0.0, 0.016);
-        assert_eq!(ctx.eval_update(script, 0.0), Some(2.0));
-
-        // Same context, new frame: only the clock changed, result tracks it.
-        ctx.set_time(5.5, 0.0, 0.016);
-        assert_eq!(ctx.eval_update(script, 0.0), Some(11.0));
-    }
-
-    #[test]
-    fn persistent_context_passes_current_value_through() {
-        let mut ctx = ScriptContext::new();
-        let script = "function update(value) { return value + 1; }";
-        assert_eq!(ctx.eval_update(script, 4.0), Some(5.0));
-        assert_eq!(ctx.eval_update(script, 40.0), Some(41.0));
-    }
-
-    #[test]
-    fn persistent_context_does_not_leak_update_between_scripts() {
-        let mut ctx = ScriptContext::new();
-        // First property defines an `update`.
-        assert_eq!(
-            ctx.eval_update("function update(value) { return 99; }", 1.0),
-            Some(99.0)
+    fn host_with_object() -> ScriptHost {
+        let mut h = ScriptHost::new();
+        h.register_object(
+            0,
+            &ObjectInit {
+                name: Some("clock".into()),
+                id: Some(7),
+                origin: [100.0, 200.0, 0.0],
+                scale: [1.0, 1.0, 1.0],
+                color: [1.0, 1.0, 1.0],
+                visible: true,
+                alpha: 1.0,
+                brightness: 1.0,
+                pointsize: 32.0,
+                volume: 1.0,
+                ..Default::default()
+            },
         );
-        // Second property has no `update`: it must keep its own value, not
-        // reuse the leftover `update` from the first property.
-        assert_eq!(ctx.eval_update("var unrelated = 3;", 7.0), Some(7.0));
+        h
+    }
+
+    fn change(h: &mut ScriptHost) -> ObjectChange {
+        h.collect()
+            .objects
+            .into_iter()
+            .find(|(i, _)| *i == 0)
+            .map(|(_, c)| c)
+            .unwrap_or_default()
     }
 
     #[test]
-    fn persistent_context_survives_a_throwing_script() {
-        let mut ctx = ScriptContext::new();
+    fn module_state_persists_and_init_runs_once() {
+        let mut h = host_with_object();
+        let script = "'use strict';\nlet n = 0;\nexport function init(v) { n = 10; }\nexport function update(value) { n += 1; return n / 100; }";
+        assert!(h.attach(0, Some("alpha"), script, None));
+        h.frame(0.0, 0.0, 0.016);
+        assert_eq!(change(&mut h).alpha, Some(0.11));
+        h.frame(0.016, 0.0, 0.016);
+        assert_eq!(change(&mut h).alpha, Some(0.12));
+    }
+
+    #[test]
+    fn unchanged_values_are_not_reported() {
+        let mut h = host_with_object();
+        h.attach(
+            0,
+            Some("alpha"),
+            "export function update(v) { return 1; }",
+            None,
+        );
+        h.frame(0.0, 0.0, 0.016);
+        assert!(h.collect().objects.is_empty());
+    }
+
+    #[test]
+    fn angles_are_degrees_in_scripts_and_radians_out() {
+        let mut h = host_with_object();
+        h.attach(
+            0,
+            Some("angles"),
+            "export function update(value) { value.z = -90; return value; }",
+            None,
+        );
+        h.frame(0.0, 0.0, 0.016);
+        let a = change(&mut h).angles.unwrap();
+        assert!((a[2] + std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn scripts_write_other_layers_and_this_layer() {
+        let mut h = host_with_object();
+        h.register_object(
+            1,
+            &ObjectInit {
+                name: Some("label".into()),
+                visible: true,
+                ..Default::default()
+            },
+        );
+        h.attach(
+            0,
+            Some("visible"),
+            "export function update(value) { thisScene.getLayer('label').text = 'hi'; thisLayer.alpha = 0.5; return value; }",
+            None,
+        );
+        h.frame(0.0, 0.0, 0.016);
+        let changes = h.collect();
+        let get = |i: usize| {
+            changes
+                .objects
+                .iter()
+                .find(|(j, _)| *j == i)
+                .unwrap()
+                .1
+                .clone()
+        };
+        assert_eq!(get(1).text.as_deref(), Some("hi"));
+        assert_eq!(get(0).alpha, Some(0.5));
+    }
+
+    #[test]
+    fn vector_getters_return_copies() {
+        let mut h = host_with_object();
+        h.attach(
+            0,
+            Some("alpha"),
+            "export function update(v) { let o = thisLayer.origin; o.x = 999; return v; }",
+            None,
+        );
+        h.frame(0.0, 0.0, 0.016);
+        assert_eq!(change(&mut h).origin, None);
+    }
+
+    #[test]
+    fn timers_fire_on_schedule() {
+        let mut h = host_with_object();
+        h.attach(
+            0,
+            None,
+            "export function init() { engine.setTimeout(function() { thisLayer.visible = false; }, 500); }",
+            None,
+        );
+        h.frame(0.0, 0.0, 0.016);
+        assert_eq!(change(&mut h).visible, None);
+        h.frame(0.6, 0.0, 0.016);
+        assert_eq!(change(&mut h).visible, Some(false));
+    }
+
+    #[test]
+    fn audio_buffers_are_fed() {
+        let mut h = host_with_object();
+        h.attach(
+            0,
+            Some("alpha"),
+            "let buf = engine.registerAudioBuffers(engine.AUDIO_RESOLUTION_16);\nexport function update(v) { return buf.average[0]; }",
+            None,
+        );
+        assert!(h.wants_audio());
+        let l16 = [0.5f32; 16];
+        let r16 = [0.25f32; 16];
+        h.set_audio([&l16, &r16, &[0.0; 32], &[0.0; 32], &[0.0; 64], &[0.0; 64]]);
+        h.frame(0.0, 0.0, 0.016);
+        assert_eq!(change(&mut h).alpha, Some(0.375));
+    }
+
+    #[test]
+    fn cursor_events_reach_the_target_object_only() {
+        let mut h = host_with_object();
+        h.register_object(
+            1,
+            &ObjectInit {
+                visible: true,
+                ..Default::default()
+            },
+        );
+        h.attach(
+            0,
+            Some("visible"),
+            "export function cursorClick(e) { thisLayer.visible = !thisLayer.visible; }",
+            None,
+        );
+        assert_eq!(h.objects_with_handlers(CURSOR_EVENTS), vec![0]);
+        h.dispatch_cursor(1, "cursorClick", [0.0, 0.0]);
+        assert!(h.collect().objects.is_empty());
+        h.dispatch_cursor(0, "cursorClick", [0.0, 0.0]);
+        assert_eq!(change(&mut h).visible, Some(false));
+    }
+
+    #[test]
+    fn script_properties_merge_authored_values_and_user_props_apply() {
+        let mut h = host_with_object();
+        h.set_scene_info(
+            [1920.0, 1080.0],
+            [1920, 1080],
+            &serde_json::json!({"hudcolor": "1 0 0"}),
+        );
+        let script = "export var scriptProperties = createScriptProperties().addCheckbox({name: 'h24', value: false}).finish();\n\
+                      let c = '';\n\
+                      export function applyUserProperties(p) { if (p.hasOwnProperty('hudcolor')) { c = p.hudcolor; } }\n\
+                      export function update(value) { return (scriptProperties.h24 ? '24' : '12') + c; }";
+        h.attach(
+            0,
+            Some("text"),
+            script,
+            Some(&serde_json::json!({"h24": {"value": true}})),
+        );
+        h.frame(0.0, 0.0, 0.016);
+        assert_eq!(change(&mut h).text.as_deref(), Some("241 0 0"));
+    }
+
+    #[test]
+    fn sound_and_create_commands_are_reported() {
+        let mut h = host_with_object();
+        h.attach(
+            0,
+            None,
+            "export function init() { thisLayer.play(); var l = thisScene.createLayer(thisScene.getInitialLayerConfig(thisLayer)); thisScene.destroyLayer(l); }",
+            None,
+        );
+        h.frame(0.0, 0.0, 0.016);
+        let cmds = h.collect().commands;
         assert_eq!(
-            ctx.eval_update("function update(v){ return boom.x; }", 2.0),
+            cmds[0],
+            ScriptCommand::Sound {
+                index: 0,
+                op: "play".into()
+            }
+        );
+        assert!(matches!(cmds[1], ScriptCommand::Create { index: 1, .. }));
+        assert_eq!(cmds[2], ScriptCommand::Destroy { index: 1 });
+    }
+
+    #[test]
+    fn a_throwing_script_keeps_running_others() {
+        let mut h = host_with_object();
+        h.attach(
+            0,
+            Some("alpha"),
+            "export function update(v) { throw new Error('x'); }",
+            None,
+        );
+        h.attach(
+            0,
+            Some("brightness"),
+            "export function update(v) { return 2; }",
+            None,
+        );
+        h.frame(0.0, 0.0, 0.016);
+        let c = change(&mut h);
+        assert_eq!(c.alpha, None);
+        assert_eq!(c.brightness, Some(2.0));
+    }
+
+    #[test]
+    fn syntax_errors_fail_to_attach() {
+        let mut h = host_with_object();
+        assert!(!h.attach(
+            0,
+            Some("alpha"),
+            "export function update(v) { return ; ) }",
             None
-        );
-        // The context is still usable afterwards.
+        ));
+        assert!(!h.has_scripts());
+    }
+
+    #[test]
+    fn named_imports_become_bindings() {
         assert_eq!(
-            ctx.eval_update("function update(v){ return v * 10; }", 2.0),
-            Some(20.0)
+            import_to_bindings("{ smoothStep, mix as m } from 'WEMath';"),
+            "var smoothStep = WEMath.smoothStep, m = WEMath.mix;"
         );
-    }
-
-    /// Real workshop text scripts are ES modules with `import`/`export` and a
-    /// `createScriptProperties()` builder — the whole shape must evaluate and
-    /// return a string.
-    #[test]
-    fn module_style_text_script_evaluates_to_string() {
-        let mut ctx = ScriptContext::new();
-        let script = r#"'use strict';
-export let __workshopId = '2741588178';
-import * as WEMath from 'WEMath';
-export var scriptProperties = createScriptProperties()
-    .addCheckbox({ name: 'showLabel', value: true })
-    .addText({ name: 'format', value: 'H:M' });
-export function update(value) {
-    var d = new Date();
-    var label = scriptProperties.showLabel ? 'T-' : '';
-    return label + scriptProperties.format + '!';
-}"#;
+        assert_eq!(import_to_bindings("* as WEMath from 'WEMath';"), "");
         assert_eq!(
-            ctx.eval_update_string(script, "old", None).as_deref(),
-            Some("T-H:M!")
+            import_to_bindings("* as M from 'WEMath';"),
+            "var M = WEMath;"
         );
     }
 
-    /// A Vec3 `scale`/`origin`/`angles` script: `value` arrives as a Vec3 and
-    /// the returned Vec3 is read back component-wise.
     #[test]
-    fn vec3_script_reads_and_returns_vec3() {
-        let mut ctx = ScriptContext::new();
-        // Doubles x, passes y through, zeroes z.
-        let script = "export function update(value) { \
-            return new Vec3(value.x * 2, value.y, 0); }";
-        assert_eq!(
-            ctx.eval_update_vec3(script, [3.0, 5.0, 9.0]),
-            Some([6.0, 5.0, 0.0])
+    fn minified_inner_exports_are_stripped() {
+        let body =
+            module_to_body("'use strict';export var x=1;function a(){}export function update(){}");
+        assert!(!body.contains("export"));
+    }
+
+    #[test]
+    fn color_helpers_round_trip() {
+        let mut h = host_with_object();
+        h.attach(
+            0,
+            Some("color"),
+            "export function update(v) { return WEColor.hsv2rgb(WEColor.rgb2hsv(new Vec3(0.2, 0.4, 0.6))); }",
+            None,
         );
-    }
-
-    /// The real `angles` idiom mutates `value` in place and returns it.
-    #[test]
-    fn vec3_script_mutate_in_place() {
-        let mut ctx = ScriptContext::new();
-        ctx.set_time(0.0, 0.0, 0.5);
-        let script = "export function update(value) { \
-            value.x += engine.frametime; return value; }";
-        assert_eq!(
-            ctx.eval_update_vec3(script, [1.0, 2.0, 3.0]),
-            Some([1.5, 2.0, 3.0])
-        );
-    }
-
-    /// A `visible` script returns a boolean; `value` arrives as 0/1.
-    #[test]
-    fn bool_script_toggles_visibility() {
-        let mut ctx = ScriptContext::new();
-        assert_eq!(
-            ctx.eval_update_bool("export function update(value) { return !value; }", true),
-            Some(false)
-        );
-        assert_eq!(
-            ctx.eval_update_bool("export function update(value) { return value > 0; }", true),
-            Some(true)
-        );
-    }
-
-    /// Real content has invisible click/hover hitboxes: `visible` is authored
-    /// `false` and the script defines ONLY cursor handlers — no `update()`. The
-    /// script must then return the authored value unchanged, or the hitbox
-    /// renders as an opaque box (3509243656's white box).
-    #[test]
-    fn bool_script_without_update_keeps_authored_value() {
-        let mut ctx = ScriptContext::new();
-        let hitbox = "'use strict';\n\
-            export function cursorClick(event) { shared.yp = 1; }\n\
-            export function cursorEnter(event) { shared.cret1 = 1; }";
-        assert_eq!(ctx.eval_update_bool(hitbox, false), Some(false));
-        assert_eq!(ctx.eval_update_bool(hitbox, true), Some(true));
-    }
-
-    /// A text script that returns `undefined` (unstubbed scene API) must not
-    /// render the literal "undefined" — the caller keeps its current text.
-    #[test]
-    fn text_script_returning_undefined_yields_none() {
-        let mut ctx = ScriptContext::new();
-        assert_eq!(
-            ctx.eval_update_string(
-                "export function update(v) { return undefined; }",
-                "keep",
-                None
-            ),
-            None
-        );
-        assert_eq!(
-            ctx.eval_update_string("export function update(v) { return 'ok'; }", "keep", None)
-                .as_deref(),
-            Some("ok")
-        );
-    }
-
-    /// A clock-style script using `Date` must produce plausible digits.
-    #[test]
-    fn date_script_returns_time_digits() {
-        let mut ctx = ScriptContext::new();
-        let script = r#"export function update(value) {
-            var d = new Date();
-            var h = d.getHours();
-            return (h < 10 ? '0' : '') + h;
-        }"#;
-        let out = ctx
-            .eval_update_string(script, "", None)
-            .expect("should evaluate");
-        let n: u32 = out.parse().expect("two digits");
-        assert!(n < 24, "hours out of range: {out}");
-    }
-
-    /// Minified module scripts pack `"use strict";export var …;…;export
-    /// function update(){}` onto one line — every inner `export` must be
-    /// stripped, not just the line-leading one.
-    #[test]
-    fn strips_inner_statement_exports() {
-        let s = strip_module_syntax(
-            "\"use strict\";export var a=1;export function update(v){return a;}",
-        );
-        assert!(!s.contains("export"), "leftover export in: {s}");
-    }
-
-    // --- object-attachment API (`OBJECT_ATTACHMENT_API_JS`) ---
-
-    #[test]
-    fn look_at_faces_the_target_straight_ahead() {
-        let mut ctx = ScriptContext::new();
-        ctx.set_current_object(Some("obj"), Some(1), [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.0, 0.0]);
-        let script = "export function update(value) { return thisLayer.lookAt(new Vec3(0, 0, 5)); }";
-        let angles = ctx.eval_update_vec3(script, [0.0, 0.0, 0.0]).expect("should evaluate");
-        // Target is straight down local +Z: both pitch and yaw are 0.
-        assert!(angles[0].abs() < 1e-4, "pitch: {angles:?}");
-        assert!(angles[1].abs() < 1e-4, "yaw: {angles:?}");
-    }
-
-    #[test]
-    fn look_at_yaw_touches_only_the_y_axis() {
-        let mut ctx = ScriptContext::new();
-        ctx.set_current_object(None, None, [0.0, 0.0, 0.0], [0.3, 0.0, 0.7], [1.0, 1.0, 1.0], [0.0, 0.0]);
-        // Target far to +X, high up: yaw should swing toward +X (atan2(5,0) = pi/2)
-        // while the authored pitch/roll pass through untouched.
-        let script = "export function update(value) { return thisLayer.lookAtYaw(new Vec3(5, 100, 0)); }";
-        let angles = ctx.eval_update_vec3(script, [0.3, 0.0, 0.7]).expect("should evaluate");
-        assert!((angles[0] - 0.3).abs() < 1e-4, "pitch must stay unchanged: {angles:?}");
-        assert!((angles[2] - 0.7).abs() < 1e-4, "roll must stay unchanged: {angles:?}");
+        h.frame(0.0, 0.0, 0.016);
+        let c = change(&mut h).color.unwrap();
         assert!(
-            (angles[1] - std::f32::consts::FRAC_PI_2).abs() < 1e-3,
-            "yaw should point toward +X: {angles:?}"
+            (c[0] - 0.2).abs() < 1e-5 && (c[1] - 0.4).abs() < 1e-5 && (c[2] - 0.6).abs() < 1e-5
         );
     }
 
     #[test]
-    fn rotate_object_space_is_additive() {
-        let mut ctx = ScriptContext::new();
-        ctx.set_current_object(None, None, [0.0; 3], [0.1, 0.2, 0.3], [1.0; 3], [0.0, 0.0]);
-        let script = "export function update(value) { return thisLayer.rotateObjectSpace(0.5, -0.1, 0.2); }";
-        let angles = ctx.eval_update_vec3(script, [0.1, 0.2, 0.3]).expect("should evaluate");
-        assert!((angles[0] - 0.6).abs() < 1e-5, "{angles:?}");
-        assert!((angles[1] - 0.1).abs() < 1e-5, "{angles:?}");
-        assert!((angles[2] - 0.5).abs() < 1e-5, "{angles:?}");
+    fn local_storage_persists_to_disk() {
+        let path = std::env::temp_dir().join(format!("wp-ls-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut h = ScriptHost::new().with_storage(path.clone());
+            h.register_object(0, &ObjectInit::default());
+            h.attach(
+                0,
+                None,
+                "export function init() { localStorage.set('n', 3); }",
+                None,
+            );
+            h.frame(0.0, 0.0, 0.016);
+            h.collect();
+        }
+        let mut h = ScriptHost::new().with_storage(path.clone());
+        h.register_object(
+            0,
+            &ObjectInit {
+                alpha: 1.0,
+                ..Default::default()
+            },
+        );
+        h.attach(
+            0,
+            Some("alpha"),
+            "export function update(v) { return localStorage.get('n'); }",
+            None,
+        );
+        h.frame(0.0, 0.0, 0.016);
+        assert_eq!(change(&mut h).alpha, Some(3.0));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn get_transform_matrix_translation_column_matches_origin() {
-        let mut ctx = ScriptContext::new();
-        ctx.set_current_object(None, None, [3.0, 4.0, 5.0], [0.0; 3], [1.0; 3], [0.0, 0.0]);
-        let script = "export function update(value) { \
-            var m = thisLayer.getTransformMatrix(); \
-            return new Vec3(m[12], m[13], m[14]); }";
-        let t = ctx.eval_update_vec3(script, [0.0; 3]).expect("should evaluate");
-        assert_eq!(t, [3.0, 4.0, 5.0]);
+    fn scene_general_settings_are_readable() {
+        let mut h = host_with_object();
+        h.set_scene_general(
+            &serde_json::json!({"bloom": {"value": true}, "bloomstrength": 2.5, "getLayer": 1}),
+        );
+        h.attach(
+            0,
+            Some("text"),
+            "export function update(v) { return thisScene.bloom + ' ' + thisScene.bloomstrength + ' ' + typeof thisScene.getLayer; }",
+            None,
+        );
+        h.frame(0.0, 0.0, 0.016);
+        assert_eq!(change(&mut h).text.as_deref(), Some("true 2.5 function"));
+    }
+
+    fn host_with_effects() -> ScriptHost {
+        let mut h = ScriptHost::new();
+        h.register_object(
+            0,
+            &ObjectInit {
+                name: Some("dots".into()),
+                visible: true,
+                raw: Some(serde_json::json!({
+                    "instanceoverride": {"rate": 0.5},
+                    "effects": [
+                        {"file": "effects/pulse/effect.json", "passes": [{"constantshadervalues": {"speed": 1.0}}]},
+                        {"file": "effects/scroll/effect.json", "name": "scroll", "passes": [{"constantshadervalues": {"tint": "1 0 0"}}]}
+                    ]
+                })),
+                ..Default::default()
+            },
+        );
+        h
     }
 
     #[test]
-    fn set_parent_composes_local_offset_onto_the_named_parent() {
-        let mut ctx = ScriptContext::new();
-        ctx.set_layers(&[LayerSnapshot {
-            name: Some("Anchor"),
-            id: Some(9),
-            origin: [10.0, 0.0, 0.0],
-            angles: [0.0, 0.0, 0.0],
-            scale: [2.0, 2.0, 2.0],
-        }]);
-        ctx.set_current_object(Some("Child"), Some(1), [1.0, 0.0, 0.0], [0.0; 3], [1.0; 3], [0.0, 0.0]);
-        let script = "export function update(value) { \
-            return thisLayer.setParent(thisScene.getLayer('Anchor')).origin; }";
-        let origin = ctx.eval_update_vec3(script, [1.0, 0.0, 0.0]).expect("should evaluate");
-        // local (1,0,0) * parent scale (2,2,2) = (2,0,0), unrotated, + parent origin (10,0,0)
-        assert_eq!(origin, [12.0, 0.0, 0.0]);
+    fn effect_materials_and_instance_are_scriptable() {
+        let mut h = host_with_effects();
+        h.attach(
+            0,
+            Some("visible"),
+            "export function update(v) {\n\
+               let m = thisLayer.getEffect(1).getMaterial(0);\n\
+               let t = m.tint; t.y = 0.5; m.tint = t;\n\
+               thisLayer.getEffect('pulse').getMaterial(0).speed = m.tint.y * 4;\n\
+               thisLayer.getEffect(0).visible = false;\n\
+               thisLayer.instance.rate = thisLayer.instance.rate * 2;\n\
+               return v; }",
+            None,
+        );
+        h.frame(0.0, 0.0, 0.016);
+        let c = change(&mut h);
+        assert_eq!(c.extra["effects.1.0.tint"], serde_json::json!([1, 0.5, 0]));
+        assert_eq!(c.extra["effects.0.0.speed"], serde_json::json!(2));
+        assert_eq!(c.extra["effects.0.visible"], serde_json::json!(false));
+        assert_eq!(c.extra["instance.rate"], serde_json::json!(1));
     }
 
     #[test]
-    fn get_layer_returns_null_for_an_unknown_name() {
-        let mut ctx = ScriptContext::new();
-        ctx.set_layers(&[]);
-        let script = "export function update(value) { \
-            return thisScene.getLayer('Nope') === null ? new Vec3(1,1,1) : new Vec3(0,0,0); }";
-        let v = ctx.eval_update_vec3(script, [0.0; 3]).expect("should evaluate");
-        assert_eq!(v, [1.0, 1.0, 1.0]);
-    }
-
-    /// No skeleton/bone/attachment-point data exists anywhere in this engine
-    /// — `getAttachmentIndex` always reports -1, and `getAttachmentOrigin`
-    /// always resolves to the object's own transform regardless of index.
-    #[test]
-    fn attachment_queries_have_no_bone_table_so_resolve_to_self_or_not_found() {
-        let mut ctx = ScriptContext::new();
-        ctx.set_current_object(None, None, [7.0, 8.0, 9.0], [0.0; 3], [1.0; 3], [0.0, 0.0]);
-        let script = "export function update(value) { \
-            var idx = thisLayer.getAttachmentIndex('hand'); \
-            var o = thisLayer.getAttachmentOrigin(idx); \
-            return new Vec3(idx, o.x, o.z); }";
-        let out = ctx.eval_update_vec3(script, [0.0; 3]).expect("should evaluate");
-        assert_eq!(out, [-1.0, 7.0, 9.0]);
-    }
-
-    #[test]
-    fn disablepropagation_sets_a_readable_flag_reset_by_the_next_object() {
-        let mut ctx = ScriptContext::new();
-        ctx.set_current_object(None, None, [0.0; 3], [0.0; 3], [1.0; 3], [0.0, 0.0]);
-        assert!(!ctx.take_propagation_disabled());
-
-        let script = "export function update(value) { thisLayer.disablepropagation(); return value; }";
-        ctx.eval_update_vec3(script, [0.0; 3]);
-        assert!(ctx.take_propagation_disabled());
-
-        // A fresh object (no call to disablepropagation) starts clean again.
-        ctx.set_current_object(None, None, [0.0; 3], [0.0; 3], [1.0; 3], [0.0, 0.0]);
-        assert!(!ctx.take_propagation_disabled());
-    }
-
-    // --- media (engine::media, see set_media's own doc comment) ---
-
-    #[test]
-    fn media_global_starts_unavailable() {
-        let mut ctx = ScriptContext::new();
-        let script = "export function update(value) { return media.available ? 1 : 0; }";
-        assert_eq!(ctx.eval_update(script, 0.0), Some(0.0));
-    }
-
-    #[test]
-    fn set_media_updates_the_global_a_script_can_read() {
-        let mut ctx = ScriptContext::new();
-        ctx.set_media(true, 1, "Song Title", "The Artist", "An Album", 30_000_000, 180_000_000, None);
-
-        let script = "export function update(value) { return media.available ? 1 : 0; }";
-        assert_eq!(ctx.eval_update(script, 0.0), Some(1.0));
-
-        let script = "export function update(value) { return media.playbackState; }";
-        assert_eq!(ctx.eval_update(script, 0.0), Some(1.0));
-
-        let script = "export function update(value) { return media.position / 1000000; }";
-        assert_eq!(ctx.eval_update(script, 0.0), Some(30.0));
-
-        let script = "export function update(value) { return media.artUrl === null ? 1 : 0; }";
-        assert_eq!(ctx.eval_update(script, 0.0), Some(1.0));
-    }
-
-    #[test]
-    fn set_media_escapes_string_fields_safely() {
-        let mut ctx = ScriptContext::new();
-        // A title containing a quote and a backslash must not break out of
-        // the JS string literal `set_media` builds.
-        ctx.set_media(true, 0, "Quote\" \\ Test", "", "", 0, 0, Some("http://example.com/art.jpg"));
-
-        let script = "export function update(value) { return media.title; }";
+    fn declared_extra_properties_drive_update_scripts() {
+        let mut h = host_with_effects();
+        h.declare_property(0, "instance.rate", "number", &serde_json::json!(0.5));
+        h.attach(
+            0,
+            Some("instance.rate"),
+            "export function update(v) { return v + 1; }",
+            None,
+        );
+        h.frame(0.0, 0.0, 0.016);
         assert_eq!(
-            ctx.eval_update_string(script, "", None).as_deref(),
-            Some("Quote\" \\ Test")
+            change(&mut h).extra["instance.rate"],
+            serde_json::json!(1.5)
         );
-        let script = "export function update(value) { return media.artUrl; }";
-        assert_eq!(
-            ctx.eval_update_string(script, "", None).as_deref(),
-            Some("http://example.com/art.jpg")
-        );
+        assert_eq!(value_kind(&serde_json::json!("1 0 0")), "vec3");
+        assert_eq!(value_kind(&serde_json::json!("0.5")), "number");
+    }
+
+    #[test]
+    fn time_of_day_is_a_fraction() {
+        let t = local_time_of_day();
+        assert!((0.0..1.0).contains(&t));
     }
 }

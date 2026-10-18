@@ -182,9 +182,8 @@ pub struct Emitter {
     /// stops emitting. Absent = emits forever.
     #[serde(default)]
     pub duration: Option<f64>,
-    /// Presence of any `audioprocessing*` field makes emission react to the
-    /// captured audio level (rate scales with loudness). We use the mode as
-    /// the trigger; band bounds are parsed but not yet split per-frequency.
+    /// Presence of `audioprocessingmode`/`bounds` makes emission react to
+    /// captured audio; the rest shape the response (see `AudioResponse`).
     #[serde(default)]
     pub audioprocessingmode: Option<serde_json::Value>,
     #[serde(default)]
@@ -192,7 +191,80 @@ pub struct Emitter {
     #[serde(default)]
     pub audioprocessingexponent: Option<serde_json::Value>,
     #[serde(default)]
+    pub audioprocessingfrequencystart: Option<serde_json::Value>,
+    #[serde(default)]
     pub audioprocessingfrequencyend: Option<serde_json::Value>,
+}
+
+/// An emitter's audio response, with the defaults and clamping of WE's own
+/// parser (wallpaper64.exe `FUN_1401c1e20`): `exponent` 2.0, `bounds`
+/// "0.8 1.0", bands `0..=1` of the 16-band spectrum, both clamped to 15 and
+/// swapped if reversed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AudioResponse {
+    exponent: f32,
+    bounds: [f32; 2],
+    bands: [usize; 2],
+}
+
+impl AudioResponse {
+    fn from_emitter(e: &Emitter) -> Option<Self> {
+        if e.audioprocessingmode.is_none() && e.audioprocessingbounds.is_none() {
+            return None;
+        }
+        let band = |v: &Option<serde_json::Value>, d: usize| {
+            v.as_ref()
+                .and_then(|v| v.as_u64())
+                .map_or(d, |b| b as usize)
+                .min(15)
+        };
+        let (a, b) = (
+            band(&e.audioprocessingfrequencystart, 0),
+            band(&e.audioprocessingfrequencyend, 1),
+        );
+        let bounds = match &e.audioprocessingbounds {
+            Some(serde_json::Value::String(s)) => {
+                let p: Vec<f32> = s
+                    .split_whitespace()
+                    .filter_map(|x| x.parse().ok())
+                    .collect();
+                [
+                    p.first().copied().unwrap_or(0.0),
+                    p.get(1).copied().unwrap_or(0.0),
+                ]
+            }
+            Some(v) => value_as_f32(v).map_or([0.8, 1.0], |x| [x, x]),
+            None => [0.8, 1.0],
+        };
+        Some(Self {
+            exponent: e
+                .audioprocessingexponent
+                .as_ref()
+                .and_then(value_as_f32)
+                .unwrap_or(2.0),
+            bounds,
+            bands: [a.min(b), a.max(b)],
+        })
+    }
+
+    /// Rate multiplier for one 16-band spectrum (L/R averaged). Per WE's
+    /// emitter docs the emitter is "only active when audio is playing" and
+    /// `bounds` are the volume levels where the response starts and stops,
+    /// so silence -> 0 and the rate ramps from `bounds[0]` to `bounds[1]`.
+    // ponytail: WE's runtime consumer isn't decompiled; the exponent-then-
+    // bounds order follows the docs' wording, and `mode` (left/right/center)
+    // is treated only as an on-switch. Revisit if the consumer is recovered.
+    fn gain(&self, bands16: &[f32; 16]) -> f32 {
+        let s = &bands16[self.bands[0]..=self.bands[1]];
+        let level = (s.iter().sum::<f32>() / s.len() as f32)
+            .clamp(0.0, 1.0)
+            .powf(self.exponent);
+        let [lo, hi] = self.bounds;
+        if hi <= lo {
+            return if level >= lo { 1.0 } else { 0.0 };
+        }
+        ((level - lo) / (hi - lo)).clamp(0.0, 1.0)
+    }
 }
 
 /// `min`/`max` are untyped because real presets mix plain numbers
@@ -570,9 +642,9 @@ pub struct ParticleSystem {
     /// Scene-global constant acceleration (`general.gravity*` + `wind*`),
     /// added to every particle's velocity each step. Set post-construction.
     scene_force: [f32; 2],
-    /// Current audio loudness in ~[0,1], set per frame; audio-reactive emitters
-    /// scale their emission rate by it.
-    audio_level: f32,
+    /// Latest 16-band spectrum (L/R averaged), set per frame; audio-reactive
+    /// emitters scale their emission rate by it.
+    audio_bands: [f32; 16],
     /// `movement.drag`: velocity decays by `1 - drag*dt` (clamped at 0)
     /// each step, matching the reference's reversal-preventing clamp.
     movement_drag: f32,
@@ -643,8 +715,8 @@ pub struct ParticleSystem {
     /// `mapsequencebetweencontrolpoints` initializer + its counter.
     map_seq_between: Option<MapSequenceBetweenParams>,
     map_seq_between_index: u32,
-    /// `turbulentvelocityrandom` initializer parameters.
-    turbulent_velocity: Option<TurbulentVelocityParams>,
+    /// `turbulentvelocityrandom` initializers; each adds its own velocity.
+    turbulent_velocity: Vec<TurbulentVelocityParams>,
     /// `turbulence` operator parameters.
     turbulence: Option<TurbulenceParams>,
     /// `vortex` operator parameters.
@@ -805,10 +877,16 @@ struct VortexParams {
 /// three collapse to the same axis-aligned-rectangle test.
 #[derive(Clone, Copy)]
 enum CollisionShape {
-    Sphere { radius: f32 },
-    Box { half_extent: [f32; 2] },
+    Sphere {
+        radius: f32,
+    },
+    Box {
+        half_extent: [f32; 2],
+    },
     /// `normal` points away from the solid side (into free space).
-    Plane { normal: [f32; 2] },
+    Plane {
+        normal: [f32; 2],
+    },
 }
 
 /// `collisionbehavior`: what happens to a particle that penetrates a
@@ -1137,12 +1215,23 @@ impl RemapParams {
     /// axis, exactly the original x/y-decorrelation this operator always
     /// used); field mode ignores it, which is what gives a scalar field's
     /// single value its "broadcast to every output axis" behavior.
-    fn sample01(&self, axis_seed: f64, p: &Particle, time: f32, lifetime_pos: f32, max_life: f32) -> f32 {
+    fn sample01(
+        &self,
+        axis_seed: f64,
+        p: &Particle,
+        time: f32,
+        lifetime_pos: f32,
+        max_life: f32,
+    ) -> f32 {
         if self.input == RemapField::None || self.transform.is_noise() {
             use crate::engine::noise::fbm_noise;
             let s = self.input_scale;
             let (x, y, t) = ((p.x * s) as f64, (p.y * s) as f64, time as f64);
-            let octaves = if self.transform == RemapTransform::Fbm { 4 } else { 1 };
+            let octaves = if self.transform == RemapTransform::Fbm {
+                4
+            } else {
+                1
+            };
             let n = fbm_noise(x + axis_seed, y, t, octaves);
             ((n * 0.5 + 0.5) as f32).clamp(0.0, 1.0) // [-1,1] → [0,1]
         } else {
@@ -1160,7 +1249,14 @@ impl RemapParams {
     /// original x/y-decorrelated noise sampling exactly; field-mode inputs
     /// naturally broadcast the same value to every written axis instead
     /// (`sample01` ignores the seed outside noise mode).
-    fn apply_vector(&self, p: &Particle, time: f32, lifetime_pos: f32, current: [f32; 3], axes: usize) -> [f32; 3] {
+    fn apply_vector(
+        &self,
+        p: &Particle,
+        time: f32,
+        lifetime_pos: f32,
+        current: [f32; 3],
+        axes: usize,
+    ) -> [f32; 3] {
         let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
         let seeds = [0.0f64, 13.7, 27.4];
         let mut out = current;
@@ -1209,9 +1305,9 @@ struct EmitterState {
     burst_done: bool,
     /// `duration`: emitter stops after `start_time + duration` (None = forever).
     duration: Option<f32>,
-    /// True when the emitter has `audioprocessing*` — its rate scales with the
-    /// current audio level.
-    audio_reactive: bool,
+    /// Set when the emitter has `audioprocessing*` — its rate follows the
+    /// audio spectrum.
+    audio: Option<AudioResponse>,
 }
 
 impl ParticleSystem {
@@ -1283,8 +1379,7 @@ impl ParticleSystem {
                     burst: e.instantaneous.unwrap_or(0.0).max(0.0) as u32,
                     burst_done: false,
                     duration: e.duration.map(|d| d as f32),
-                    audio_reactive: e.audioprocessingmode.is_some()
-                        || e.audioprocessingbounds.is_some(),
+                    audio: AudioResponse::from_emitter(e),
                 }
             })
             .collect();
@@ -1313,20 +1408,29 @@ impl ParticleSystem {
         let size_exp = initializer_exponent(&config.initializer, "sizerandom");
         let (alpha_min, alpha_max) =
             scalar_range_from_initializers(&config.initializer, "alpharandom", 1.0, 1.0);
-        let velocity_range = vec3_range_from_initializers(&config.initializer, "velocityrandom");
+        // Particle vectors are authored y-up; this simulation is y-down, so
+        // y flips on the way in (CParticle.cpp does the same for velocity,
+        // gravity and turbulent directions, as it does for emitter origins).
+        let flip_y = |v: [f32; 3]| [v[0], -v[1], v[2]];
+        let velocity_range = vec3_range_from_initializers(
+            &config.initializer,
+            "velocityrandom",
+            [-32.0; 3],
+            [32.0; 3],
+        );
         let (velocity_min, velocity_max) = match velocity_range {
-            Some((min, max)) => (Some(min), Some(max)),
+            Some((min, max)) => (Some(flip_y(min)), Some(flip_y(max))),
             None => (None, None),
         };
         let (color_min, color_max) =
-            vec3_range_from_initializers(&config.initializer, "colorrandom")
+            vec3_range_from_initializers(&config.initializer, "colorrandom", [0.0; 3], [255.0; 3])
                 .unwrap_or(([255.0; 3], [255.0; 3]));
 
         let movement_op = config.operator.iter().find(|op| op.name == "movement");
         let gravity = movement_op
             .and_then(|op| op.gravity.as_deref())
             .map(|s| parse_f32_vec3(Some(s)))
-            .map(|v| [v[0], v[1]])
+            .map(|v| [v[0], -v[1]])
             .unwrap_or([0.0, 0.0]);
         // `movement.drag`: per-second velocity decay (CParticle.cpp
         // createMovementOperator) — without it, operators that keep adding
@@ -1553,7 +1657,7 @@ impl ParticleSystem {
         let turbulent_velocity = config
             .initializer
             .iter()
-            .find(|init| init.name == "turbulentvelocityrandom")
+            .filter(|init| init.name == "turbulentvelocityrandom")
             .map(|init| TurbulentVelocityParams {
                 speed_min: init
                     .speedmin
@@ -1571,7 +1675,8 @@ impl ParticleSystem {
                     .forward
                     .as_ref()
                     .and_then(value_as_vec3)
-                    .unwrap_or([0.0, 1.0, 0.0]),
+                    .map(flip_y)
+                    .unwrap_or([0.0, -1.0, 0.0]),
                 timescale: init.timescale.unwrap_or(1.0) as f32,
                 phase_min: init.phasemin.unwrap_or(0.0) as f32,
                 phase_max: init.phasemax.unwrap_or(0.1) as f32,
@@ -1579,8 +1684,10 @@ impl ParticleSystem {
                     .right
                     .as_ref()
                     .and_then(value_as_vec3)
+                    .map(flip_y)
                     .unwrap_or([0.0, 0.0, 1.0]),
-            });
+            })
+            .collect();
 
         // `turbulence`: phase and speed are randomized once per operator
         // instance (the reference draws them in the factory, not per
@@ -1756,9 +1863,7 @@ impl ParticleSystem {
                             .map(|a| a[2])
                             .unwrap_or(0.0);
                         let (s, c) = az.sin_cos();
-                        CollisionShape::Plane {
-                            normal: [-s, c],
-                        }
+                        CollisionShape::Plane { normal: [-s, c] }
                     }
                     // collisionbox/collisionbounds/collisionquad
                     _ => {
@@ -1868,7 +1973,40 @@ impl ParticleSystem {
             time: 0.0,
             start_time: config.starttime.unwrap_or(0.0).max(0.0) as f32,
             scene_force: [0.0, 0.0],
-            audio_level: 0.0,
+            audio_bands: [0.0; 16],
+        }
+    }
+
+    /// Change one `instanceoverride` value live (SceneScript
+    /// `thisLayer.instance.<key> = …`). `count` (the pool size) only applies
+    /// at load and is ignored here.
+    pub fn set_instance_value(&mut self, key: &str, value: &serde_json::Value) {
+        let num = || match value {
+            serde_json::Value::Number(n) => n.as_f64().map(|v| v as f32),
+            serde_json::Value::String(s) => s.trim().parse().ok(),
+            _ => None,
+        };
+        let vec3 = || -> Option<[f32; 3]> {
+            match value {
+                serde_json::Value::Array(a) if a.len() >= 3 => {
+                    Some(std::array::from_fn(|i| a[i].as_f64().unwrap_or(0.0) as f32))
+                }
+                other => value_as_vec3_pub(other),
+            }
+        };
+        match key {
+            "alpha" => self.alpha_mult = num().unwrap_or(self.alpha_mult),
+            "rate" => self.rate_mult = num().unwrap_or(self.rate_mult).max(0.0),
+            "size" => self.size_mult = num().unwrap_or(self.size_mult),
+            "speed" => self.speed_mult = num().unwrap_or(self.speed_mult),
+            "lifetime" => self.lifetime_mult = num().unwrap_or(self.lifetime_mult),
+            "colorn" => self.colorn_mult = vec3().unwrap_or(self.colorn_mult),
+            "color" => {
+                if let Some(c) = vec3() {
+                    self.color_override = Some(c.map(|v| v.clamp(0.0, 255.0) as u8));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1877,9 +2015,9 @@ impl ParticleSystem {
         self.scene_force = force;
     }
 
-    /// Set the current audio loudness (~[0,1]) driving audio-reactive emitters.
-    pub fn set_audio_level(&mut self, level: f32) {
-        self.audio_level = level.clamp(0.0, 4.0);
+    /// Set the 16-band spectrum (~[0,1] per band) driving audio-reactive emitters.
+    pub fn set_audio_bands(&mut self, bands: [f32; 16]) {
+        self.audio_bands = bands;
     }
 
     /// Tell the system its resolved sprite's frame count/loop duration, so
@@ -2272,7 +2410,8 @@ impl ParticleSystem {
                         ];
                     }
                     RemapOutput::Position => {
-                        let [x, y, _] = r.apply_vector(p, self.time, lifetime_pos, [p.x, p.y, 0.0], 2);
+                        let [x, y, _] =
+                            r.apply_vector(p, self.time, lifetime_pos, [p.x, p.y, 0.0], 2);
                         p.x = x;
                         p.y = y;
                     }
@@ -2317,13 +2456,7 @@ impl ParticleSystem {
                 emitter.accumulator += emitter.burst as f32;
                 emitter.burst_done = true;
             }
-            // Audio-reactive emitters scale their rate with loudness (a small
-            // baseline keeps a trickle when quiet).
-            let audio_gain = if emitter.audio_reactive {
-                0.15 + self.audio_level
-            } else {
-                1.0
-            };
+            let audio_gain = emitter.audio.map_or(1.0, |a| a.gain(&self.audio_bands));
             emitter.accumulator += emitter.rate * self.rate_mult * audio_gain * dt;
             while emitter.accumulator >= 1.0 && self.particles.len() < self.max_count {
                 emitter.accumulator -= 1.0;
@@ -2465,21 +2598,19 @@ impl ParticleSystem {
                     let sy = ms.speed_min[1]
                         + fastrand::f32() * (ms.speed_max[1] - ms.speed_min[1]).max(0.0);
                     let (sin, cos) = angle.sin_cos();
-                    // The reference rotates in its y-up sim space
-                    // (v' = (cos*x + sin*y, -sin*x + cos*y), column-major
-                    // glm::mat3) and projects y-up; our space is y-down, so
-                    // the net screen-space rotation is the conjugate —
-                    // otherwise the spawn sequence sweeps the circle in the
-                    // mirrored direction.
+                    // The reference flips y, then rotates by
+                    // (cos*x + sin*y, -sin*x + cos*y) (column-major
+                    // glm::mat3); with the flip folded in that is the
+                    // conjugate rotation followed by a y flip.
                     vx = (cos * sx - sin * sy) * self.speed_mult;
-                    vy = (sin * sx + cos * sy) * self.speed_mult;
+                    vy = -(sin * sx + cos * sy) * self.speed_mult;
                 }
 
                 // `turbulentvelocityrandom` (CParticle.cpp): curl-noise
                 // spawn velocity, angle-limited around `forward`, added on
                 // top of any plain `velocityrandom` contribution.
-                if let Some(t) = self.turbulent_velocity {
-                    let forward = vec3_normalize_or(t.forward, [0.0, 1.0, 0.0]);
+                for &t in &self.turbulent_velocity {
+                    let forward = vec3_normalize_or(t.forward, [0.0, -1.0, 0.0]);
                     let right = vec3_normalize_or(t.right, [1.0, 0.0, 0.0]);
                     let speed =
                         t.speed_min + fastrand::f32() * (t.speed_max - t.speed_min).max(0.0);
@@ -2495,12 +2626,15 @@ impl ParticleSystem {
                     let mut dir = vec3_normalize_or(curl, forward);
 
                     // `scale` < 2 limits how far the direction may deviate
-                    // from `forward` (normalized angle, max = scale/2).
-                    if t.scale < 2.0 {
+                    // from `forward` (normalized angle, max = scale/2); 0
+                    // means straight along `forward`.
+                    if t.scale <= 0.0 {
+                        dir = forward;
+                    } else if t.scale < 2.0 {
                         let cos_angle = vec3_dot(dir, forward).clamp(-1.0, 1.0);
                         let angle = cos_angle.acos() / std::f32::consts::PI;
                         let max_angle = t.scale / 2.0;
-                        if angle > max_angle && max_angle > 0.0001 {
+                        if angle > max_angle {
                             let axis = vec3_cross(dir, forward);
                             if vec3_length(axis) > 0.0001 {
                                 let axis = vec3_normalize_or(axis, [0.0, 0.0, 1.0]);
@@ -3893,13 +4027,26 @@ fn scalar_range_from_initializers(
 /// Returns `Some((min, max))` when the named initializer exists and both
 /// bounds parse as a 3-component vector (e.g. `velocityrandom`/`colorrandom`).
 /// Exact-name matching for the same reason as `scalar_range_from_initializers`.
+/// The (min, max) of initializer `name`, each falling back to WE's default
+/// when omitted (ObjectParser.cpp: `colorrandom` black..white,
+/// `velocityrandom` -32..32). `None` when there is no such initializer.
 fn vec3_range_from_initializers(
     initializers: &[Initializer],
     name: &str,
+    default_min: [f32; 3],
+    default_max: [f32; 3],
 ) -> Option<([f32; 3], [f32; 3])> {
     let init = initializers.iter().find(|init| init.name == name)?;
-    let min = init.min.as_ref().and_then(value_as_vec3)?;
-    let max = init.max.as_ref().and_then(value_as_vec3)?;
+    let min = init
+        .min
+        .as_ref()
+        .and_then(value_as_vec3)
+        .unwrap_or(default_min);
+    let max = init
+        .max
+        .as_ref()
+        .and_then(value_as_vec3)
+        .unwrap_or(default_max);
     Some((min, max))
 }
 
@@ -4067,7 +4214,9 @@ mod tests {
         }"#;
         let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
         let sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
-        assert_eq!(sys.gravity, [0.0, -50.0]);
+        // Authored y-up: "0 -50 0" pulls down the screen, +y in this
+        // y-down simulation.
+        assert_eq!(sys.gravity, [0.0, 50.0]);
     }
 
     #[test]
@@ -4650,8 +4799,16 @@ mod tests {
         sys.particles.push(p);
         sys.step(0.1);
         let p = &sys.particles[0];
-        assert!((p.x - 50.0).abs() < 1e-3, "expected pushed to surface, x={}", p.x);
-        assert!(p.vx > 0.0, "expected reflected outward velocity, vx={}", p.vx);
+        assert!(
+            (p.x - 50.0).abs() < 1e-3,
+            "expected pushed to surface, x={}",
+            p.x
+        );
+        assert!(
+            p.vx > 0.0,
+            "expected reflected outward velocity, vx={}",
+            p.vx
+        );
     }
 
     /// `collisionbox` with `slide`: the into-wall velocity component is
@@ -4672,8 +4829,16 @@ mod tests {
         sys.particles.push(p);
         sys.step(0.15);
         let p = &sys.particles[0];
-        assert!((p.x - 50.0).abs() < 1e-3, "expected pushed to wall, x={}", p.x);
-        assert!(p.vx.abs() < 1e-3, "expected into-wall velocity zeroed, vx={}", p.vx);
+        assert!(
+            (p.x - 50.0).abs() < 1e-3,
+            "expected pushed to wall, x={}",
+            p.x
+        );
+        assert!(
+            p.vx.abs() < 1e-3,
+            "expected into-wall velocity zeroed, vx={}",
+            p.vx
+        );
     }
 
     /// `collisionplane` with `delete`: a particle on the solid side of the
@@ -4691,7 +4856,34 @@ mod tests {
         let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
         sys.particles.push(make_particle(0.0, -10.0, 5.0, 0.0));
         sys.step(0.1);
-        assert!(sys.particles.is_empty(), "particle should be deleted on contact");
+        assert!(
+            sys.particles.is_empty(),
+            "particle should be deleted on contact"
+        );
+    }
+
+    /// Audio response: WE's parser defaults, band clamp/swap, and the gain
+    /// ramp runs between the `bounds` volume levels over the selected bands.
+    #[test]
+    fn audio_response_defaults_bands_and_bounds() {
+        let em = |j: &str| serde_json::from_str::<Emitter>(j).unwrap();
+        assert_eq!(AudioResponse::from_emitter(&em("{}")), None);
+        let d = AudioResponse::from_emitter(&em(r#"{"audioprocessingmode": 1}"#)).unwrap();
+        assert_eq!((d.exponent, d.bounds, d.bands), (2.0, [0.8, 1.0], [0, 1]));
+        let r = AudioResponse::from_emitter(&em(
+            r#"{"audioprocessingbounds": "0.2 1.5", "audioprocessingexponent": 1,
+                "audioprocessingfrequencystart": 40, "audioprocessingfrequencyend": 6}"#,
+        ))
+        .unwrap();
+        assert_eq!(r.bands, [6, 15]);
+        let mut bands = [0.0; 16];
+        assert_eq!(r.gain(&bands), 0.0); // silence: emitter inactive
+        bands[0] = 1.0; // outside 6..=15: no effect
+        assert_eq!(r.gain(&bands), 0.0);
+        bands[6..].fill(0.85);
+        assert!((r.gain(&bands) - 0.5).abs() < 1e-6); // (0.85-0.2)/(1.5-0.2)
+        bands[6..].fill(1.0);
+        assert!((r.gain(&bands) - 0.8 / 1.3).abs() < 1e-6);
     }
 
     /// `boids` cohesion pulls two distant particles toward each other.
@@ -4708,8 +4900,16 @@ mod tests {
         sys.particles.push(make_particle(-100.0, 0.0, 5.0, 0.0));
         sys.particles.push(make_particle(100.0, 0.0, 5.0, 0.0));
         sys.step(0.1);
-        assert!(sys.particles[0].vx > 1.0, "left particle should move right, vx={}", sys.particles[0].vx);
-        assert!(sys.particles[1].vx < -1.0, "right particle should move left, vx={}", sys.particles[1].vx);
+        assert!(
+            sys.particles[0].vx > 1.0,
+            "left particle should move right, vx={}",
+            sys.particles[0].vx
+        );
+        assert!(
+            sys.particles[1].vx < -1.0,
+            "right particle should move left, vx={}",
+            sys.particles[1].vx
+        );
     }
 
     /// `boids` separation pushes two nearby particles apart.
@@ -4726,8 +4926,16 @@ mod tests {
         sys.particles.push(make_particle(-2.0, 0.0, 5.0, 0.0));
         sys.particles.push(make_particle(2.0, 0.0, 5.0, 0.0));
         sys.step(0.1);
-        assert!(sys.particles[0].vx < 0.0, "left particle should move further left, vx={}", sys.particles[0].vx);
-        assert!(sys.particles[1].vx > 0.0, "right particle should move further right, vx={}", sys.particles[1].vx);
+        assert!(
+            sys.particles[0].vx < 0.0,
+            "left particle should move further left, vx={}",
+            sys.particles[0].vx
+        );
+        assert!(
+            sys.particles[1].vx > 0.0,
+            "right particle should move further right, vx={}",
+            sys.particles[1].vx
+        );
     }
 
     /// `movement.drag` decays velocity by `1 - drag*dt` per step, clamped
@@ -4903,6 +5111,26 @@ mod tests {
     /// must not shadow them — the old substring matcher (`contains`)
     /// read the turbulent initializer's fields as the plain velocity
     /// range and the angular operator's (absent) gravity as movement's.
+    /// An omitted `min`/`max` takes WE's default instead of discarding the
+    /// initializer: 3598808038's vapor sets only `colorrandom.max = 0 0 0`
+    /// and must come out black, not the no-initializer white.
+    #[test]
+    fn partial_vec3_initializers_use_we_defaults() {
+        let json = r#"{
+            "maxcount": 4,
+            "emitter": [{"name":"box","rate":1}],
+            "initializer": [
+                {"id":1,"name":"colorrandom","max":"0 0 0"},
+                {"id":2,"name":"velocityrandom","min":"0 10 0"}
+            ]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        assert_eq!((sys.color_min, sys.color_max), ([0.0; 3], [0.0; 3]));
+        assert_eq!(sys.velocity_min, Some([0.0, -10.0, 0.0]));
+        assert_eq!(sys.velocity_max, Some([32.0, -32.0, 32.0]));
+    }
+
     #[test]
     fn similarly_named_initializers_do_not_shadow_each_other() {
         let json = r#"{
@@ -4919,12 +5147,12 @@ mod tests {
         }"#;
         let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
         let sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
-        assert_eq!(sys.velocity_min, Some([3.0, 3.0, 0.0]));
-        assert_eq!(sys.velocity_max, Some([3.0, 3.0, 0.0]));
-        // Preset vectors apply unflipped in our y-down space: the reference
-        // flips y into its y-up sim space and flips again at projection, so
-        // the net screen-space direction equals the raw preset value.
-        assert_eq!(sys.gravity[1], -7.0);
+        // Authored y-up vectors flip into this y-down simulation. Real
+        // content settles the direction: snow, rain and leaf presets fall
+        // with -y velocity, embers rise with +y gravity.
+        assert_eq!(sys.velocity_min, Some([3.0, -3.0, 0.0]));
+        assert_eq!(sys.velocity_max, Some([3.0, -3.0, 0.0]));
+        assert_eq!(sys.gravity[1], 7.0);
     }
 
     /// A config with no `alpharandom` initializer at all must stay a no-op
