@@ -3,7 +3,7 @@ use std::path::Path;
 
 use super::assets::AssetStore;
 use super::material::{EffectDefinition, Model};
-use super::scene::{Scene, SceneObject};
+use crate::engine::model::scene::{Scene, SceneObject};
 
 pub struct SceneGraph {
     pub assets: AssetStore,

@@ -5,8 +5,8 @@ use std::path::Path;
 
 use super::pkg::Package;
 use super::properties::SceneProperties;
-use super::scene::{Scene, SceneObject};
 use super::tex::TexFile;
+use crate::engine::model::scene::{Scene, SceneObject};
 use crate::engine::sim::particle;
 
 /// Parse scene.json, first resolving `{"user": ...}` references against the
@@ -972,7 +972,7 @@ fn layer_from_object(
                     // (`{"user": "head", "value": false}`), not a bare bool.
                     .filter(|(_, e)| {
                         e.get("visible")
-                            .and_then(crate::engine::scene::parse_value_bool)
+                            .and_then(crate::engine::model::scene::parse_value_bool)
                             .unwrap_or(true)
                     })
                     .map(|(i, e)| {
@@ -1431,13 +1431,13 @@ fn text_layer_from_object(
     // and cap at `maxrows`, if authored.
     let gate = |v: &Option<serde_json::Value>| {
         v.as_ref()
-            .and_then(crate::engine::scene::parse_value_bool)
+            .and_then(crate::engine::model::scene::parse_value_bool)
             .unwrap_or(false)
     };
     let text_str = match obj
         .maxwidth
         .as_ref()
-        .and_then(crate::engine::scene::parse_value_f32)
+        .and_then(crate::engine::model::scene::parse_value_f32)
         .filter(|w| *w > 0.0)
         .filter(|_| gate(&obj.limitwidth))
     {
@@ -1445,7 +1445,7 @@ fn text_layer_from_object(
             let rows = obj
                 .maxrows
                 .as_ref()
-                .and_then(crate::engine::scene::parse_value_f32)
+                .and_then(crate::engine::model::scene::parse_value_f32)
                 .filter(|_| gate(&obj.limitrows))
                 .unwrap_or(0.0)
                 .max(0.0) as usize;
@@ -1478,18 +1478,18 @@ fn text_layer_from_object(
         let text_color = obj
             .color
             .as_ref()
-            .and_then(|v| crate::engine::scene::parse_value_vec3(v))
+            .and_then(|v| crate::engine::model::scene::parse_value_vec3(v))
             .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
             .unwrap_or([1.0, 1.0, 1.0]);
         let bright = obj
             .backgroundbrightness
             .as_ref()
-            .and_then(crate::engine::scene::parse_value_f32)
+            .and_then(crate::engine::model::scene::parse_value_f32)
             .unwrap_or(1.0);
         let bg = obj
             .backgroundcolor
             .as_ref()
-            .and_then(|v| crate::engine::scene::parse_value_vec3(v))
+            .and_then(|v| crate::engine::model::scene::parse_value_vec3(v))
             .map(|c| {
                 [
                     c[0] as f32 * bright,
@@ -1501,7 +1501,7 @@ fn text_layer_from_object(
         let pad = obj
             .padding
             .as_ref()
-            .and_then(crate::engine::scene::parse_value_f32)
+            .and_then(crate::engine::model::scene::parse_value_f32)
             .unwrap_or(0.0)
             .max(0.0) as u32;
         (
@@ -2286,7 +2286,7 @@ pub fn obj_local_xform(obj: &SceneObject) -> Xform {
     let s = obj
         .scale
         .as_ref()
-        .and_then(crate::engine::scene::parse_value_vec3)
+        .and_then(crate::engine::model::scene::parse_value_vec3)
         .unwrap_or([1.0, 1.0, 1.0]);
     Xform { t, r, s }
 }
@@ -2305,7 +2305,7 @@ fn parent_index(
     if obj
         .disablepropagation
         .as_ref()
-        .and_then(crate::engine::scene::parse_value_bool)
+        .and_then(crate::engine::model::scene::parse_value_bool)
         .unwrap_or(false)
     {
         return None;

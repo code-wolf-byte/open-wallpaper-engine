@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 use crate::engine::gpu::fbo::RenderTargetPool;
 use crate::engine::gpu::shaders::{effect_def, loader, resolver, transpiler};
+use crate::engine::model::scene::{parse_value_bool, parse_value_f32};
 use crate::engine::model::{ShaderModel, WEBlending};
-use crate::engine::scene::{parse_value_bool, parse_value_f32};
 use crate::engine::sim::camera_dynamics::{CameraDynamics, CameraFrameDynamics};
 use crate::engine::sim::particle;
 use crate::platform::GpuDevice;
@@ -1752,7 +1752,7 @@ pub(crate) struct SceneSound {
 /// `startsilent` is set.
 fn start_scene_sound(
     dir: &Path,
-    obj: &crate::engine::scene::SceneObject,
+    obj: &crate::engine::model::scene::SceneObject,
 ) -> Option<crate::engine::audio::SoundPlayback> {
     let sound = obj.sound.as_ref()?;
     let start_silent = obj
@@ -1766,7 +1766,7 @@ fn start_scene_sound(
     let volume = obj
         .volume
         .as_ref()
-        .and_then(crate::engine::scene::parse_value_f32)
+        .and_then(crate::engine::model::scene::parse_value_f32)
         .unwrap_or(1.0);
     let mode = obj.playbackmode.as_ref().and_then(|v| v.as_str());
     let looping = mode != Some("nointerrupt") && mode != Some("once");
@@ -2106,7 +2106,7 @@ fn mesh3d_transform_bytes(
 /// `flags.y` (as `light_index + 1`, `0.0` = none) and the trailing
 /// `cookie_view_proj` field.
 fn mesh3d_lighting_bytes(
-    scene: &crate::engine::scene::Scene,
+    scene: &crate::engine::model::scene::Scene,
     cam: &crate::engine::sim::camera3d::PerspectiveCamera,
     shadow_slots: &[Option<usize>],
     shadow_slot_data: &[(crate::engine::sim::camera3d::Mat4, [f32; 4])],
@@ -3858,7 +3858,7 @@ impl GpuSceneInstance {
         v: &serde_json::Value,
         c: &mut crate::engine::sim::script::ObjectChange,
     ) -> Option<()> {
-        use crate::engine::scene::{parse_value_bool, parse_value_f32, parse_value_vec3};
+        use crate::engine::model::scene::{parse_value_bool, parse_value_f32, parse_value_vec3};
         // `{"user": …, "value": X}` bindings resolve to their `value`.
         let v = v.get("value").unwrap_or(v);
         let vec3 = |v| parse_value_vec3(v).map(|a| a.map(|x| x as f32));
@@ -3987,13 +3987,14 @@ impl GpuSceneInstance {
             let len = self.draw_rank.len();
             self.draw_rank.extend((len..n).map(|i| i as f64));
         }
-        let obj: crate::engine::scene::SceneObject = match serde_json::from_value(config.clone()) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::warn!(target: "script", "createLayer: bad config: {e}");
-                return;
-            }
-        };
+        let obj: crate::engine::model::scene::SceneObject =
+            match serde_json::from_value(config.clone()) {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(target: "script", "createLayer: bad config: {e}");
+                    return;
+                }
+            };
         if obj.sound.is_some() {
             if let Some(playback) = start_scene_sound(&self.scene_dir, &obj) {
                 self.sounds.push(SceneSound {
@@ -6733,12 +6734,12 @@ fn build_timelines(
 /// transform graph use), then one instance per scripted property.
 fn build_script_host(
     dir: &Path,
-    scene: &crate::engine::scene::Scene,
+    scene: &crate::engine::model::scene::Scene,
     graph: &crate::engine::render::TransformGraph,
     canvas: [u32; 2],
     raw_scene: &serde_json::Value,
 ) -> crate::engine::sim::script::ScriptHost {
-    use crate::engine::scene::{parse_value_f32, parse_value_vec3};
+    use crate::engine::model::scene::{parse_value_f32, parse_value_vec3};
     use crate::engine::sim::script::{ObjectInit, ScriptHost};
 
     let mut host = ScriptHost::new();

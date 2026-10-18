@@ -140,12 +140,12 @@ fn wrap_limits_respect_their_gates() {
     let active = |o: &SceneObject| {
         o.maxwidth
             .as_ref()
-            .and_then(crate::engine::scene::parse_value_f32)
+            .and_then(crate::engine::model::scene::parse_value_f32)
             .filter(|w| *w > 0.0)
             .filter(|_| {
                 o.limitwidth
                     .as_ref()
-                    .and_then(crate::engine::scene::parse_value_bool)
+                    .and_then(crate::engine::model::scene::parse_value_bool)
                     .unwrap_or(false)
             })
             .is_some()

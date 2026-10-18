@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
+use wp_engine::engine::model::scene::Scene;
 use wp_engine::engine::properties::{parse_property_arg, SceneProperties};
-use wp_engine::engine::scene::Scene;
 use wp_engine::engine::sim::camera_dynamics::CameraDynamics;
 
 fn props_from_project(project: serde_json::Value, overrides: &[(&str, &str)]) -> SceneProperties {
