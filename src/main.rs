@@ -1183,7 +1183,7 @@ fn cmd_test_scene(id_or_path: &str, num_frames: usize) -> Result<()> {
     let (tx, rx) = sync_channel::<Arc<image::RgbaImage>>(2);
     let render_dir = dir.clone();
     let handle = std::thread::spawn(move || {
-        if let Err(e) = engine::gpu_renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
+        if let Err(e) = engine::gpu::renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
             tracing::error!(target: "render", "gpu scene error: {e}");
         }
     });
@@ -1286,7 +1286,7 @@ fn cmd_preview_scene(id_or_path: &str, width: u32, height: u32) -> Result<()> {
     let (tx, rx) = sync_channel::<Arc<image::RgbaImage>>(2);
     let render_dir = dir.clone();
     let handle = std::thread::spawn(move || {
-        if let Err(e) = engine::gpu_renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
+        if let Err(e) = engine::gpu::renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
             tracing::error!(target: "render", "gpu scene error: {e}");
         }
     });
