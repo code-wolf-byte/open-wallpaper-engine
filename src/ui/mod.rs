@@ -5,12 +5,33 @@
 //! and an "Open Wallpaper" / OK / Cancel footer. As in WE, clicking a
 //! wallpaper applies it to the chosen display straight away; Cancel puts
 //! back what was showing (and saved) when the window opened.
+//!
+//! This file holds the app state, the frame loop and shared helpers; each
+//! part of the window has its own file: `browse` (tabs, search, filters,
+//! grid), `details` with `properties`, `playlist`, `displays`, `footer`,
+//! `settings_window`, plus `apply` (showing and reverting wallpapers) and
+//! `thumbnails`.
 
+use crate::content::RenderSettings;
 use crate::platform::{RenderQuality, WallpaperHandle};
-use crate::render::RenderSettings;
 use crate::workshop::{self, Wallpaper, WallpaperType};
+mod apply;
+use apply::*;
+
+mod thumbnails;
+
+mod browse;
+
+mod details;
+
+mod playlist;
+
+mod displays;
+
+mod footer;
+
 #[cfg(not(target_os = "linux"))]
-use crate::{platform::display::detect_platform, render::WallpaperContent};
+use crate::{content::WallpaperContent, platform::display::detect_platform};
 use egui::{pos2, vec2, Align, Color32, CornerRadius, FontId, Layout, Rect, Sense, Stroke};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -18,7 +39,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-mod config;
+mod properties;
+mod settings_window;
 
 // ── Layout ────────────────────────────────────────────────────────────────────
 
@@ -116,15 +138,15 @@ pub struct WpApp {
     pending_apply: Option<mpsc::Receiver<ApplyResult>>,
     /// Cached speaker list for the audio picker, built on first use —
     /// enumerating shells out to `pactl`, so not every frame.
-    audio_devices: Option<Vec<crate::platform::audio::CaptureOption>>,
+    audio_devices: Option<Vec<crate::services::audio_devices::CaptureOption>>,
     /// Index into `audio_devices`; 0 is "Automatic".
     audio_choice: usize,
 
     /// `settings.json`, edited by the property editor and settings window.
     saved: crate::settings::WpSettings,
-    prop_editor: Option<config::PropertyEditor>,
+    prop_editor: Option<properties::PropertyEditor>,
     show_settings: bool,
-    settings_tab: config::SettingsTab,
+    settings_tab: settings_window::SettingsTab,
     show_displays: bool,
     /// The display clicking a wallpaper applies to; `None` = all of them.
     target_screen: Option<String>,
@@ -138,45 +160,6 @@ pub struct WpApp {
 
 /// `None` handle when the daemon owns the renderer.
 type ApplyResult = Result<(Option<WallpaperHandle>, String), String>;
-
-/// A worker thread that forwards live setting changes to the daemon, so a
-/// dragged slider never blocks the UI on the socket (or on an apply the
-/// daemon is still busy with). Changes are dropped when no daemon runs:
-/// the next apply carries the current values anyway.
-#[cfg(target_os = "linux")]
-struct DaemonLink {
-    tx: mpsc::Sender<crate::daemon::Request>,
-}
-
-#[cfg(target_os = "linux")]
-impl DaemonLink {
-    fn new() -> Self {
-        use crate::daemon::{self, Request};
-        let (tx, rx) = mpsc::channel::<Request>();
-        std::thread::spawn(move || {
-            while let Ok(first) = rx.recv() {
-                // Coalesce a burst (slider drag) down to the latest of each kind.
-                let mut latest = HashMap::new();
-                for req in std::iter::once(first).chain(rx.try_iter()) {
-                    latest.insert(std::mem::discriminant(&req), req);
-                }
-                if !daemon::is_running() {
-                    continue;
-                }
-                for req in latest.into_values() {
-                    if let Err(e) = daemon::request(&req) {
-                        tracing::warn!(target: "app", "daemon update failed: {e:#}");
-                    }
-                }
-            }
-        });
-        Self { tx }
-    }
-
-    fn send(&self, req: crate::daemon::Request) {
-        let _ = self.tx.send(req);
-    }
-}
 
 /// The filter panel's unticked boxes; a wallpaper shows unless it is
 /// excluded by type or rating, or every one of its tags is unticked.
@@ -315,7 +298,7 @@ impl WpApp {
             close_after_apply: false,
             status,
             settings: Arc::new(Mutex::new(RenderSettings {
-                fps: saved.fps.unwrap_or(crate::render::settings::DEFAULT_FPS),
+                fps: saved.fps.unwrap_or(crate::content::settings::DEFAULT_FPS),
                 scaling: saved.scaling.unwrap_or_default(),
                 ..Default::default()
             })),
@@ -325,7 +308,7 @@ impl WpApp {
             saved,
             prop_editor: None,
             show_settings: false,
-            settings_tab: config::SettingsTab::Performance,
+            settings_tab: settings_window::SettingsTab::Performance,
             show_displays: false,
             target_screen: None,
             outputs: None,
@@ -339,323 +322,9 @@ impl WpApp {
 
     // ── Filter helpers ────────────────────────────────────────────────────────
 
-    fn rebuild_filter(&mut self) {
-        let q = self.search.to_lowercase();
-        let mut shown: Vec<usize> = (0..self.wallpapers.len())
-            .filter(|&i| {
-                let w = &self.wallpapers[i];
-                let text_ok = q.is_empty()
-                    || w.title().to_lowercase().contains(&q)
-                    || w.project
-                        .tags
-                        .iter()
-                        .flatten()
-                        .any(|t| t.to_lowercase() == q);
-                text_ok && self.filters.matches(w)
-            })
-            .collect();
-        let title = |i: &usize| self.wallpapers[*i].title().to_lowercase();
-        match self.sort {
-            SortKey::Name => shown.sort_by_cached_key(title),
-            SortKey::Type => shown.sort_by_cached_key(|i| {
-                (type_name(self.wallpapers[*i].wallpaper_type()), title(i))
-            }),
-            // Newest first, like WE.
-            SortKey::Installed => shown.sort_by_key(|&i| std::cmp::Reverse(self.installed[i])),
-        }
-        if self.descending {
-            shown.reverse();
-        }
-        self.filtered = shown;
-    }
-
     // ── Thumbnail loading ─────────────────────────────────────────────────────
 
-    fn enqueue_thumb(&mut self, idx: usize) {
-        let id = &self.wallpapers[idx].workshop_id;
-        if !self.thumbnails.contains_key(id) && !self.thumb_queue.contains(&idx) {
-            self.thumb_queue.push(idx);
-        }
-    }
-
-    fn flush_thumb_queue(&mut self, ctx: &egui::Context) {
-        // Load at most 4 thumbnails per frame to keep frame times smooth
-        let batch: Vec<usize> = self
-            .thumb_queue
-            .drain(..self.thumb_queue.len().min(4))
-            .collect();
-        for idx in batch {
-            self.load_thumb(idx, ctx);
-        }
-    }
-
-    fn load_thumb(&mut self, idx: usize, ctx: &egui::Context) {
-        let w = &self.wallpapers[idx];
-        let key = w.workshop_id.clone();
-        if self.thumbnails.contains_key(&key) {
-            return;
-        }
-
-        // Try preview file first, then look for any image in the directory
-        let path = w.preview_file().or_else(|| {
-            std::fs::read_dir(&w.path).ok()?.find_map(|e| {
-                let p = e.ok()?.path();
-                let ext = p.extension()?.to_str()?.to_lowercase();
-                matches!(ext.as_str(), "jpg" | "jpeg" | "png").then_some(p)
-            })
-        });
-
-        if let Some(p) = path {
-            if let Ok(img) = image::open(&p) {
-                // Square tiles, centre-cropped like WE's grid.
-                let img = img.into_rgba8();
-                let side = img.width().min(img.height());
-                let square = image::imageops::crop_imm(
-                    &img,
-                    (img.width() - side) / 2,
-                    (img.height() - side) / 2,
-                    side,
-                    side,
-                )
-                .to_image();
-                let thumb = image::imageops::thumbnail(&square, 256, 256);
-                let size = [thumb.width() as usize, thumb.height() as usize];
-                let ci = egui::ColorImage::from_rgba_unmultiplied(size, &thumb.into_raw());
-                let handle = ctx.load_texture(&key, ci, egui::TextureOptions::LINEAR);
-                self.thumbnails.insert(key, handle);
-            }
-        }
-    }
-
     // ── Wallpaper application ─────────────────────────────────────────────────
-
-    /// Show a file or folder that isn't a Workshop item on every display.
-    fn apply_path(&mut self, path: PathBuf, display_title: String) {
-        let properties = self.saved.property_overrides(&path.to_string_lossy());
-        #[cfg(target_os = "linux")]
-        self.apply_via_daemon(path, HashMap::new(), display_title, properties);
-        #[cfg(not(target_os = "linux"))]
-        match WallpaperContent::from_path(&path) {
-            Err(e) => self.status = StatusMsg::err(format!("Load failed: {e}")),
-            Ok(content) => self.apply_content(content, display_title, properties),
-        }
-    }
-
-    /// WE's click-to-apply: show wallpaper `idx` on the chosen display (or
-    /// all of them) and remember it, as `wp-engine config` would.
-    fn apply_wallpaper(&mut self, idx: usize) {
-        if let Err(reason) = can_apply(&self.wallpapers[idx]) {
-            self.status = StatusMsg::err(reason);
-            return;
-        }
-        let id = self.wallpapers[idx].workshop_id.clone();
-        match self.target_screen.clone() {
-            Some(screen) => {
-                self.saved.screens.insert(screen, id);
-            }
-            None => {
-                self.saved.default_background = Some(id);
-                self.saved.screens.clear();
-            }
-        }
-        self.save_settings();
-        let title = self.wallpapers[idx].title().to_string();
-        #[cfg(target_os = "linux")]
-        self.apply_saved(title, self.wallpapers[idx].path.clone());
-        #[cfg(not(target_os = "linux"))]
-        {
-            let properties = self
-                .saved
-                .property_overrides(&self.wallpapers[idx].path.to_string_lossy());
-            match WallpaperContent::from_wallpaper(&self.wallpapers[idx]) {
-                Err(e) => self.status = StatusMsg::err(e.to_string()),
-                Ok(content) => self.apply_content(content, title, properties),
-            }
-        }
-    }
-
-    /// Show the saved default and per-display wallpapers; `fallback` stands
-    /// in for a missing default.
-    #[cfg(target_os = "linux")]
-    fn apply_saved(&mut self, title: String, fallback: PathBuf) {
-        let path_of = |id: &str| {
-            self.wallpapers
-                .iter()
-                .find(|w| w.workshop_id == id)
-                .map(|w| w.path.clone())
-                .or_else(|| workshop::find_item_dir(id, None))
-        };
-        let background = self
-            .saved
-            .default_background
-            .as_deref()
-            .and_then(path_of)
-            .unwrap_or(fallback);
-        let screens = self
-            .saved
-            .screens
-            .iter()
-            .filter_map(|(screen, id)| Some((screen.clone(), path_of(id)?)))
-            .collect();
-        let properties = self.saved.property_overrides(&background.to_string_lossy());
-        self.apply_via_daemon(background, screens, title, properties);
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn apply_content(
-        &mut self,
-        content: WallpaperContent,
-        display_title: String,
-        properties: HashMap<String, String>,
-    ) {
-        crate::engine::properties::set_global_overrides(properties);
-        let old_renderer = self.renderer.take();
-        let settings = Arc::clone(&self.settings);
-        let (tx, rx) = mpsc::channel();
-
-        std::thread::spawn(move || {
-            if let Some(old) = old_renderer {
-                old.stop();
-            }
-            let result = detect_platform()
-                .spawn_wallpaper(
-                    crate::render::ScreenContent::single(content),
-                    crate::render::ScreenSettings::single(settings),
-                )
-                .map(|handle| (Some(handle), display_title.clone()))
-                .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(result);
-        });
-
-        self.pending_apply = Some(rx);
-        self.status = StatusMsg::ok("Applying...");
-    }
-
-    /// Hand the wallpaper to the background daemon (starting it if needed),
-    /// so it keeps running after this window closes.
-    #[cfg(target_os = "linux")]
-    fn apply_via_daemon(
-        &mut self,
-        path: PathBuf,
-        screens: HashMap<String, PathBuf>,
-        display_title: String,
-        properties: HashMap<String, String>,
-    ) {
-        use crate::daemon::{self, ApplySpec, Request};
-        let spec = {
-            let s = self.settings.lock().unwrap();
-            ApplySpec {
-                background: path,
-                screens,
-                properties,
-                quality: Some(s.quality.label().to_string()),
-                volume: Some(s.volume),
-                title: Some(display_title.clone()),
-                ..Default::default()
-            }
-        };
-        let (tx, rx) = mpsc::channel();
-
-        std::thread::spawn(move || {
-            let device = crate::platform::audio::preferred_device();
-            let result = daemon::request_or_spawn(&Request::SetAudioDevice { device })
-                .and_then(|_| daemon::request(&Request::Apply(spec)))
-                .map(|_| (None, display_title))
-                .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(result);
-        });
-
-        self.pending_apply = Some(rx);
-        self.status = StatusMsg::ok("Applying...");
-    }
-
-    /// Remove the wallpaper the daemon is showing (the daemon stays up).
-    #[cfg(target_os = "linux")]
-    fn clear_wallpaper(&mut self) {
-        std::thread::spawn(|| {
-            if let Err(e) = crate::daemon::request(&crate::daemon::Request::Clear) {
-                tracing::warn!(target: "app", "clearing wallpaper failed: {e:#}");
-            }
-        });
-        self.active_title = None;
-        self.status = StatusMsg::ok("Wallpaper removed");
-    }
-
-    /// WE's Cancel: restore the settings and wallpaper from when the window
-    /// opened, then close.
-    fn cancel(&mut self, ctx: &egui::Context) {
-        if self.saved == self.initial_saved {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-        self.saved = self.initial_saved.clone();
-        self.save_settings();
-        #[cfg(target_os = "linux")]
-        match self.initial.clone() {
-            Some((path, title)) => {
-                self.apply_saved(title, path);
-                self.close_after_apply = true;
-                return;
-            }
-            None => self.clear_wallpaper(),
-        }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-    }
-
-    #[cfg(target_os = "linux")]
-    fn poll_initial_status(&mut self) {
-        let Some(rx) = &self.initial_status else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(status) => {
-                if let Some(active) = status.active {
-                    let title = active
-                        .title
-                        .unwrap_or_else(|| active.background.display().to_string());
-                    self.active_title = Some(title.clone());
-                    self.initial = Some((active.background, title));
-                    if let Some(q) = RenderQuality::parse(&active.quality) {
-                        self.settings.lock().unwrap().quality = q;
-                    }
-                }
-                self.initial_status = None;
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => self.initial_status = None,
-        }
-    }
-
-    fn poll_pending_apply(&mut self, ctx: &egui::Context) {
-        let Some(rx) = &self.pending_apply else {
-            return;
-        };
-        let done = match rx.try_recv() {
-            Ok(Ok((handle, title))) => {
-                if let Some(handle) = handle {
-                    self.renderer = Some(handle);
-                }
-                self.active_title = Some(title.clone());
-                self.status = StatusMsg::ok(format!("Applied \"{title}\""));
-                true
-            }
-            Ok(Err(e)) => {
-                self.status = StatusMsg::err(e);
-                true
-            }
-            Err(mpsc::TryRecvError::Empty) => false,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.status = StatusMsg::err("Apply thread crashed");
-                true
-            }
-        };
-        if done {
-            self.pending_apply = None;
-            if self.close_after_apply {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        }
-    }
 
     /// Workshop item path for `id`, for the displays dialog and playlist.
     fn index_of(&self, id: &str) -> Option<usize> {
@@ -721,798 +390,15 @@ impl eframe::App for WpApp {
 // ── Panels ────────────────────────────────────────────────────────────────────
 
 impl WpApp {
-    /// Source tabs with Displays/Settings, then search, filter and sort.
-    fn render_header(&mut self, ui: &mut egui::Ui, skin: Skin) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            for (label, active) in [
-                ("Installed", true),
-                ("Discover", false),
-                ("Workshop", false),
-            ] {
-                if source_tab(ui, label, active, skin).clicked() && !active {
-                    open_external(WORKSHOP_URL);
-                }
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                if ui.button("⚙ Settings").clicked() {
-                    self.show_settings = !self.show_settings;
-                    // `wp-engine config` may have changed it meanwhile.
-                    self.saved = crate::settings::WpSettings::load();
-                    self.autostart = crate::settings::autostart_enabled();
-                }
-                let display = self.target_screen.as_deref().unwrap_or("All displays");
-                if ui
-                    .button(format!("🖵 Displays: {display}"))
-                    .on_hover_text("Choose the display clicked wallpapers go to")
-                    .clicked()
-                {
-                    self.show_displays = true;
-                }
-            });
-        });
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.search)
-                    .desired_width(260.0)
-                    .hint_text("🔍 Search"),
-            );
-            let mut changed = r.changed();
-            let filter_btn = egui::Button::new("☰ Filter results")
-                .selected(self.show_filter || self.filters.is_active());
-            if ui.add(filter_btn).clicked() {
-                self.show_filter = !self.show_filter;
-            }
-            if self.filtered.len() != self.wallpapers.len() {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "({} of {})",
-                        self.filtered.len(),
-                        self.wallpapers.len()
-                    ))
-                    .color(TEXT_MUTED),
-                );
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let arrow = if self.descending { "⬇" } else { "⬆" };
-                if ui.button(arrow).on_hover_text("Sort direction").clicked() {
-                    self.descending = !self.descending;
-                    changed = true;
-                }
-                egui::ComboBox::from_id_salt("sort")
-                    .selected_text(self.sort.label())
-                    .width(140.0)
-                    .show_ui(ui, |ui| {
-                        for key in SortKey::ALL {
-                            changed |= ui
-                                .selectable_value(&mut self.sort, key, key.label())
-                                .changed();
-                        }
-                    });
-            });
-            if changed {
-                self.rebuild_filter();
-            }
-        });
-    }
-
-    /// WE's "Filter results" panel: type, age rating and tags.
-    fn render_filters(&mut self, ui: &mut egui::Ui) {
-        let mut changed = false;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if ui.button("Reset Filters").clicked() {
-                self.filters = Filters::default();
-                changed = true;
-            }
-            ui.add_space(6.0);
-            ui.strong("Type");
-            for t in TYPES {
-                changed |= filter_box(ui, &mut self.filters.hidden_types, t, t);
-            }
-            ui.add_space(6.0);
-            ui.strong("Age rating");
-            for r in AGE_RATINGS {
-                changed |= filter_box(ui, &mut self.filters.hidden_ratings, r, r);
-            }
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.strong("Tags");
-                if ui.small_button("All").clicked() {
-                    self.filters.hidden_tags.clear();
-                    changed = true;
-                }
-                if ui.small_button("None").clicked() {
-                    self.filters.hidden_tags = self.all_tags.iter().cloned().collect();
-                    changed = true;
-                }
-            });
-            for tag in self.all_tags.clone() {
-                changed |= filter_box(ui, &mut self.filters.hidden_tags, tag.clone(), &tag);
-            }
-        });
-        if changed {
-            self.rebuild_filter();
-        }
-    }
-
-    fn render_grid(&mut self, ui: &mut egui::Ui, skin: Skin) {
-        if self.wallpapers.is_empty() {
-            ui.vertical_centered(|ui| {
-                ui.add_space(80.0);
-                ui.label(
-                    egui::RichText::new("No Workshop wallpapers found")
-                        .size(18.0)
-                        .color(TEXT_MUTED),
-                );
-                ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Install Wallpaper Engine on Steam and subscribe to wallpapers,\n\
-                         or use \"Open Wallpaper\" below to show any file.",
-                    )
-                    .color(TEXT_MUTED),
-                );
-            });
-            return;
-        }
-        if self.filtered.is_empty() {
-            ui.vertical_centered(|ui| {
-                ui.add_space(95.0);
-                ui.label(
-                    egui::RichText::new(
-                        "No wallpapers found for your search.\nExpand or reset the filters.",
-                    )
-                    .size(18.0)
-                    .color(TEXT_MUTED),
-                );
-            });
-            return;
-        }
-
-        // As many columns as fit at up to `TILE`, stretched to fill the row.
-        let width = ui.available_width();
-        let cols = (((width + TILE_GAP) / (TILE + TILE_GAP)).ceil() as usize).max(1);
-        let tile = (width - TILE_GAP * (cols - 1) as f32) / cols as f32;
-        let rows = self.filtered.len().div_ceil(cols);
-        let filtered = self.filtered.clone();
-        egui::ScrollArea::vertical().auto_shrink(false).show_rows(
-            ui,
-            tile + TILE_GAP,
-            rows,
-            |ui, range| {
-                for row in range {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = TILE_GAP;
-                        for &idx in filtered.iter().skip(row * cols).take(cols) {
-                            self.grid_tile(ui, idx, tile, skin);
-                        }
-                    });
-                    ui.add_space(TILE_GAP);
-                }
-            },
-        );
-    }
-
-    fn grid_tile(&mut self, ui: &mut egui::Ui, idx: usize, size: f32, skin: Skin) {
-        let id = self.wallpapers[idx].workshop_id.clone();
-        let thumb = self.thumbnails.get(&id).cloned();
-        if thumb.is_none() {
-            self.enqueue_thumb(idx);
-        }
-        let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
-        if ui.is_rect_visible(rect) {
-            draw_tile(
-                ui,
-                rect,
-                &resp,
-                &self.wallpapers[idx],
-                thumb.as_ref(),
-                self.selected == Some(idx),
-                skin,
-            );
-        }
-        let in_playlist = self.playlist_items().contains(&id);
-        resp.context_menu(|ui| {
-            let label = if in_playlist {
-                "Remove from playlist"
-            } else {
-                "Add to playlist"
-            };
-            if ui.button(label).clicked() {
-                self.toggle_in_playlist(&id);
-                ui.close();
-            }
-            if id.bytes().all(|b| b.is_ascii_digit()) && ui.button("Open Workshop page").clicked() {
-                open_external(&workshop_item_url(&id));
-                ui.close();
-            }
-            if ui.button("Open folder").clicked() {
-                open_external(&self.wallpapers[idx].path.to_string_lossy());
-                ui.close();
-            }
-        });
-        if resp.clicked() {
-            self.selected = Some(idx);
-            self.apply_wallpaper(idx);
-        }
-    }
-
-    /// The right-hand column: preview, info, actions and properties.
-    fn render_details_panel(&mut self, ctx: &egui::Context, skin: Skin) {
-        egui::SidePanel::right("details")
-            .exact_width(DETAILS_W)
-            .resizable(false)
-            .frame(
-                egui::Frame::default()
-                    .fill(skin.panel)
-                    .inner_margin(egui::Margin::same(14)),
-            )
-            .show(ctx, |ui| match self.selected {
-                Some(idx) => self.render_details(ui, idx, skin),
-                None => {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(100.0);
-                        ui.label(
-                            egui::RichText::new("Please select a wallpaper")
-                                .size(16.0)
-                                .color(TEXT_MUTED),
-                        );
-                    });
-                }
-            });
-    }
-
-    fn render_details(&mut self, ui: &mut egui::Ui, idx: usize, skin: Skin) {
-        let w = &self.wallpapers[idx];
-        let title = w.title().to_string();
-        let wtype = w.wallpaper_type().clone();
-        let tags = w.project.tags.clone().unwrap_or_default();
-        let rating = age_rating(w);
-        let id = w.workshop_id.clone();
-        let path = w.path.clone();
-        let blocker = can_apply(w).err();
-        let thumb = self.thumbnails.get(&id).cloned();
-        if thumb.is_none() {
-            self.enqueue_thumb(idx);
-        }
-
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            // Preview, square like the thumbnails it comes from.
-            let side = ui.available_width().min(260.0);
-            ui.vertical_centered(|ui| {
-                let (rect, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
-                let p = ui.painter_at(rect);
-                p.rect_filled(rect, CornerRadius::same(4), skin.tile);
-                match &thumb {
-                    Some(tex) => {
-                        p.image(tex.id(), rect, full_uv(), Color32::WHITE);
-                    }
-                    None => {
-                        p.text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "No preview",
-                            FontId::proportional(13.0),
-                            TEXT_MUTED,
-                        );
-                    }
-                }
-            });
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new(&title).size(18.0).color(skin.text));
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                pill(ui, type_name(&wtype), type_color(&wtype), Color32::WHITE);
-                pill(ui, rating, skin.pill, skin.text);
-                for tag in &tags {
-                    pill(ui, tag, skin.pill, skin.text);
-                }
-            });
-            if let Some(reason) = blocker {
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new(reason).color(DANGER));
-            }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if id.bytes().all(|b| b.is_ascii_digit()) && ui.button("🌐 Workshop page").clicked()
-                {
-                    open_external(&workshop_item_url(&id));
-                }
-                if ui.button("📂 Open folder").clicked() {
-                    open_external(&path.to_string_lossy());
-                }
-                let in_playlist = self.playlist_items().contains(&id);
-                let label = if in_playlist {
-                    "➖ Playlist"
-                } else {
-                    "➕ Playlist"
-                };
-                if ui.button(label).clicked() {
-                    self.toggle_in_playlist(&id);
-                }
-            });
-            ui.add_space(10.0);
-            self.render_properties(ui, idx);
-        });
-    }
-
-    /// Under the grid: the playlist for the chosen display, as in WE.
-    fn render_playlist_bar(&mut self, ui: &mut egui::Ui, skin: Skin) {
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.strong("Playlist");
-            ui.menu_button(format!("📋 {}", self.playlist), |ui| {
-                let names: Vec<String> = self.saved.playlists.keys().cloned().collect();
-                for name in names {
-                    if ui.selectable_label(name == self.playlist, &name).clicked() {
-                        self.playlist = name;
-                        ui.close();
-                    }
-                }
-                ui.separator();
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.new_playlist)
-                        .hint_text("New playlist…")
-                        .desired_width(140.0),
-                );
-                let name = self.new_playlist.trim().to_string();
-                if ui
-                    .add_enabled(!name.is_empty(), egui::Button::new("Save current as"))
-                    .clicked()
-                {
-                    let copy = self
-                        .saved
-                        .playlists
-                        .get(&self.playlist)
-                        .cloned()
-                        .unwrap_or_else(config::empty_playlist);
-                    self.saved.playlists.insert(name.clone(), copy);
-                    self.playlist = name;
-                    self.new_playlist.clear();
-                    self.save_settings();
-                    ui.close();
-                }
-            });
-            let has_items = !self.playlist_items().is_empty();
-            ui.add_enabled_ui(has_items, |ui| {
-                ui.menu_button("Configure", |ui| self.playlist_config(ui));
-                #[cfg(target_os = "linux")]
-                {
-                    use crate::daemon::Request;
-                    if ui.button("▶ Play").clicked() {
-                        self.daemon_request(Request::PlayPlaylist {
-                            name: self.playlist.clone(),
-                        });
-                        self.active_title = Some(format!("playlist '{}'", self.playlist));
-                    }
-                    if ui.button("⏭").on_hover_text("Next").clicked() {
-                        self.daemon_request(Request::NextItem);
-                    }
-                    if ui.button("■").on_hover_text("Stop rotating").clicked() {
-                        self.daemon_request(Request::StopPlaylist);
-                    }
-                }
-                if ui.button("Clear").clicked() {
-                    if let Some(p) = self.saved.playlists.get_mut(&self.playlist) {
-                        p.items.clear();
-                        p.times.clear();
-                    }
-                    self.save_settings();
-                }
-            });
-            if let Some(idx) = self.selected {
-                let id = self.wallpapers[idx].workshop_id.clone();
-                let label = if self.playlist_items().contains(&id) {
-                    "Remove wallpaper"
-                } else {
-                    "Add wallpaper"
-                };
-                if ui.button(label).clicked() {
-                    self.toggle_in_playlist(&id);
-                }
-            }
-        });
-        let items = self.playlist_items();
-        if items.is_empty() {
-            ui.label(
-                egui::RichText::new(
-                    "Right-click a wallpaper or use \"Add wallpaper\" to build a playlist.",
-                )
-                .size(11.0)
-                .color(TEXT_MUTED),
-            );
-            return;
-        }
-        egui::ScrollArea::horizontal().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for id in items {
-                    let idx = self.index_of(&id);
-                    if let Some(idx) = idx {
-                        self.enqueue_thumb(idx);
-                    }
-                    let (rect, resp) = ui
-                        .allocate_exact_size(vec2(PLAYLIST_THUMB, PLAYLIST_THUMB), Sense::click());
-                    let p = ui.painter_at(rect);
-                    p.rect_filled(rect, CornerRadius::same(3), skin.tile);
-                    if let Some(tex) = self.thumbnails.get(&id) {
-                        p.image(tex.id(), rect, full_uv(), Color32::WHITE);
-                    }
-                    if idx.is_some() && idx == self.selected {
-                        p.rect_stroke(
-                            rect,
-                            CornerRadius::same(3),
-                            Stroke::new(2.0, skin.accent),
-                            egui::StrokeKind::Inside,
-                        );
-                    }
-                    let resp = resp.on_hover_text(self.title_of(&id));
-                    if resp.clicked() {
-                        self.selected = idx;
-                    }
-                }
-            });
-        });
-    }
-
-    /// Open file/folder on the left, what's showing in the middle, OK and
-    /// Cancel on the right.
-    fn render_footer(&mut self, ctx: &egui::Context, skin: Skin) {
-        egui::TopBottomPanel::bottom("footer")
-            .frame(
-                egui::Frame::default()
-                    .fill(skin.panel)
-                    .inner_margin(egui::Margin::symmetric(12, 8)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.menu_button("📂 Open Wallpaper", |ui| {
-                        if ui
-                            .button("Open offline wallpaper (scene folder)…")
-                            .clicked()
-                        {
-                            ui.close();
-                            if let Some(p) = config::pick_path(true) {
-                                self.open_path(PathBuf::from(p));
-                            }
-                        }
-                        if ui.button("Open video, image or web page…").clicked() {
-                            ui.close();
-                            if let Some(p) = config::pick_path(false) {
-                                self.open_path(PathBuf::from(p));
-                            }
-                        }
-                    });
-                    ui.separator();
-                    if let Some(title) = self.active_title.clone() {
-                        ui.label(egui::RichText::new(format!("▶ {title}")).color(skin.accent));
-                        #[cfg(target_os = "linux")]
-                        if ui.small_button("■ Remove").clicked() {
-                            self.clear_wallpaper();
-                        }
-                    }
-                    let color = if self.status.error {
-                        DANGER
-                    } else {
-                        TEXT_MUTED
-                    };
-                    ui.label(egui::RichText::new(&self.status.text).color(color));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Cancel").clicked() {
-                            self.cancel(ctx);
-                        }
-                        let ok = egui::Button::new(
-                            egui::RichText::new("   OK   ").color(Color32::WHITE),
-                        )
-                        .fill(skin.accent);
-                        if ui.add(ok).clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    });
-                });
-            });
-    }
-
-    fn open_path(&mut self, path: PathBuf) {
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        self.apply_path(path, name);
-    }
-
-    /// WE's "Choose Display": where clicked wallpapers go, the multi-monitor
-    /// layout, and what each display shows.
-    fn render_displays(&mut self, ctx: &egui::Context, skin: Skin) {
-        if !self.show_displays {
-            return;
-        }
-        let outputs = self
-            .outputs
-            .get_or_insert_with(crate::platform::display::output_names)
-            .clone();
-        let modal = egui::Modal::new(egui::Id::new("displays")).show(ctx, |ui| {
-            ui.set_width(560.0);
-            ui.heading("Choose Display");
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                let all = self.saved.default_background.clone();
-                self.display_box(ui, None, "All displays", all, skin);
-                for out in &outputs {
-                    let shown = self
-                        .saved
-                        .screens
-                        .get(out)
-                        .or(self.saved.default_background.as_ref())
-                        .cloned();
-                    self.display_box(ui, Some(out.clone()), out, shown, skin);
-                }
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label("Several displays:");
-                let mut layout = self.saved.layout.unwrap_or_default();
-                let before = layout;
-                for (l, text) in [
-                    (crate::render::ScreenLayout::PerScreen, "Separate"),
-                    (crate::render::ScreenLayout::Span, "Stretch"),
-                    (crate::render::ScreenLayout::Clone, "Clone"),
-                ] {
-                    ui.selectable_value(&mut layout, l, text);
-                }
-                if layout != before {
-                    self.saved.layout = Some(layout);
-                    self.save_settings();
-                    #[cfg(target_os = "linux")]
-                    if let Some(id) = self.saved.default_background.clone() {
-                        let fallback = self
-                            .index_of(&id)
-                            .map(|i| self.wallpapers[i].path.clone())
-                            .unwrap_or_default();
-                        self.apply_saved(self.title_of(&id), fallback);
-                    }
-                }
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .add(egui::Button::new(
-                        egui::RichText::new("Remove Wallpaper").color(DANGER),
-                    ))
-                    .clicked()
-                {
-                    match self.target_screen.clone() {
-                        Some(screen) => {
-                            self.saved.screens.remove(&screen);
-                        }
-                        None => {
-                            self.saved.default_background = None;
-                            self.saved.screens.clear();
-                            #[cfg(target_os = "linux")]
-                            self.clear_wallpaper();
-                        }
-                    }
-                    self.save_settings();
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Close").clicked() {
-                        ui.close();
-                    }
-                });
-            });
-        });
-        if modal.should_close() {
-            self.show_displays = false;
-        }
-    }
-
-    /// One display in the "Choose Display" dialog; click to target it.
-    fn display_box(
-        &mut self,
-        ui: &mut egui::Ui,
-        screen: Option<String>,
-        name: &str,
-        shown: Option<String>,
-        skin: Skin,
-    ) {
-        let (rect, resp) = ui.allocate_exact_size(vec2(170.0, 120.0), Sense::click());
-        let p = ui.painter_at(rect);
-        let screen_rect = Rect::from_min_size(rect.min, vec2(170.0, 96.0));
-        p.rect_filled(screen_rect, CornerRadius::same(4), skin.tile);
-        if let Some(idx) = shown.as_deref().and_then(|id| self.index_of(id)) {
-            self.enqueue_thumb(idx);
-            if let Some(tex) = self.thumbnails.get(&self.wallpapers[idx].workshop_id) {
-                // The square thumbnail, cropped to the screen's 16:9.
-                let uv = Rect::from_min_max(pos2(0.0, 0.22), pos2(1.0, 0.78));
-                p.image(tex.id(), screen_rect, uv, Color32::WHITE);
-            }
-        }
-        let selected = self.target_screen == screen;
-        p.rect_stroke(
-            screen_rect,
-            CornerRadius::same(4),
-            Stroke::new(
-                if selected { 3.0 } else { 1.0 },
-                if selected { skin.accent } else { TEXT_MUTED },
-            ),
-            egui::StrokeKind::Inside,
-        );
-        p.text(
-            pos2(rect.center().x, rect.bottom() - 10.0),
-            egui::Align2::CENTER_CENTER,
-            name,
-            FontId::proportional(13.0),
-            skin.text,
-        );
-        if resp.clicked() {
-            self.target_screen = screen;
-        }
-    }
-
     // ── Playlist helpers ──────────────────────────────────────────────────────
-
-    fn playlist_items(&self) -> Vec<String> {
-        self.saved
-            .playlists
-            .get(&self.playlist)
-            .map(|p| p.items.clone())
-            .unwrap_or_default()
-    }
-
-    fn toggle_in_playlist(&mut self, id: &str) {
-        let p = self
-            .saved
-            .playlists
-            .entry(self.playlist.clone())
-            .or_insert_with(config::empty_playlist);
-        match p.items.iter().position(|i| i == id) {
-            Some(i) => {
-                p.items.remove(i);
-                if p.times.len() > i {
-                    p.times.remove(i);
-                }
-            }
-            None => p.items.push(id.to_string()),
-        }
-        self.save_settings();
-    }
 }
 
 // ── Drawing ───────────────────────────────────────────────────────────────────
-
-fn source_tab(ui: &mut egui::Ui, label: &str, active: bool, skin: Skin) -> egui::Response {
-    let (fill, text) = if active {
-        (skin.accent, Color32::WHITE)
-    } else {
-        (skin.panel, skin.text)
-    };
-    ui.add(
-        egui::Button::new(egui::RichText::new(label).size(15.0).color(text))
-            .fill(fill)
-            .stroke(Stroke::new(1.0, skin.accent))
-            .corner_radius(CornerRadius {
-                nw: 3,
-                ne: 3,
-                sw: 0,
-                se: 0,
-            })
-            .min_size(vec2(96.0, 28.0)),
-    )
-}
-
-/// A ticked-by-default filter checkbox backed by a set of unticked keys.
-fn filter_box<K: std::hash::Hash + Eq>(
-    ui: &mut egui::Ui,
-    hidden: &mut HashSet<K>,
-    key: K,
-    text: &str,
-) -> bool {
-    let mut on = !hidden.contains(&key);
-    if !ui.checkbox(&mut on, text).changed() {
-        return false;
-    }
-    if on {
-        hidden.remove(&key);
-    } else {
-        hidden.insert(key);
-    }
-    true
-}
-
-fn pill(ui: &mut egui::Ui, text: &str, fill: Color32, color: Color32) {
-    egui::Frame::default()
-        .fill(fill)
-        .corner_radius(CornerRadius::same(12))
-        .inner_margin(egui::Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(text).size(12.0).color(color));
-        });
-}
-
-fn draw_tile(
-    ui: &egui::Ui,
-    rect: Rect,
-    resp: &egui::Response,
-    w: &Wallpaper,
-    thumb: Option<&egui::TextureHandle>,
-    selected: bool,
-    skin: Skin,
-) {
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, CornerRadius::same(2), skin.tile);
-    match thumb {
-        Some(tex) => {
-            painter.image(tex.id(), rect, full_uv(), Color32::WHITE);
-        }
-        None => {
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "⏳",
-                FontId::proportional(22.0),
-                TEXT_MUTED,
-            );
-        }
-    }
-    if resp.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(2), Color32::from_white_alpha(24));
-    }
-
-    // Title over a dark band along the bottom, as in WE's grid.
-    let band = Rect::from_min_max(pos2(rect.min.x, rect.max.y - 24.0), rect.max);
-    painter.rect_filled(band, CornerRadius::ZERO, Color32::from_black_alpha(170));
-    let mut job = egui::text::LayoutJob::simple_singleline(
-        w.title().to_string(),
-        FontId::proportional(12.0),
-        Color32::WHITE,
-    );
-    job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() - 10.0);
-    painter.galley(
-        pos2(band.min.x + 5.0, band.min.y + 5.0),
-        painter.layout_job(job),
-        Color32::WHITE,
-    );
-
-    // Type marker in the top corner for everything that isn't a scene.
-    if !matches!(w.wallpaper_type(), WallpaperType::Scene) {
-        let label = type_name(w.wallpaper_type()).to_uppercase();
-        let galley = painter.layout_no_wrap(label, FontId::proportional(9.0), Color32::WHITE);
-        let size = galley.size() + vec2(8.0, 4.0);
-        let badge = Rect::from_min_size(pos2(rect.max.x - size.x - 4.0, rect.min.y + 4.0), size);
-        painter.rect_filled(badge, CornerRadius::same(3), type_color(w.wallpaper_type()));
-        painter.galley(badge.min + vec2(4.0, 2.0), galley, Color32::WHITE);
-    }
-
-    if selected {
-        painter.rect_stroke(
-            rect,
-            CornerRadius::same(2),
-            Stroke::new(3.0, skin.accent),
-            egui::StrokeKind::Inside,
-        );
-    }
-}
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
 fn full_uv() -> Rect {
     Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0))
-}
-
-/// Why `w` can't be shown here, if it can't.
-fn can_apply(w: &Wallpaper) -> Result<(), &'static str> {
-    let file_ok = || w.wallpaper_file().is_some_and(|p| p.exists());
-    match w.wallpaper_type() {
-        WallpaperType::Scene | WallpaperType::Preset => Ok(()),
-        WallpaperType::Application => Err("Application wallpapers only run on Windows"),
-        WallpaperType::Web if !crate::render::web::is_supported() => {
-            Err("Web wallpapers need a build with --features web")
-        }
-        _ if file_ok() => Ok(()),
-        _ => Err("The wallpaper's file is missing"),
-    }
 }
 
 fn age_rating(w: &Wallpaper) -> &'static str {
@@ -1565,6 +451,55 @@ fn truncate(s: &str, max: usize) -> &str {
         Some((i, _)) => &s[..i],
         None => s,
     }
+}
+
+impl WpApp {
+    pub(super) fn save_settings(&mut self) {
+        if let Err(e) = self.saved.save() {
+            self.status = StatusMsg::err(format!("Saving settings failed: {e:#}"));
+        }
+    }
+
+    /// Send a one-off request to the daemon, starting it if needed.
+    #[cfg(target_os = "linux")]
+    pub(super) fn daemon_request(&mut self, req: crate::daemon::Request) {
+        std::thread::spawn(move || {
+            if let Err(e) = crate::daemon::request_or_spawn(&req) {
+                tracing::warn!(target: "app", "daemon request failed: {e:#}");
+            }
+        });
+    }
+
+    pub(super) fn title_of(&self, id: &str) -> String {
+        self.wallpapers
+            .iter()
+            .find(|w| w.workshop_id == id)
+            .map(|w| w.title().to_string())
+            .unwrap_or_else(|| id.to_string())
+    }
+}
+
+/// Ask the desktop for a file or folder via zenity or kdialog.
+// ponytail: shells out instead of a file-dialog crate; use the XDG portal
+// (zbus is already a dependency) if neither tool is common enough.
+pub(super) fn pick_path(directory: bool) -> Option<String> {
+    let zenity: &[&str] = if directory {
+        &["--file-selection", "--directory"]
+    } else {
+        &["--file-selection"]
+    };
+    let kdialog: &[&str] = if directory {
+        &["--getexistingdirectory"]
+    } else {
+        &["--getopenfilename"]
+    };
+    [("zenity", zenity), ("kdialog", kdialog)]
+        .iter()
+        .find_map(|(cmd, args)| {
+            let out = std::process::Command::new(cmd).args(*args).output().ok()?;
+            let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+            (out.status.success() && !path.is_empty()).then_some(path)
+        })
 }
 
 /// Wallpaper Engine's light and dark skins, following the system theme.

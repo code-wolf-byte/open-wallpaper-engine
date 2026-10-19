@@ -153,9 +153,9 @@ impl GpuScaler {
         dst_w: u32,
         dst_h: u32,
         quality: RenderQuality,
-        mode: crate::render::ScaleMode,
+        mode: crate::content::ScaleMode,
     ) -> Vec<u8> {
-        let full = crate::render::settings::FULL_REGION;
+        let full = crate::content::settings::FULL_REGION;
         self.scale_region(src, dst_w, dst_h, quality, mode, (dst_w, dst_h), full)
     }
 
@@ -168,7 +168,7 @@ impl GpuScaler {
         dst_w: u32,
         dst_h: u32,
         quality: RenderQuality,
-        mode: crate::render::ScaleMode,
+        mode: crate::content::ScaleMode,
         canvas: (u32, u32),
         region: [f32; 4],
     ) -> Vec<u8> {
@@ -400,7 +400,7 @@ mod tests {
             8,
             8,
             RenderQuality::Ultra,
-            crate::render::ScaleMode::Fit,
+            crate::content::ScaleMode::Fit,
         );
         let px = |x: usize, y: usize| &out[(y * 8 + x) * 4..(y * 8 + x) * 4 + 4];
         assert_eq!(px(4, 0), &[0, 0, 0, 255], "top bar is black");

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use wp_engine::engine::camera_dynamics::CameraDynamics;
-use wp_engine::engine::properties::{parse_property_arg, SceneProperties};
-use wp_engine::engine::scene::Scene;
+use wp_engine::engine::model::scene::Scene;
+use wp_engine::engine::sim::camera_dynamics::CameraDynamics;
+use wp_engine::workshop::properties::{parse_property_arg, SceneProperties};
 
 fn props_from_project(project: serde_json::Value, overrides: &[(&str, &str)]) -> SceneProperties {
     // Build via a temp dir so the public loader path is exercised.

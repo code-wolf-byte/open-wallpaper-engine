@@ -53,19 +53,19 @@ pub struct WpSettings {
     /// What happens while another application is focused, maximized,
     /// fullscreen or playing audio, on battery, or while locked.
     #[serde(default)]
-    pub playback: crate::engine::playback_gate::PlaybackPolicy,
+    pub playback: crate::services::playback_gate::PlaybackPolicy,
     /// Frame-rate cap for animated wallpapers; `None` = the default (30).
     #[serde(default)]
     pub fps: Option<u32>,
     /// How video, image and web wallpapers fit the screen; `None` = fill.
     #[serde(default)]
-    pub scaling: Option<crate::render::ScaleMode>,
+    pub scaling: Option<crate::content::ScaleMode>,
     /// The playlist `wp-engine run` plays, if any.
     #[serde(default)]
     pub active_playlist: Option<String>,
     /// Per-screen, span or clone; `None` = per-screen.
     #[serde(default)]
-    pub layout: Option<crate::render::ScreenLayout>,
+    pub layout: Option<crate::content::ScreenLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

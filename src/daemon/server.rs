@@ -277,7 +277,7 @@ pub(super) fn handle_request(req: Request, state: &Mutex<State>) -> Response {
                     for name in &names {
                         let (dir, name) = (dir.clone(), name.clone());
                         s.property_edits
-                            .push(crate::render::settings::PropertyEdit { dir, name });
+                            .push(crate::content::settings::PropertyEdit { dir, name });
                     }
                 }
             }
@@ -290,7 +290,7 @@ pub(super) fn handle_request(req: Request, state: &Mutex<State>) -> Response {
             Response::Ok
         }
         Request::SetAudioDevice { device } => {
-            crate::platform::audio::set_preferred_device(device);
+            crate::services::audio_devices::set_preferred_device(device);
             Response::Ok
         }
         Request::PlayPlaylist { name } => {
@@ -393,7 +393,14 @@ mod tests {
         );
 
         drop(first);
-        InstanceLock::acquire(&path).expect("lock is free again once dropped");
+        // A process another test spawns at this moment briefly shares our
+        // open file (fork to exec) and with it the lock, so allow a moment.
+        let again = (0..100).find_map(|_| {
+            InstanceLock::acquire(&path)
+                .inspect_err(|_| std::thread::sleep(std::time::Duration::from_millis(10)))
+                .ok()
+        });
+        assert!(again.is_some(), "lock is free again once dropped");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

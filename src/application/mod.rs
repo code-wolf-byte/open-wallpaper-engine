@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use crate::content::{ScreenContent, ScreenSettings, WallpaperContent};
 use crate::platform::{self, WallpaperHandle};
-use crate::render::{ScreenContent, ScreenSettings, WallpaperContent};
 
 pub mod application_context;
 pub use application_context::ApplicationContext;
@@ -37,7 +37,7 @@ impl WallpaperApplication {
     /// Prepare the application: installs the context's property overrides so
     /// every scene loaded afterwards resolves user settings against them.
     pub fn new(context: ApplicationContext) -> Self {
-        crate::engine::properties::set_overrides_for(
+        crate::workshop::properties::set_overrides_for(
             &context.background,
             context.properties.clone(),
         );

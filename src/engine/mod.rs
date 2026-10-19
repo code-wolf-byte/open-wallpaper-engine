@@ -1,52 +1,21 @@
-//! Wallpaper Engine scene rendering engine.
+//! The scene engine: turns a Wallpaper Engine scene into frames.
 //!
-//! The production live-render path is [`gpu_renderer::GpuSceneInstance`]; the
-//! backend-neutral [`graph::SceneGraph`] feeds the CPU compositor and
-//! diagnostics.
+//! - [`model`]: what the scene is — `scene.json` types, resolving them into
+//!   layers, materials and shader metadata, static meshes
+//! - [`sim`]: what changes over time — particles, timelines, SceneScript,
+//!   camera motion, puppet animation
+//! - [`gpu`]: how it is drawn — the renderer
+//!   ([`gpu::renderer::GpuSceneInstance`] is the live path), render targets,
+//!   blending, lighting, shadows, text, and the GLSL→WGSL shader pipeline
+//! - [`cpu`]: the CPU fallback renderer, used when the GPU path can't start
+//!
+//! File formats live in [`crate::formats`], user properties in
+//! [`crate::workshop::properties`].
 
-pub mod animated;
-pub mod assets;
-pub mod audio;
-pub mod blend;
-pub mod camera;
-pub mod camera3d;
-pub mod camera_dynamics;
-pub mod effect;
-pub mod fbo;
-pub mod gpu_renderer;
-pub mod graph;
-pub mod lighting;
-pub mod material;
-#[cfg(target_os = "linux")]
-pub mod media;
-pub mod mesh3d;
+pub mod cpu;
+pub mod gpu;
 pub mod model;
-pub mod noise;
-pub mod particle;
-pub mod pass;
-pub mod pkg;
-pub mod playback_gate;
-pub mod properties;
-pub mod puppet;
-pub mod render;
-pub mod resource;
-pub mod scene;
-pub mod script;
-pub mod shaders;
-pub mod shadow;
-pub mod tex;
-pub mod text;
-pub mod timeline;
+pub mod sim;
 
-// Convenience re-exports.
-pub use camera::SceneCamera;
-pub use camera_dynamics::{CameraDynamics, CameraFrameDynamics};
-pub use fbo::{RenderTarget, RenderTargetPool};
-pub use graph::SceneGraph;
-pub use pass::{ScenePass, UniformValue};
-pub use pkg::Package;
-pub use properties::SceneProperties;
-pub use render::ResolvedScene;
-pub use resource::ResourceManager;
-pub use scene::Scene;
-pub use tex::TexFile;
+pub use cpu::graph::SceneGraph;
+pub use model::resolve::ResolvedScene;

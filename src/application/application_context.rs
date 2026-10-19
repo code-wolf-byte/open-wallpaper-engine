@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::render::RenderSettings;
+use crate::content::RenderSettings;
 
 /// Runtime configuration for a wallpaper run (the Rust counterpart of the C++
 /// `ApplicationContext`). Built from the CLI by `main.rs` and consumed by
@@ -36,7 +36,7 @@ pub struct ApplicationContext {
 impl ApplicationContext {
     pub fn new(background: PathBuf) -> Self {
         let saved = crate::settings::WpSettings::load();
-        let fps = saved.fps.unwrap_or(crate::render::settings::DEFAULT_FPS);
+        let fps = saved.fps.unwrap_or(crate::content::settings::DEFAULT_FPS);
         let scaling = saved.scaling.unwrap_or_default();
         Self {
             background,
@@ -83,7 +83,7 @@ impl ApplicationContext {
         S: AsRef<str>,
     {
         for arg in args {
-            let (name, value) = crate::engine::properties::parse_property_arg(arg.as_ref());
+            let (name, value) = crate::workshop::properties::parse_property_arg(arg.as_ref());
             self.properties.insert(name, value);
         }
     }
